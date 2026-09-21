@@ -51,6 +51,9 @@ class UserPrompt:
 class AssistantMessage:
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # 思维链内容（DeepSeek reasoning_content）。
+    # 当请求携带 tools 时，需要把历史轮次的 reasoning_content 一并回传。
+    reasoning_content: str | None = None
     role: Literal["assistant"] = "assistant"
 
 @dataclass
@@ -100,9 +103,19 @@ def from_dict(message: dict[str, Any]) -> Message:
     if role == "user":
         return UserPrompt(content=content, name=message.get("name"))
     if role == "assistant":
-        return AssistantMessage(content=content, tool_calls=[_tool_call_from_dict(item) for item in message.get("tool_calls", [])])
+        return AssistantMessage(
+            content=content,
+            tool_calls=[_tool_call_from_dict(item) for item in message.get("tool_calls", [])],
+            reasoning_content=message.get("reasoning_content"),
+        )
     if role == "tool":
-        return ToolResult(tool_call_id=message.get("tool_call_id", ""), content=content)
+        return ToolResult(
+            tool_call_id=message.get("tool_call_id", ""),
+            tool_name=message.get("tool_name", ""),
+            content=content,
+            is_error=message.get("is_error", False),
+            details=message.get("details"),
+        )
     if not role:
         raise ValueError("每条 message 必须包含 role")
     return GenericMessage(role=role, content=content, extra={k: v for k, v in message.items() if k not in {"role", "content"}})
@@ -114,7 +127,21 @@ def normalize_messages(messages: MessageInputs) -> list[Message]:
         values = [messages]
     else:
         values = list(messages)
-    return [from_dict(item) if isinstance(item, dict) else item for item in values]
+    messages = [from_dict(item) if isinstance(item, dict) else item for item in values]
+    # 兼容旧版上下文：旧 JSON 的 tool message 没有保存 tool_name，
+    # 可以从对应的 assistant tool call 中恢复。
+    for index, message in enumerate(messages):
+        if not isinstance(message, ToolResult) or message.tool_name:
+            continue
+        for previous in reversed(messages[:index]):
+            if isinstance(previous, AssistantMessage):
+                for call in previous.tool_calls:
+                    if call.id == message.tool_call_id:
+                        message.tool_name = call.name
+                        break
+                if message.tool_name:
+                    break
+    return messages
 
 
 def to_openai_message(message: Message) -> dict[str, Any]:
@@ -127,6 +154,10 @@ def to_openai_message(message: Message) -> dict[str, Any]:
         return result
     if isinstance(message, AssistantMessage):
         result: dict[str, Any] = {"role": "assistant", "content": message.content}
+        if message.reasoning_content:
+            # DeepSeek 要求携带 tools 的请求把历史 reasoning_content 回传，
+            # 以便模型续接上一轮思维链。
+            result["reasoning_content"] = message.reasoning_content
         if message.tool_calls:
             result["tool_calls"] = [{"id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.arguments_json()}} for c in message.tool_calls]
         return result
@@ -141,6 +172,17 @@ def to_responses_input(message: Message) -> list[dict[str, Any]]:
     """将消息转换为 OpenAI Responses API 的 input item(s)。"""
     if isinstance(message, AssistantMessage):
         items: list[dict[str, Any]] = []
+        if message.reasoning_content:
+            # Responses API 下思维链以 reasoning item 回传，
+            # DeepSeek 会把其中的纯文本内容合并进相邻的 assistant 消息。
+            items.append(
+                {
+                    "type": "reasoning",
+                    "content": [
+                        {"type": "reasoning_text", "text": message.reasoning_content}
+                    ],
+                }
+            )
         if message.content:
             items.append({"role": "assistant", "content": message.content})
         items.extend(
@@ -190,7 +232,7 @@ def to_dict(message: Message) -> dict[str, Any]:
             result["name"] = message.name
         return result
     if isinstance(message, AssistantMessage):
-        return {
+        result: dict[str, Any] = {
             "role": "assistant",
             "content": message.content,
             "tool_calls": [
@@ -205,11 +247,17 @@ def to_dict(message: Message) -> dict[str, Any]:
                 for call in message.tool_calls
             ],
         }
+        if message.reasoning_content:
+            result["reasoning_content"] = message.reasoning_content
+        return result
     if isinstance(message, ToolResult):
         return {
             "role": "tool",
             "tool_call_id": message.tool_call_id,
+            "tool_name": message.tool_name,
             "content": message.content,
+            "is_error": message.is_error,
+            "details": message.details,
         }
     result = {"role": message.role, "content": message.content}
     result.update(message.extra)
