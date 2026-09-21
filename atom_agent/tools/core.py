@@ -9,6 +9,13 @@ from typing import Any, Callable
 
 @dataclass
 class RuntimeContext:
+    """Tool 执行时使用的运行环境。
+
+    它是 Context 层 ``Session`` 的近似实现：只有工作区、元数据和回调，属于工具
+    注册表级别，不区分 ``session_id``。``Session.runtime_context()`` 会把会话状态
+    转换成这个对象，因此 ``metadata`` 中通常包含 ``session_id`` 和会话元数据。
+    """
+
     workspace: Path = field(default_factory=Path.cwd)
     metadata: dict[str, Any] = field(default_factory=dict)
     approve: Callable[[str, dict[str, Any]], bool] | None = None
