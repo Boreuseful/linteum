@@ -33,6 +33,8 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     raw_response: Any = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # 思维链内容（DeepSeek reasoning_content / Responses API reasoning item）。
+    reasoning_content: str = ""
 
 
 @dataclass
@@ -42,6 +44,9 @@ class LLMStreamChunk:
 
     普通增量:
         LLMStreamChunk(delta="你好")
+
+    思维链增量:
+        LLMStreamChunk(reasoning_content="让我先想想...")
 
     流结束:
         LLMStreamChunk(
@@ -56,6 +61,8 @@ class LLMStreamChunk:
     done: bool = False
     usage: dict[str, int] = field(default_factory=dict)
     response: LLMResponse | None = None
+    # 本次增量中的思维链文本。
+    reasoning_content: str = ""
 
 
 def normalize_usage(
@@ -81,6 +88,92 @@ def _nested_usage_value(usage: Any, *names: str) -> int:
         if isinstance(usage, dict) and name in usage:
             return int(usage[name] or 0)
     return 0
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    """兼容对象和 dict 两种取值方式（OpenAI SDK 新旧版本都可能返回 dict）。"""
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _reasoning_from_message(message: Any) -> str:
+    """从 Chat Completions 的 assistant message 中提取思维链文本。"""
+    reasoning = _field(message, "reasoning_content") or _field(message, "reasoning")
+    return reasoning if isinstance(reasoning, str) else ""
+
+
+_RESPONSES_REASONING_PART_TYPES = {"reasoning_text", "summary_text", "thinking_text"}
+
+
+def _reasoning_from_responses(response: Any) -> str:
+    """从 Responses API 的 output 中提取 reasoning item 的文本。"""
+    parts: list[str] = []
+
+    for item in _field(response, "output") or []:
+        if _field(item, "type") != "reasoning":
+            continue
+
+        text = _field(item, "reasoning_text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+
+        for attribute in ("content", "summary"):
+            for part in _field(item, attribute) or []:
+                if isinstance(part, str):
+                    if part:
+                        parts.append(part)
+                    continue
+                part_type = _field(part, "type")
+                part_text = _field(part, "text")
+                if part_text and (
+                    part_type is None
+                    or part_type in _RESPONSES_REASONING_PART_TYPES
+                ):
+                    parts.append(part_text)
+
+    return "\n".join(parts)
+
+
+def _accumulate_tool_calls(
+    state: dict[int, dict[str, str]],
+    deltas: Any,
+) -> None:
+    """把流式增量里的 tool_calls 片段按 index 累积起来。"""
+    for delta in deltas or []:
+        index = _field(delta, "index")
+        if index is None:
+            index = len(state)
+        entry = state.setdefault(index, {"id": "", "name": "", "arguments": ""})
+
+        call_id = _field(delta, "id")
+        if call_id:
+            entry["id"] = call_id
+
+        function = _field(delta, "function")
+        if function is None:
+            continue
+
+        name = _field(function, "name")
+        if name:
+            entry["name"] = name
+
+        arguments = _field(function, "arguments")
+        if arguments:
+            entry["arguments"] += arguments
+
+
+def _tool_calls_from_state(state: dict[int, dict[str, str]]) -> list[ToolCall]:
+    return [
+        ToolCall(
+            id=entry["id"],
+            name=entry["name"],
+            arguments=entry["arguments"] or "{}",
+        )
+        for _, entry in sorted(state.items())
+    ]
 
 
 def build_request(
@@ -115,23 +208,23 @@ def build_request(
 def _tool_calls_from_openai(message: Any) -> list[ToolCall]:
     return [
         ToolCall(
-            id=getattr(call, "id", ""),
-            name=getattr(getattr(call, "function", None), "name", ""),
-            arguments=getattr(getattr(call, "function", None), "arguments", "{}"),
+            id=_field(call, "id", ""),
+            name=_field(_field(call, "function"), "name", ""),
+            arguments=_field(_field(call, "function"), "arguments", "{}"),
         )
-        for call in (getattr(message, "tool_calls", None) or [])
+        for call in (_field(message, "tool_calls") or [])
     ]
 
 
 def _tool_calls_from_responses(response: Any) -> list[ToolCall]:
     return [
         ToolCall(
-            id=getattr(item, "call_id", None) or getattr(item, "id", ""),
-            name=getattr(item, "name", ""),
-            arguments=getattr(item, "arguments", "{}"),
+            id=_field(item, "call_id") or _field(item, "id", ""),
+            name=_field(item, "name", ""),
+            arguments=_field(item, "arguments", "{}"),
         )
-        for item in (getattr(response, "output", None) or [])
-        if getattr(item, "type", "") == "function_call"
+        for item in (_field(response, "output") or [])
+        if _field(item, "type", "") == "function_call"
     ]
 
 
@@ -429,6 +522,7 @@ class OpenAIProvider(BaseLLMProvider):
         usage: dict[str, int] | None = None,
         raw_response: Any = None,
         tool_calls: list[ToolCall] | None = None,
+        reasoning_content: str = "",
     ) -> LLMResponse:
         return LLMResponse(
             text=text,
@@ -437,6 +531,7 @@ class OpenAIProvider(BaseLLMProvider):
             usage=usage or {},
             raw_response=raw_response,
             tool_calls=tool_calls or [],
+            reasoning_content=reasoning_content or "",
         )
 
     # ------------------------------------------------------------------
@@ -461,6 +556,7 @@ class OpenAIProvider(BaseLLMProvider):
             model=getattr(response, "model", None),
             usage=self._response_usage(response),
             tool_calls=_tool_calls_from_responses(response),
+            reasoning_content=_reasoning_from_responses(response),
             raw_response=response,
         )
 
@@ -478,6 +574,7 @@ class OpenAIProvider(BaseLLMProvider):
         stream = self.client.responses.create(**request)
 
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         final_response: Any = None
 
         for event in stream:
@@ -490,6 +587,17 @@ class OpenAIProvider(BaseLLMProvider):
                     text_parts.append(delta)
                     yield LLMStreamChunk(delta=delta)
 
+            elif event_type in (
+                "response.reasoning_text.delta",
+                "response.reasoning_summary_text.delta",
+                "response.thinking_text.delta",
+            ):
+                reasoning_delta = getattr(event, "delta", "") or ""
+
+                if reasoning_delta:
+                    reasoning_parts.append(reasoning_delta)
+                    yield LLMStreamChunk(reasoning_content=reasoning_delta)
+
             elif event_type == "response.completed":
                 final_response = getattr(event, "response", None)
 
@@ -500,6 +608,8 @@ class OpenAIProvider(BaseLLMProvider):
             model=getattr(final_response, "model", None),
             usage=usage,
             tool_calls=_tool_calls_from_responses(final_response),
+            reasoning_content="".join(reasoning_parts)
+            or _reasoning_from_responses(final_response),
             raw_response=final_response,
         )
 
@@ -530,12 +640,14 @@ class OpenAIProvider(BaseLLMProvider):
             raise RuntimeError("Chat Completions 返回结果中没有 choices")
 
         content = response.choices[0].message.content or ""
+        message = response.choices[0].message
 
         return self._new_response(
             text=content,
             model=getattr(response, "model", None),
             usage=self._chat_usage(response),
-            tool_calls=_tool_calls_from_openai(response.choices[0].message),
+            tool_calls=_tool_calls_from_openai(message),
+            reasoning_content=_reasoning_from_message(message),
             raw_response=response,
         )
 
@@ -553,15 +665,30 @@ class OpenAIProvider(BaseLLMProvider):
         stream = self.client.chat.completions.create(**request)
 
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_call_state: dict[int, dict[str, str]] = {}
         usage: dict[str, int] = {}
 
         for chunk in stream:
             if getattr(chunk, "choices", None):
-                delta = chunk.choices[0].delta.content or ""
+                delta = chunk.choices[0].delta
 
-                if delta:
-                    text_parts.append(delta)
-                    yield LLMStreamChunk(delta=delta)
+                content = getattr(delta, "content", None) or ""
+
+                if content:
+                    text_parts.append(content)
+                    yield LLMStreamChunk(delta=content)
+
+                reasoning = _reasoning_from_message(delta)
+
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    yield LLMStreamChunk(reasoning_content=reasoning)
+
+                _accumulate_tool_calls(
+                    tool_call_state,
+                    _field(delta, "tool_calls"),
+                )
 
             chunk_usage = getattr(chunk, "usage", None)
 
@@ -587,6 +714,8 @@ class OpenAIProvider(BaseLLMProvider):
             text="".join(text_parts),
             model=self.config.model,
             usage=usage,
+            tool_calls=_tool_calls_from_state(tool_call_state),
+            reasoning_content="".join(reasoning_parts),
         )
 
         yield LLMStreamChunk(
@@ -633,6 +762,7 @@ class OpenAIProvider(BaseLLMProvider):
         stream = await self.async_client.responses.create(**request)
 
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         final_response: Any = None
 
         async for event in stream:
@@ -645,6 +775,17 @@ class OpenAIProvider(BaseLLMProvider):
                     text_parts.append(delta)
                     yield LLMStreamChunk(delta=delta)
 
+            elif event_type in (
+                "response.reasoning_text.delta",
+                "response.reasoning_summary_text.delta",
+                "response.thinking_text.delta",
+            ):
+                reasoning_delta = getattr(event, "delta", "") or ""
+
+                if reasoning_delta:
+                    reasoning_parts.append(reasoning_delta)
+                    yield LLMStreamChunk(reasoning_content=reasoning_delta)
+
             elif event_type == "response.completed":
                 final_response = getattr(event, "response", None)
 
@@ -655,6 +796,8 @@ class OpenAIProvider(BaseLLMProvider):
             model=getattr(final_response, "model", None),
             usage=usage,
             tool_calls=_tool_calls_from_responses(final_response),
+            reasoning_content="".join(reasoning_parts)
+            or _reasoning_from_responses(final_response),
             raw_response=final_response,
         )
 
@@ -685,11 +828,14 @@ class OpenAIProvider(BaseLLMProvider):
             raise RuntimeError("Chat Completions 返回结果中没有 choices")
 
         content = response.choices[0].message.content or ""
+        message = response.choices[0].message
 
         return self._new_response(
             text=content,
             model=getattr(response, "model", None),
             usage=self._chat_usage(response),
+            tool_calls=_tool_calls_from_openai(message),
+            reasoning_content=_reasoning_from_message(message),
             raw_response=response,
         )
 
@@ -707,15 +853,30 @@ class OpenAIProvider(BaseLLMProvider):
         stream = await self.async_client.chat.completions.create(**request)
 
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_call_state: dict[int, dict[str, str]] = {}
         usage: dict[str, int] = {}
 
         async for chunk in stream:
             if getattr(chunk, "choices", None):
-                delta = chunk.choices[0].delta.content or ""
+                delta = chunk.choices[0].delta
 
-                if delta:
-                    text_parts.append(delta)
-                    yield LLMStreamChunk(delta=delta)
+                content = getattr(delta, "content", None) or ""
+
+                if content:
+                    text_parts.append(content)
+                    yield LLMStreamChunk(delta=content)
+
+                reasoning = _reasoning_from_message(delta)
+
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    yield LLMStreamChunk(reasoning_content=reasoning)
+
+                _accumulate_tool_calls(
+                    tool_call_state,
+                    _field(delta, "tool_calls"),
+                )
 
             chunk_usage = getattr(chunk, "usage", None)
 
@@ -741,6 +902,8 @@ class OpenAIProvider(BaseLLMProvider):
             text="".join(text_parts),
             model=self.config.model,
             usage=usage,
+            tool_calls=_tool_calls_from_state(tool_call_state),
+            reasoning_content="".join(reasoning_parts),
         )
 
         yield LLMStreamChunk(
@@ -1037,6 +1200,114 @@ class AnthropicProvider(BaseLLMProvider):
             done=True,
             usage=usage,
             response=response,
+        )
+
+class DeepseekCompatibleProvider(OpenAIProvider):
+    """
+    DeepSeek Provider。
+
+    既支持 ``provider="deepseek"``，也兼容旧的 ``provider="deepseek_compatible"``。
+
+    默认行为:
+    - base_url 缺省为 ``https://api.deepseek.com``
+    - api_key 缺省读取 ``DEEPSEEK_API_KEY``，回退 ``OPENAI_API_KEY``
+    - 支持 thinking mode（思维链），并在携带 tools 时按 DeepSeek 要求回传
+      ``reasoning_content``，从而支持"思维链 + 工具调用"的多轮对话
+    """
+
+    provider_name = "deepseek"
+    default_base_url = "https://api.deepseek.com"
+    api_key_env = "DEEPSEEK_API_KEY"
+
+    def __init__(self, config: LLMConfig):
+        api_key = (
+            config.api_key
+            or os.getenv(self.api_key_env)
+            or os.getenv("OPENAI_API_KEY")
+        )
+
+        if not api_key:
+            raise ValueError(
+                "未找到 DeepSeek API Key，请通过 api_key "
+                f"或 {self.api_key_env} 环境变量配置"
+            )
+
+        if not config.base_url:
+            config.base_url = self.default_base_url
+
+        if not config.api_key:
+            config.api_key = api_key
+
+        super().__init__(config)
+
+    # ------------------------------------------------------------------
+    # DeepSeek thinking mode 参数注入
+    # ------------------------------------------------------------------
+
+    def _thinking_kwargs(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        responses: bool,
+    ) -> dict[str, Any]:
+        """把 config/调用参数中的 thinking 配置翻译成 DeepSeek 请求参数。"""
+        kwargs = dict(kwargs)
+
+        effort = kwargs.pop("reasoning_effort", self.config.reasoning_effort)
+        enabled = kwargs.pop("thinking", self.config.thinking)
+
+        if responses:
+            # Responses API: reasoning={"effort": "none|low|high|max"}
+            if effort is not None or enabled is not None:
+                if enabled is False:
+                    effort = "none"
+                kwargs.setdefault("reasoning", {"effort": effort or "high"})
+            return kwargs
+
+        # Chat Completions: reasoning_effort + extra_body.thinking
+        if effort is not None:
+            kwargs.setdefault("reasoning_effort", effort)
+
+        if enabled is not None:
+            extra_body = dict(kwargs.get("extra_body") or {})
+            extra_body.setdefault(
+                "thinking",
+                {"type": "enabled" if enabled else "disabled"},
+            )
+            kwargs["extra_body"] = extra_body
+
+        return kwargs
+
+    def _chat_request(
+        self,
+        messages: list[Message],
+        *,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if stream:
+            # DeepSeek 只在显式开启 include_usage 时于最后一个 chunk 返回 usage。
+            stream_options = dict(kwargs.get("stream_options") or {})
+            stream_options.setdefault("include_usage", True)
+            kwargs["stream_options"] = stream_options
+
+        return super()._chat_request(
+            messages,
+            stream=stream,
+            **self._thinking_kwargs(kwargs, responses=False),
+        )
+
+    def _responses_request(
+        self,
+        messages: list[Message],
+        *,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return super()._responses_request(
+            messages,
+            stream=stream,
+            **self._thinking_kwargs(kwargs, responses=True),
         )
 
 

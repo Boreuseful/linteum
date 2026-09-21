@@ -66,7 +66,11 @@ class ContextMiddleware:
 
     @staticmethod
     def _response_message(response: LLMResponse) -> AssistantMessage:
-        return AssistantMessage(content=response.text or None, tool_calls=response.tool_calls)
+        return AssistantMessage(
+            content=response.text or None,
+            tool_calls=response.tool_calls,
+            reasoning_content=response.reasoning_content or None,
+        )
 
     def _save_turn(self, session_id: str, messages: MessageInputs, response: LLMResponse) -> None:
         if self.persist_user_messages:

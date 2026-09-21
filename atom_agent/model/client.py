@@ -9,6 +9,7 @@ try:
     from .llm import (
         AnthropicProvider,
         BaseLLMProvider,
+        DeepseekCompatibleProvider,
         LLMResponse,
         LLMStreamChunk,
         MessageInputs,
@@ -20,6 +21,7 @@ except ImportError:  # 兼容旧的直接导入方式
     from llm import (
         AnthropicProvider,
         BaseLLMProvider,
+        DeepseekCompatibleProvider,
         LLMResponse,
         LLMStreamChunk,
         MessageInputs,
@@ -54,6 +56,8 @@ class LLMClient:
             return OpenAICompatibleProvider(config)
         if config.provider == "anthropic":
             return AnthropicProvider(config)
+        if config.provider in ("deepseek", "deepseek_compatible"):
+            return DeepseekCompatibleProvider(config)
         raise ValueError(f"不支持的 provider: {config.provider}")
 
     def _record_usage(self, session_id: str, usage: dict[str, int]) -> None:

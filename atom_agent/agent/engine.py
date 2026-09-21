@@ -33,6 +33,32 @@ except ImportError:
     from tools.registry import ToolRegistry
     from tools.builtin import tool_result_content
 
+try:
+    from evnts import (AgentStartEvent,
+                                   AgentEndEvent,
+                                   TurnStartEvent,
+                                   TurnEndEvent,
+                                   MessageStartEvent,
+                                   MessageUpdateEvent,
+                                   MessageEndEvent,
+                                   ToolExecutionStartEvent,
+                                   ToolExecutionUpdateEvent,
+                                   ToolExecutionEndEvent)
+    from ..evnts import EventBus
+
+except ImportError:
+    from ..evnts import (AgentStartEvent,
+                                       AgentEndEvent,
+                                       TurnStartEvent,
+                                       TurnEndEvent,
+                                       MessageStartEvent,
+                                       MessageUpdateEvent,
+                                       MessageEndEvent,
+                                       ToolExecutionStartEvent,
+                                       ToolExecutionUpdateEvent,
+                                       ToolExecutionEndEvent)
+    from ..evnts import EventBus
+
 @dataclass
 class AgentContext:
     """一次 Agent 执行的输入上下文。"""
@@ -94,6 +120,8 @@ class AgentStreamChunk:
     usage: dict[str, int] = field(default_factory=dict)
     result: AgentResult | None = None
     raw_chunk: LLMStreamChunk | None = None
+    # 本次增量中的思维链文本。
+    reasoning_delta: str = ""
 
 
 class AgentEngine:
@@ -106,12 +134,14 @@ class AgentEngine:
         *,
         default_context: MessageInputs | None = None,
         tool_registry: ToolRegistry | None = None,
+        events_bus: EventBus | None = None,
         max_tool_rounds: int = 8,
     ):
         self.client = client
         self.middleware = middleware or ContextMiddleware(client)
         self.default_context = normalize_messages(default_context or [])
         self.tool_registry = tool_registry
+        self.events_bus = events_bus or EventBus()
         self.max_tool_rounds = max_tool_rounds
 
     def _request_context(
@@ -147,6 +177,7 @@ class AgentEngine:
                 AssistantMessage(
                     content=response.text or None,
                     tool_calls=response.tool_calls,
+                    reasoning_content=response.reasoning_content or None,
                 )
             )
         return AgentResult(
@@ -175,12 +206,23 @@ class AgentEngine:
     ) -> list[MessageToolResult]:
         results: list[MessageToolResult] = []
         for call in response.tool_calls:
+            arguments = self._arguments(call)
+            self.events_bus.emit_sync({"type": "tool_execution_start", "tool_call_id": call.id,
+                                       "tool_name": call.name, "args": arguments})
+            self.events_bus.emit_sync({"type": "tool_execution_update", "tool_call_id": call.id,
+                                       "tool_name": call.name, "args": arguments,
+                                       "partial_result": "正在执行工具..."})
             try:
-                value = registry.execute_sync(call.name, self._arguments(call))
+                arguments = self._arguments(call)
+                value = registry.execute_sync(call.name, arguments)
                 if isinstance(value, ExecutionToolResult):
-                    value = {"tool_name":call.name,"content": value.content, "is_error": value.is_error, "details": value.details}
+                    value = {"tool_name": call.name, "content": value.content,
+                             "is_error": value.is_error, "details": value.details}
             except Exception as exc:
-                value = {"tool_name":call.name,"is_error": value.is_error, "content": str(exc),"details": value.details}
+                value = {"tool_name": call.name, "is_error": True, "content": str(exc), "details": None}
+            self.events_bus.emit_sync({"type": "tool_execution_end", "tool_call_id": call.id,
+                                       "tool_name": call.name, "result": value["content"],
+                                       "is_error": value["is_error"]})
             results.append(MessageToolResult(call.id,**value))
         return results
 
@@ -191,12 +233,22 @@ class AgentEngine:
     ) -> list[MessageToolResult]:
         results: list[MessageToolResult] = []
         for call in response.tool_calls:
+            arguments = self._arguments(call)
+            await self.events_bus.emit({"type": "tool_execution_start", "tool_call_id": call.id,
+                                        "tool_name": call.name, "args": arguments})
+            await self.events_bus.emit({"type": "tool_execution_update", "tool_call_id": call.id,
+                                        "tool_name": call.name, "args": arguments,
+                                        "partial_result": "正在执行工具..."})
             try:
-                value = await registry.execute(call.name, self._arguments(call))
+                value = await registry.execute(call.name, arguments)
                 if isinstance(value, ExecutionToolResult):
-                    value = {"tool_name":call.name,"content": value.content, "is_error": value.is_error, "details": value.details}
+                    value = {"tool_name": call.name, "content": value.content,
+                             "is_error": value.is_error, "details": value.details}
             except Exception as exc:
-                value = {"tool_name":call.name,"is_error": value.is_error, "content": str(exc),"details": value.details}
+                value = {"tool_name": call.name, "is_error": True, "content": str(exc), "details": None}
+            await self.events_bus.emit({"type": "tool_execution_end", "tool_call_id": call.id,
+                                        "tool_name": call.name, "result": value["content"],
+                                        "is_error": value["is_error"]})
             results.append(MessageToolResult(call.id,**value))
         return results
 
@@ -210,6 +262,7 @@ class AgentEngine:
             AssistantMessage(
                 content=response.text or None,
                 tool_calls=list(response.tool_calls),
+                reasoning_content=response.reasoning_content or None,
             )
         )
         context.extend(results)
@@ -226,23 +279,33 @@ class AgentEngine:
         **kwargs: Any,
     ) -> AgentResult:
         request = self._request_context(prompt, context, session_id, metadata)
+        self.events_bus.emit_sync({"type": "agent_start"})
+        self.events_bus.emit_sync({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
         self._tool_definitions(registry, kwargs)
-        response = self.middleware.complete(request.messages(), session_id=session_id, **kwargs)
-        execution_context = request.messages()
-        rounds = max_tool_rounds if max_tool_rounds is not None else self.max_tool_rounds
-        for round_index in range(rounds + 1):
-            if not response.tool_calls:
-                break
-            if registry is None:
-                break
-            if round_index >= rounds:
-                raise RuntimeError("工具调用超过最大轮次")
-            results = self._tool_results(response, registry)
-            self._append_tool_round(execution_context, response, results)
-            response = self.middleware.complete(results, session_id=session_id, **kwargs)
-        return self._wrap_response(request, response, execution_context)
+        try:
+            response = self.middleware.complete(request.messages(), session_id=session_id, **kwargs)
+            execution_context = request.messages()
+            rounds = max_tool_rounds if max_tool_rounds is not None else self.max_tool_rounds
+            for round_index in range(rounds + 1):
+                self.events_bus.emit_sync({"type": "turn_start"})
+                if not response.tool_calls or registry is None:
+                    result = self._wrap_response(request, response, execution_context)
+                    self.events_bus.emit_sync({"type": "message_start", "message": result.output})
+                    self.events_bus.emit_sync({"type": "message_end", "message": result.output})
+                    self.events_bus.emit_sync({"type": "turn_end", "message": result.output, "tool_results": []})
+                    return result
+                if round_index >= rounds:
+                    raise RuntimeError("工具调用超过最大轮次")
+                results = self._tool_results(response, registry)
+                self._append_tool_round(execution_context, response, results)
+                self.events_bus.emit_sync({"type": "turn_end", "message": execution_context[-len(results)-1],
+                                           "tool_results": results})
+                response = self.middleware.complete(results, session_id=session_id, **kwargs)
+            raise RuntimeError("工具调用超过最大轮次")
+        finally:
+            self.events_bus.emit_sync({"type": "agent_end", "messages": execution_context if 'execution_context' in locals() else []})
 
     async def arun(
         self,
@@ -256,23 +319,33 @@ class AgentEngine:
         **kwargs: Any,
     ) -> AgentResult:
         request = self._request_context(prompt, context, session_id, metadata)
+        await self.events_bus.emit({"type": "agent_start"})
+        await self.events_bus.emit({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
         self._tool_definitions(registry, kwargs)
-        response = await self.middleware.acomplete(request.messages(), session_id=session_id, **kwargs)
-        execution_context = request.messages()
-        rounds = max_tool_rounds if max_tool_rounds is not None else self.max_tool_rounds
-        for round_index in range(rounds + 1):
-            if not response.tool_calls:
-                break
-            if registry is None:
-                break
-            if round_index >= rounds:
-                raise RuntimeError("工具调用超过最大轮次")
-            results = await self._tool_results_async(response, registry)
-            self._append_tool_round(execution_context, response, results)
-            response = await self.middleware.acomplete(results, session_id=session_id, **kwargs)
-        return self._wrap_response(request, response, execution_context)
+        try:
+            response = await self.middleware.acomplete(request.messages(), session_id=session_id, **kwargs)
+            execution_context = request.messages()
+            rounds = max_tool_rounds if max_tool_rounds is not None else self.max_tool_rounds
+            for round_index in range(rounds + 1):
+                await self.events_bus.emit({"type": "turn_start"})
+                if not response.tool_calls or registry is None:
+                    result = self._wrap_response(request, response, execution_context)
+                    await self.events_bus.emit({"type": "message_start", "message": result.output})
+                    await self.events_bus.emit({"type": "message_end", "message": result.output})
+                    await self.events_bus.emit({"type": "turn_end", "message": result.output, "tool_results": []})
+                    return result
+                if round_index >= rounds:
+                    raise RuntimeError("工具调用超过最大轮次")
+                results = await self._tool_results_async(response, registry)
+                self._append_tool_round(execution_context, response, results)
+                await self.events_bus.emit({"type": "turn_end", "message": execution_context[-len(results)-1],
+                                            "tool_results": results})
+                response = await self.middleware.acomplete(results, session_id=session_id, **kwargs)
+            raise RuntimeError("工具调用超过最大轮次")
+        finally:
+            await self.events_bus.emit({"type": "agent_end", "messages": execution_context if 'execution_context' in locals() else []})
 
     @staticmethod
     def _arguments(call: ToolCall) -> dict[str, Any]:
@@ -298,29 +371,53 @@ class AgentEngine:
         **kwargs: Any,
     ) -> Iterator[AgentStreamChunk]:
         request = self._request_context(prompt, context, session_id, metadata)
+        self.events_bus.emit_sync({"type": "agent_start"})
+        self.events_bus.emit_sync({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
         self._tool_definitions(registry, kwargs)
-
         messages: MessageInputs = request.messages()
         execution_context = request.messages()
         rounds = max_tool_rounds if max_tool_rounds is not None else self.max_tool_rounds
         for round_index in range(rounds + 1):
+            self.events_bus.emit_sync({"type": "turn_start"})
             final_chunk: LLMStreamChunk | None = None
             for chunk in self.middleware.stream(messages, session_id=session_id, **kwargs):
                 if chunk.done:
                     final_chunk = chunk
-                else:
-                    yield AgentStreamChunk(delta=chunk.delta, raw_chunk=chunk)
+                    continue
+                if chunk.reasoning_content:
+                    self.events_bus.emit_sync({
+                        "type": "message_update",
+                        "message": AssistantMessage(reasoning_content=chunk.reasoning_content),
+                        "assistant_message_event": {"type": "reasoning_delta", "text": chunk.reasoning_content},
+                    })
+                if chunk.delta:
+                    self.events_bus.emit_sync({
+                        "type": "message_update",
+                        "message": AssistantMessage(content=chunk.delta),
+                        "assistant_message_event": {"type": "text_delta", "text": chunk.delta},
+                    })
+                if chunk.reasoning_content or chunk.delta:
+                    yield AgentStreamChunk(
+                        delta=chunk.delta,
+                        reasoning_delta=chunk.reasoning_content,
+                        raw_chunk=chunk,
+                    )
 
             if final_chunk is None or final_chunk.response is None:
+                self.events_bus.emit_sync({"type": "agent_end", "messages": execution_context})
                 return
             response = final_chunk.response
             if not response.tool_calls or registry is None:
+                result = self._wrap_response(request, response, execution_context)
+                self.events_bus.emit_sync({"type": "message_start", "message": result.output})
+                self.events_bus.emit_sync({"type": "message_end", "message": result.output})
+                self.events_bus.emit_sync({"type": "turn_end", "message": result.output, "tool_results": []})
                 yield AgentStreamChunk(
                     done=True,
                     usage=final_chunk.usage,
-                    result=self._wrap_response(request, response, execution_context),
+                    result=result,
                     raw_chunk=final_chunk,
                 )
                 return
@@ -329,6 +426,8 @@ class AgentEngine:
                 raise RuntimeError("工具调用超过最大轮次")
             results = self._tool_results(response, registry)
             self._append_tool_round(execution_context, response, results)
+            self.events_bus.emit_sync({"type": "turn_end", "message": execution_context[-len(results)-1],
+                                       "tool_results": results})
             messages = results
 
         raise RuntimeError("工具调用超过最大轮次")
@@ -345,6 +444,8 @@ class AgentEngine:
         **kwargs: Any,
     ) -> AsyncIterator[AgentStreamChunk]:
         request = self._request_context(prompt, context, session_id, metadata)
+        await self.events_bus.emit({"type": "agent_start"})
+        await self.events_bus.emit({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
         self._tool_definitions(registry, kwargs)
@@ -353,21 +454,44 @@ class AgentEngine:
         execution_context = request.messages()
         rounds = max_tool_rounds if max_tool_rounds is not None else self.max_tool_rounds
         for round_index in range(rounds + 1):
+            await self.events_bus.emit({"type": "turn_start"})
             final_chunk: LLMStreamChunk | None = None
             async for chunk in self.middleware.astream(messages, session_id=session_id, **kwargs):
                 if chunk.done:
                     final_chunk = chunk
-                else:
-                    yield AgentStreamChunk(delta=chunk.delta, raw_chunk=chunk)
+                    continue
+                if chunk.reasoning_content:
+                    await self.events_bus.emit({
+                        "type": "message_update",
+                        "message": AssistantMessage(reasoning_content=chunk.reasoning_content),
+                        "assistant_message_event": {"type": "reasoning_delta", "text": chunk.reasoning_content},
+                    })
+                if chunk.delta:
+                    await self.events_bus.emit({
+                        "type": "message_update",
+                        "message": AssistantMessage(content=chunk.delta),
+                        "assistant_message_event": {"type": "text_delta", "text": chunk.delta},
+                    })
+                if chunk.reasoning_content or chunk.delta:
+                    yield AgentStreamChunk(
+                        delta=chunk.delta,
+                        reasoning_delta=chunk.reasoning_content,
+                        raw_chunk=chunk,
+                    )
 
             if final_chunk is None or final_chunk.response is None:
+                await self.events_bus.emit({"type": "agent_end", "messages": execution_context})
                 return
             response = final_chunk.response
             if not response.tool_calls or registry is None:
+                result = self._wrap_response(request, response, execution_context)
+                await self.events_bus.emit({"type": "message_start", "message": result.output})
+                await self.events_bus.emit({"type": "message_end", "message": result.output})
+                await self.events_bus.emit({"type": "turn_end", "message": result.output, "tool_results": []})
                 yield AgentStreamChunk(
                     done=True,
                     usage=final_chunk.usage,
-                    result=self._wrap_response(request, response, execution_context),
+                    result=result,
                     raw_chunk=final_chunk,
                 )
                 return
@@ -376,6 +500,8 @@ class AgentEngine:
                 raise RuntimeError("工具调用超过最大轮次")
             results = await self._tool_results_async(response, registry)
             self._append_tool_round(execution_context, response, results)
+            await self.events_bus.emit({"type": "turn_end", "message": execution_context[-len(results)-1],
+                                        "tool_results": results})
             messages = results
 
         raise RuntimeError("工具调用超过最大轮次")
