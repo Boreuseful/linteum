@@ -5,19 +5,63 @@ import threading
 from collections.abc import Iterable
 from typing import Any
 
-from .core import RuntimeContext, Tool, ToolResult
+from .core import Session, Tool, ToolResult
 from .validation import validate_arguments
 
 
 class ToolRegistry:
-    """负责 Tool 对象的注册、导出、校验、授权和执行。"""
+    """负责 Tool 对象的注册、导出、校验、授权和执行。
 
-    def __init__(self, tools: Iterable[Tool] | None = None, *, context: RuntimeContext | None = None):
+    工具执行所需的配置全部来自 ``session``（即 ``context.Session``）：
+
+    - ``session.effective_workspace``：工具工作区（内置 Tool 读取它做路径约束）；
+    - ``session.metadata["tools"]``：启用/禁用列表与每个工具的选项；
+    - ``session.approve``：``requires_approval`` 工具的授权回调；
+    - ``session.cancelled``：执行前的取消检查；
+    - ``session.metadata`` / ``session.log()``：会话信息与工具输出通道。
+
+    ``context=`` 参数与 ``context`` 属性是 ``session`` 的兼容别名。
+    """
+
+    def __init__(
+        self,
+        tools: Iterable[Tool] | None = None,
+        *,
+        session: Session | None = None,
+        context: Session | None = None,
+    ):
         self._tools: dict[str, Tool] = {}
         self._lock = threading.RLock()
-        self.context = context or RuntimeContext.cwd()
+        self.session: Session = session or context or Session.cwd()
         for tool in tools or []:
             self.register(tool)
+
+    # ------------------------------------------------------------------
+    # Session 绑定
+    # ------------------------------------------------------------------
+
+    @property
+    def context(self) -> Session:
+        """兼容旧命名：工具运行上下文就是 ``self.session``。"""
+        return self.session
+
+    @context.setter
+    def context(self, value: Session) -> None:
+        self.session = value
+
+    @property
+    def workspace(self) -> Any:
+        """工具工作区（实时读取会话工作区）。"""
+        return self.session.effective_workspace
+
+    def bind_session(self, session: Session) -> Session:
+        """切换工具注册表使用的会话，并返回它。"""
+        self.session = session
+        return session
+
+    # ------------------------------------------------------------------
+    # 注册与查询
+    # ------------------------------------------------------------------
 
     def register(self, tool: Tool) -> None:
         if not isinstance(tool, Tool):
@@ -41,22 +85,33 @@ class ToolRegistry:
 
     def to_llm_tools(self) -> list[dict[str, Any]]:
         return [{"type": "function", "function": {"name": t.name, "description": t.description,
-                 "parameters": t.parameters}} for t in self.all() if t.enabled]
+                 "parameters": t.parameters}} for t in self.all() if self.is_tool_enabled(t.name)]
 
     def definitions(self) -> list[Any]:
         try:
             from ..messages.agent_message import ToolDefinition
         except ImportError:
             from messages.agent_message import ToolDefinition
-        return [ToolDefinition(t.name, t.description, t.parameters) for t in self.all() if t.enabled]
+        return [ToolDefinition(t.name, t.description, t.parameters)
+                for t in self.all() if self.is_tool_enabled(t.name)]
 
     def set_enabled(self, name: str, enabled: bool) -> Tool:
+        """切换 Tool 自身的 ``enabled`` 开关（会话配置仍然优先）。"""
         tool = self._require(name)
         tool.enabled = bool(enabled)
         return tool
 
     def is_enabled(self, name: str) -> bool:
-        return self._require(name).enabled
+        return self.is_tool_enabled(name)
+
+    def is_tool_enabled(self, name: str) -> bool:
+        """结合 Tool 自身开关与会话工具配置判断是否可用。"""
+        tool = self._require(name)
+        return tool.enabled and self.session.tool_enabled(name)
+
+    def tool_options(self, name: str | None = None) -> dict[str, Any]:
+        """返回会话中该工具（或全局）的选项配置。"""
+        return self.session.tool_options(name)
 
     def _require(self, name: str) -> Tool:
         tool = self.get(name)
@@ -64,19 +119,29 @@ class ToolRegistry:
             raise KeyError(f"unknown tool: {name}")
         return tool
 
+    # ------------------------------------------------------------------
+    # 执行
+    # ------------------------------------------------------------------
+
     def _prepare(self, name: str, arguments: dict[str, Any]) -> Tool:
         tool = self._require(name)
         if not tool.enabled:
             raise PermissionError(f"tool is disabled: {name}")
+        if not self.session.tool_enabled(name):
+            raise PermissionError(f"tool is disabled by session config: {name}")
+        if self.session.is_cancelled():
+            raise RuntimeError(f"session cancelled before tool execution: {name}")
         validate_arguments(tool.parameters, arguments)
-        if tool.requires_approval and (self.context.approve is None or not self.context.approve(name, arguments)):
+        if tool.requires_approval and (
+            self.session.approve is None or not self.session.approve(name, arguments)
+        ):
             raise PermissionError(f"tool call not approved: {name}")
         return tool
 
     def execute_sync(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         if not isinstance(arguments, dict):
             raise ValueError("tool arguments must be an object")
-        result = self._prepare(name, arguments).execute(arguments, self.context)
+        result = self._prepare(name, arguments).execute(arguments, self.session)
         if inspect.isawaitable(result):
             raise RuntimeError("同步执行不能调用异步工具")
         return result if isinstance(result, ToolResult) else ToolResult(str(result), details={"value": result})
@@ -84,15 +149,16 @@ class ToolRegistry:
     async def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         if not isinstance(arguments, dict):
             raise ValueError("tool arguments must be an object")
-        result = self._prepare(name, arguments).execute(arguments, self.context)
+        result = self._prepare(name, arguments).execute(arguments, self.session)
         if inspect.isawaitable(result):
             result = await result
         return result if isinstance(result, ToolResult) else ToolResult(str(result), details={"value": result})
 
     def tool_info(self, *, include_disabled: bool = True) -> list[dict[str, Any]]:
         return [{"id": t.name, "name": t.name, "description": t.description, "parameters": t.parameters,
-                 "enabled": t.enabled, "requires_approval": t.requires_approval}
-                for t in self.all() if include_disabled or t.enabled]
+                 "enabled": t.enabled and self.session.tool_enabled(t.name),
+                 "requires_approval": t.requires_approval}
+                for t in self.all() if include_disabled or self.is_tool_enabled(t.name)]
 
 
-__all__ = ["ToolRegistry", "Tool"]
+__all__ = ["ToolRegistry", "Tool", "Session"]

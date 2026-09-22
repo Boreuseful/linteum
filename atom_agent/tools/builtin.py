@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .core import RuntimeContext, Tool, ToolResult
+from .core import Session, Tool, ToolResult
 from .registry import ToolRegistry
 
 
@@ -94,9 +94,9 @@ def tool_result_content(value: Any) -> str:
 
 
 def create_read_tool() -> Tool:
-    def execute(args: dict[str, Any], context: RuntimeContext) -> ToolResult:
+    def execute(args: dict[str, Any], context: Session) -> ToolResult:
         try:
-            return ToolResult(read_file(args["path"], root_dir=context.workspace,
+            return ToolResult(read_file(args["path"], root_dir=context.effective_workspace,
                                         encoding=args.get("encoding", "utf-8")))
         except Exception as exc:
             return ToolResult(str(exc), is_error=True)
@@ -107,9 +107,9 @@ def create_read_tool() -> Tool:
 
 
 def create_list_files_tool() -> Tool:
-    def execute(args: dict[str, Any], context: RuntimeContext) -> ToolResult:
+    def execute(args: dict[str, Any], context: Session) -> ToolResult:
         try:
-            value = list_files(args.get("path", "."), root_dir=context.workspace,
+            value = list_files(args.get("path", "."), root_dir=context.effective_workspace,
                                recursive=args.get("recursive", False))
             return ToolResult("\n".join(value) or "(empty directory)", details={"files": value, "count": len(value)})
         except Exception as exc:
@@ -120,9 +120,9 @@ def create_list_files_tool() -> Tool:
 
 
 def create_write_file_tool() -> Tool:
-    def execute(args: dict[str, Any], context: RuntimeContext) -> ToolResult:
+    def execute(args: dict[str, Any], context: Session) -> ToolResult:
         try:
-            value = write_file(args["path"], args["content"], root_dir=context.workspace,
+            value = write_file(args["path"], args["content"], root_dir=context.effective_workspace,
                                encoding=args.get("encoding", "utf-8"))
             return ToolResult(json.dumps(value, ensure_ascii=False), details=value)
         except Exception as exc:
@@ -134,9 +134,12 @@ def create_write_file_tool() -> Tool:
 
 
 def create_bash_tool(timeout: float = 30) -> Tool:
-    def execute(args: dict[str, Any], context: RuntimeContext) -> ToolResult:
+    def execute(args: dict[str, Any], context: Session) -> ToolResult:
         try:
-            value = run_bash(args["command"], root_dir=context.workspace, cwd=args.get("cwd"), timeout=timeout)
+            # 会话可以为该工具单独配置超时：metadata["tools"]["options"]["bash"]["timeout"]
+            effective_timeout = float(context.tool_options("bash").get("timeout", timeout))
+            value = run_bash(args["command"], root_dir=context.effective_workspace,
+                             cwd=args.get("cwd"), timeout=effective_timeout)
             return ToolResult(json.dumps(value, ensure_ascii=False), is_error=value["returncode"] != 0, details=value)
         except Exception as exc:
             return ToolResult(str(exc), is_error=True)
@@ -146,11 +149,15 @@ def create_bash_tool(timeout: float = 30) -> Tool:
 
 
 def create_builtin_tools(*, include_bash: bool = False, bash_timeout: float = 30,
-                         workspace: str | Path = ".") -> ToolRegistry:
-    """按目标 Tool 工厂格式创建内置工具。"""
-    context = RuntimeContext(Path(workspace))
+                         workspace: str | Path = ".", session: Session | None = None) -> ToolRegistry:
+    """按目标 Tool 工厂格式创建内置工具。
+
+    工具配置保存在 ``Session`` 中：``session=`` 可以直接复用调用方会话，
+    否则用 ``workspace`` 创建一个 ``session_id="default"`` 的会话。
+    """
+    session = session or Session(session_id="default", workspace=Path(workspace))
     tools = [create_read_tool(), create_list_files_tool(), create_write_file_tool()]
     if include_bash:
         tools.append(create_bash_tool(bash_timeout))
-    return ToolRegistry(tools, context=context)
+    return ToolRegistry(tools, session=session)
 

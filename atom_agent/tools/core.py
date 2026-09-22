@@ -2,39 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Callable
 
+try:
+    from ..context.session import TOOL_CONFIG_KEY, Session
+except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
+    from context.session import TOOL_CONFIG_KEY, Session
 
-@dataclass
-class RuntimeContext:
-    """Tool 执行时使用的运行环境。
-
-    它是 Context 层 ``Session`` 的近似实现：只有工作区、元数据和回调，属于工具
-    注册表级别，不区分 ``session_id``。``Session.runtime_context()`` 会把会话状态
-    转换成这个对象，因此 ``metadata`` 中通常包含 ``session_id`` 和会话元数据。
-    """
-
-    workspace: Path = field(default_factory=Path.cwd)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    approve: Callable[[str, dict[str, Any]], bool] | None = None
-    cancelled: Callable[[], bool] | None = None
-
-    def __post_init__(self) -> None:
-        self.workspace = Path(self.workspace).expanduser().resolve()
-
-    def log(self, message: str) -> None:
-        callback = self.metadata.get("log")
-        if callable(callback):
-            callback(message)
-
-    def is_cancelled(self) -> bool:
-        return bool(self.cancelled and self.cancelled())
-
-    @classmethod
-    def cwd(cls) -> "RuntimeContext":
-        return cls(Path.cwd())
+# 工具运行上下文已经合并进 ``context.Session``：
+# - ``Session.effective_workspace``：工具工作区；
+# - ``Session.metadata`` / ``metadata["tools"]``：会话元数据与工具配置；
+# - ``Session.approve`` / ``Session.cancelled`` / ``log()`` / ``is_cancelled()``：
+#   执行控制与输出通道。
+#
+# 旧的 ``RuntimeContext`` 名字仍然可用，但它只是 ``Session`` 的兼容别名。
+RuntimeContext = Session
 
 
 @dataclass
@@ -44,7 +27,7 @@ class ToolResult:
     details: dict[str, Any] | None = None
 
 
-ExecuteFn = Callable[[dict[str, Any], RuntimeContext], ToolResult]
+ExecuteFn = Callable[[dict[str, Any], Session], ToolResult]
 
 
 @dataclass
@@ -56,6 +39,8 @@ class Tool:
     enabled: bool = True
     requires_approval: bool = False
 
-    def execute(self, arguments: dict[str, Any], context: RuntimeContext) -> ToolResult:
+    def execute(self, arguments: dict[str, Any], context: Session) -> ToolResult:
         return self.execute_fn(arguments, context)
 
+
+__all__ = ["Session", "RuntimeContext", "Tool", "ToolResult", "ExecuteFn", "TOOL_CONFIG_KEY"]

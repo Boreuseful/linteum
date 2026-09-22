@@ -172,21 +172,21 @@ class AgentEngine:
         session_id: str,
         metadata: dict[str, Any] | None = None,
     ) -> Session | None:
-        """把会话状态绑定到工具注册表，让工具在会话工作区中执行。
+        """把会话绑定到工具注册表，让工具使用会话的工作区与工具配置。
 
-        - 会话工作区未显式指定时，继承工具注册表已有的工作区（保持旧行为）；
-        - 会话元数据注入工具运行环境，并始终携带当前 ``session_id``；
+        - 会话工作区未显式指定时，继承注册表当前会话的工作区（保持旧行为）；
+        - 本次调用 ``metadata`` 与会话元数据一起交给工具（会话元数据优先）；
         - 保留注册表原有的 ``approve``/``cancelled`` 回调。
         """
         if registry is None:
             return None
         session = self.middleware.ensure_session(session_id)
-        previous = getattr(registry, "context", None)
+        previous = getattr(registry, "session", None) or getattr(registry, "context", None)
         if session.workspace is None and previous is not None:
-            session.set_workspace(previous.workspace)
+            session.set_workspace(previous.effective_workspace)
         context_metadata = dict(getattr(previous, "metadata", {}) or {})
         context_metadata.update(metadata or {})
-        registry.context = session.runtime_context(
+        registry.session = session.tool_context(
             metadata=context_metadata,
             approve=getattr(previous, "approve", None),
             cancelled=getattr(previous, "cancelled", None),
@@ -318,8 +318,10 @@ class AgentEngine:
         self.events_bus.emit_sync({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
-        self._tool_definitions(registry, kwargs)
+        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
+        # 这样会话中禁用的工具不会被提供给 LLM。
         session = self._bind_tool_context(registry, session_id, metadata)
+        self._tool_definitions(registry, kwargs)
         try:
             response = self.middleware.complete(request.messages(), session_id=session_id, **kwargs)
             execution_context = request.messages()
@@ -359,8 +361,10 @@ class AgentEngine:
         await self.events_bus.emit({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
-        self._tool_definitions(registry, kwargs)
+        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
+        # 这样会话中禁用的工具不会被提供给 LLM。
         session = self._bind_tool_context(registry, session_id, metadata)
+        self._tool_definitions(registry, kwargs)
         try:
             response = await self.middleware.acomplete(request.messages(), session_id=session_id, **kwargs)
             execution_context = request.messages()
@@ -412,8 +416,10 @@ class AgentEngine:
         self.events_bus.emit_sync({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
-        self._tool_definitions(registry, kwargs)
+        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
+        # 这样会话中禁用的工具不会被提供给 LLM。
         session = self._bind_tool_context(registry, session_id, metadata)
+        self._tool_definitions(registry, kwargs)
         messages: MessageInputs = request.messages()
         execution_context = request.messages()
         rounds = max_tool_rounds if max_tool_rounds is not None else self.max_tool_rounds
@@ -486,8 +492,10 @@ class AgentEngine:
         await self.events_bus.emit({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
-        self._tool_definitions(registry, kwargs)
+        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
+        # 这样会话中禁用的工具不会被提供给 LLM。
         session = self._bind_tool_context(registry, session_id, metadata)
+        self._tool_definitions(registry, kwargs)
 
         messages: MessageInputs = request.messages()
         execution_context = request.messages()

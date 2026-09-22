@@ -1,4 +1,4 @@
-"""会话状态：对话的工作区、上下文表示和元数据。
+"""会话状态：对话的工作区、上下文表示、元数据和工具执行配置。
 
 Context 层用 ``Session`` 表示一次会话的全部状态：
 
@@ -7,13 +7,17 @@ Session
 ├── session_id      会话 ID
 ├── workspace       会话工作区（工具执行的根目录）
 ├── context         上下文表示（provider-neutral 的消息列表）
-└── metadata        会话级扩展信息
+├── metadata        会话级扩展信息
+│   └── tools       工具配置（启用/禁用、每个工具的选项）
+├── approve         工具授权回调
+└── cancelled       取消检查回调
 ```
 
-``atom_agent.tools.RuntimeContext`` 是 Session 的近似实现：它只有
-``workspace``/``metadata``/``approve``/``cancelled``，且属于工具注册表级别，
-不区分 ``session_id``。``Session.runtime_context()`` 负责把会话状态转换成
-``RuntimeContext``，让工具在会话的工作区中执行，同时保留会话级元数据。
+工具执行上下文（原来的 ``atom_agent.tools.RuntimeContext``）已经合并进
+``Session``：``workspace`` / ``metadata`` / ``approve`` / ``cancelled`` /
+``log()`` / ``is_cancelled()`` 全部由 Session 提供，``ToolRegistry`` 直接读取
+Session 中的工具配置。``tools.RuntimeContext`` 名字仍然可用，但它只是
+``Session`` 的兼容别名。
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 try:
     from ..messages.agent_message import (
@@ -40,11 +44,11 @@ except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
         to_dict as message_to_dict,
     )
 
-if TYPE_CHECKING:  # 仅用于类型标注，避免 context 层与 tools 层在导入期互相依赖
-    from ..tools.core import RuntimeContext
-
 ApproveFn = Callable[[str, dict[str, Any]], bool]
 CancelFn = Callable[[], bool]
+
+# 工具配置在 metadata 中的键：metadata["tools"]。
+TOOL_CONFIG_KEY = "tools"
 
 
 def utc_now() -> str:
@@ -54,11 +58,13 @@ def utc_now() -> str:
 
 @dataclass
 class Session:
-    """一次会话的完整状态：工作区 + 上下文表示 + 元数据。
+    """一次会话的完整状态：工作区 + 上下文表示 + 元数据 + 工具执行配置。
 
+    它同时就是工具运行上下文（原 ``tools.RuntimeContext`` 已合并到这里）：
     ``workspace`` 为 ``None`` 表示“尚未显式指定”，运行时可以继承工具注册表的
-    工作区；``effective_workspace`` 给出实际生效的目录。``approve``/``cancelled``
-    与 ``tools.RuntimeContext`` 语义一致，用来构造工具运行环境。
+    工作区，``effective_workspace`` 给出实际生效的目录；``metadata`` /
+    ``approve`` / ``cancelled`` / ``log()`` / ``is_cancelled()`` 供
+    ``ToolRegistry`` 和工具使用，其中 ``metadata["tools"]`` 保存工具配置。
     """
 
     session_id: str = "default"
@@ -125,32 +131,118 @@ class Session:
         self.metadata.update(values)
         return self.touch()
 
-    def runtime_context(
+    # ------------------------------------------------------------------
+    # 工具执行环境（原 tools.RuntimeContext 的能力）
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def cwd(cls, session_id: str = "default") -> "Session":
+        """以当前进程工作目录作为会话工作区。"""
+        return cls(session_id=session_id, workspace=Path.cwd())
+
+    def log(self, message: str) -> None:
+        """调用 ``metadata["log"]`` 回调（工具输出通道）。"""
+        callback = self.metadata.get("log")
+        if callable(callback):
+            callback(message)
+
+    def is_cancelled(self) -> bool:
+        """``cancelled`` 回调为真时表示会话已请求取消。"""
+        return bool(self.cancelled and self.cancelled())
+
+    def tool_config(self) -> dict[str, Any]:
+        """返回 ``metadata["tools"]`` 工具配置（副本）。"""
+        config = self.metadata.get(TOOL_CONFIG_KEY)
+        return dict(config) if isinstance(config, Mapping) else {}
+
+    def tool_options(self, tool_name: str | None = None) -> dict[str, Any]:
+        """返回工具选项；传入工具名时合并该工具的专属配置。
+
+        配置结构::
+
+            metadata["tools"] = {
+                "enabled": ["read_file"],          # 白名单（非空时生效）
+                "disabled": ["bash"],             # 黑名单
+                "timeout": 30,                    # 全局选项
+                "options": {"bash": {"timeout": 60}},  # 每个工具的选项
+            }
+        """
+        config = self.tool_config()
+        options = {
+            key: value
+            for key, value in config.items()
+            if key not in {"enabled", "disabled", "options"}
+        }
+        if tool_name is not None:
+            per_tool = config.get("options")
+            if isinstance(per_tool, Mapping):
+                specific = per_tool.get(tool_name)
+                if isinstance(specific, Mapping):
+                    options.update(specific)
+        return options
+
+    def tool_enabled(self, tool_name: str) -> bool:
+        """按会话工具配置判断工具是否启用。"""
+        config = self.tool_config()
+        disabled = config.get("disabled")
+        if isinstance(disabled, (list, tuple, set, frozenset)) and tool_name in disabled:
+            return False
+        enabled = config.get("enabled")
+        if isinstance(enabled, (list, tuple, set, frozenset)) and enabled:
+            return tool_name in enabled
+        return True
+
+    def configure_tools(
+        self,
+        *,
+        enabled: Iterable[str] | None = None,
+        disabled: Iterable[str] | None = None,
+        options: Mapping[str, Mapping[str, Any]] | None = None,
+        **values: Any,
+    ) -> "Session":
+        """写入会话级工具配置（合并到 ``metadata["tools"]``）。"""
+        config = self.tool_config()
+        if enabled is not None:
+            config["enabled"] = list(enabled)
+        if disabled is not None:
+            config["disabled"] = list(disabled)
+        if options is not None:
+            merged: dict[str, Any] = dict(config.get("options") or {})
+            for name, value in options.items():
+                specific = dict(merged.get(name) or {})
+                specific.update(value or {})
+                merged[str(name)] = specific
+            config["options"] = merged
+        config.update(values)
+        return self.update_metadata(**{TOOL_CONFIG_KEY: config})
+
+    def tool_context(
         self,
         *,
         metadata: Mapping[str, Any] | None = None,
         approve: ApproveFn | None = None,
         cancelled: CancelFn | None = None,
-    ) -> "RuntimeContext":
-        """把会话转换成工具执行环境（``tools.RuntimeContext``）。
+    ) -> "Session":
+        """返回本次工具执行的会话视图。
 
-        元数据优先级：调用方 ``metadata`` < 会话 ``metadata``，并且始终写入当前
-        ``session_id``；``approve``/``cancelled`` 缺省时使用会话自身的回调。
+        视图与源会话共享 ``session_id``、工作区和回调，并把调用方 ``metadata``
+        （例如引擎本次调用的元数据）合并进会话元数据后交给工具使用；会话元数据
+        优先，并且始终写入当前 ``session_id``。
         """
-        try:
-            from ..tools.core import RuntimeContext
-        except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
-            from tools.core import RuntimeContext
-
         merged = dict(metadata or {})
         merged.update(self.metadata)
         merged["session_id"] = self.session_id
-        return RuntimeContext(
-            workspace=self.effective_workspace,
+        return replace(
+            self,
             metadata=merged,
             approve=approve or self.approve,
             cancelled=cancelled or self.cancelled,
+            context=self.context,
         )
+
+    def runtime_context(self, **kwargs: Any) -> "Session":
+        """兼容旧命名：等价于 ``tool_context()``。"""
+        return self.tool_context(**kwargs)
 
     # ------------------------------------------------------------------
     # 序列化
@@ -191,5 +283,5 @@ class Session:
         )
 
 
-__all__ = ["Session", "ApproveFn", "CancelFn", "utc_now"]
+__all__ = ["Session", "ApproveFn", "CancelFn", "TOOL_CONFIG_KEY", "utc_now"]
 
