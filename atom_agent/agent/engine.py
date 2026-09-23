@@ -302,6 +302,10 @@ class AgentEngine:
         )
         context.extend(results)
 
+    def _record_tool_results(self, session_id: str, results: list[MessageToolResult]) -> None:
+        if results:
+            self.middleware.append_tool_results(session_id, results)
+
     def run(
         self,
         prompt: MessageInputs,
@@ -334,12 +338,13 @@ class AgentEngine:
                     self.events_bus.emit_sync({"type": "message_end", "message": result.output})
                     self.events_bus.emit_sync({"type": "turn_end", "message": result.output, "tool_results": []})
                     return result
-                if round_index >= rounds:
-                    raise RuntimeError("工具调用超过最大轮次")
                 results = self._tool_results(response, registry)
                 self._append_tool_round(execution_context, response, results)
                 self.events_bus.emit_sync({"type": "turn_end", "message": execution_context[-len(results)-1],
                                            "tool_results": results})
+                if round_index >= rounds:
+                    self._record_tool_results(session_id, results)
+                    raise RuntimeError("工具调用超过最大轮次")
                 response = self.middleware.complete(results, session_id=session_id, **kwargs)
             raise RuntimeError("工具调用超过最大轮次")
         finally:
@@ -377,12 +382,13 @@ class AgentEngine:
                     await self.events_bus.emit({"type": "message_end", "message": result.output})
                     await self.events_bus.emit({"type": "turn_end", "message": result.output, "tool_results": []})
                     return result
-                if round_index >= rounds:
-                    raise RuntimeError("工具调用超过最大轮次")
                 results = await self._tool_results_async(response, registry)
                 self._append_tool_round(execution_context, response, results)
                 await self.events_bus.emit({"type": "turn_end", "message": execution_context[-len(results)-1],
                                             "tool_results": results})
+                if round_index >= rounds:
+                    self._record_tool_results(session_id, results)
+                    raise RuntimeError("工具调用超过最大轮次")
                 response = await self.middleware.acomplete(results, session_id=session_id, **kwargs)
             raise RuntimeError("工具调用超过最大轮次")
         finally:
@@ -466,12 +472,13 @@ class AgentEngine:
                 )
                 return
 
-            if round_index >= rounds:
-                raise RuntimeError("工具调用超过最大轮次")
             results = self._tool_results(response, registry)
             self._append_tool_round(execution_context, response, results)
             self.events_bus.emit_sync({"type": "turn_end", "message": execution_context[-len(results)-1],
                                        "tool_results": results})
+            if round_index >= rounds:
+                self._record_tool_results(session_id, results)
+                raise RuntimeError("工具调用超过最大轮次")
             messages = results
 
         raise RuntimeError("工具调用超过最大轮次")
@@ -543,12 +550,13 @@ class AgentEngine:
                 )
                 return
 
-            if round_index >= rounds:
-                raise RuntimeError("工具调用超过最大轮次")
             results = await self._tool_results_async(response, registry)
             self._append_tool_round(execution_context, response, results)
             await self.events_bus.emit({"type": "turn_end", "message": execution_context[-len(results)-1],
                                         "tool_results": results})
+            if round_index >= rounds:
+                self._record_tool_results(session_id, results)
+                raise RuntimeError("工具调用超过最大轮次")
             messages = results
 
         raise RuntimeError("工具调用超过最大轮次")

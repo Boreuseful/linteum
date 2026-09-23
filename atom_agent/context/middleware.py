@@ -91,6 +91,9 @@ class ContextMiddleware:
     def clear_context(self, session_id: str = "default") -> None:
         self.store.clear(session_id)
 
+    def append_tool_results(self, session_id: str, results: MessageInputs) -> None:
+        self.store.append(session_id, results)
+
     def complete(self, messages: MessageInputs, *, session_id: str = "default", **kwargs: Any) -> LLMResponse:
         response = self.client.complete(self._messages(session_id, messages), session_id=session_id, **kwargs)
         self._save_turn(session_id, messages, response)
