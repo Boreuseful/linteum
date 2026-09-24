@@ -175,6 +175,7 @@ class AgentEngine:
         """把会话绑定到工具注册表，让工具使用会话的工作区与工具配置。
 
         - 会话工作区未显式指定时，继承注册表当前会话的工作区（保持旧行为）；
+        - 把注册表中的工具记录进会话（``session.registered_tools()``）；
         - 本次调用 ``metadata`` 与会话元数据一起交给工具（会话元数据优先）；
         - 保留注册表原有的 ``approve``/``cancelled`` 回调。
         """
@@ -184,6 +185,8 @@ class AgentEngine:
         previous = getattr(registry, "session", None) or getattr(registry, "context", None)
         if session.workspace is None and previous is not None:
             session.set_workspace(previous.effective_workspace)
+        # 记录本会话注册的工具，再生成会话视图，让视图也能读到 registered 列表。
+        session.register_tools(registry.all())
         context_metadata = dict(getattr(previous, "metadata", {}) or {})
         context_metadata.update(metadata or {})
         registry.session = session.tool_context(
@@ -581,4 +584,9 @@ class AgentEngine:
         return self.middleware.set_workspace(session_id, workspace)
 
     def get_session_usage(self, session_id: str = "default") -> dict[str, int]:
+        """返回会话累计 token usage（input/output/cache_hit/total）。"""
         return self.middleware.get_session_usage(session_id)
+
+    def reset_session_usage(self, session_id: str = "default") -> Session | None:
+        """把会话累计 token usage 归零；会话不存在时返回 ``None``。"""
+        return self.middleware.reset_session_usage(session_id)

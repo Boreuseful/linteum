@@ -16,6 +16,8 @@ class ToolRegistry:
 
     - ``session.effective_workspace``：工具工作区（内置 Tool 读取它做路径约束）；
     - ``session.metadata["tools"]``：启用/禁用列表与每个工具的选项；
+    - ``session.metadata["tools"]["registered"]``：本会话注册的工具（``register()`` 时写入，
+      可用 ``session.registered_tools()`` 读取）；
     - ``session.approve``：``requires_approval`` 工具的授权回调；
     - ``session.cancelled``：执行前的取消检查；
     - ``session.metadata`` / ``session.log()``：会话信息与工具输出通道。
@@ -55,8 +57,9 @@ class ToolRegistry:
         return self.session.effective_workspace
 
     def bind_session(self, session: Session) -> Session:
-        """切换工具注册表使用的会话，并返回它。"""
+        """切换工具注册表使用的会话，并把已注册工具记录到该会话，返回它。"""
         self.session = session
+        session.register_tools(self.all())
         return session
 
     # ------------------------------------------------------------------
@@ -72,6 +75,8 @@ class ToolRegistry:
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool name: {tool.name}")
             self._tools[tool.name] = tool
+        # 在会话中登记本会话注册（可用）的工具，供 session.registered_tools() 读取。
+        self.session.register_tools(tool)
 
     def all(self) -> list[Tool]:
         with self._lock:

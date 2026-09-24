@@ -235,6 +235,16 @@ class SkillRegistry:
         """
         return list(self._candidates.get(name, []))
 
+    def bind_session(self, session: Session) -> Session:
+        """
+        把当前生效的 Skill 记录到会话，返回该会话。
+
+        等价于 ``session.register_skills(self.list_skills())``，会话随后可用
+        ``session.registered_skills()`` 查看本会话注册了哪些 Skill。
+        """
+        session.register_skills(self.list_skills())
+        return session
+
     # ------------------------------------------------------------------
     # Prompt index
     # ------------------------------------------------------------------

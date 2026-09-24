@@ -18,7 +18,7 @@ try:
         to_dict,
     )
     from .store import ContextStore
-    from .session import Session
+    from .session import USAGE_KEY, Session
 except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
     from model.client import LLMClient
     from model.llm import LLMResponse, LLMStreamChunk
@@ -33,7 +33,7 @@ except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
         to_dict,
     )
     from store import ContextStore
-    from session import Session
+    from session import USAGE_KEY, Session
 
 ContextInjector = Callable[[str, list[Message]], Iterable[MessageInput]]
 
@@ -84,6 +84,10 @@ class ContextMiddleware:
         if self.persist_user_messages:
             self.store.append(session_id, messages)
         self.store.append(session_id, self._response_message(response))
+        # 累计本轮 token 用量（input/output/cache_hit）到会话，随会话一起持久化。
+        session = self.store.get_session(session_id)
+        if session is not None:
+            session.record_usage(response.usage)
 
     def get_context(self, session_id: str = "default") -> list[Message]:
         return self.store.get(session_id)
@@ -153,4 +157,19 @@ class ContextMiddleware:
         return self.store.set_workspace(session_id, workspace)
 
     def get_session_usage(self, session_id: str = "default") -> dict[str, int]:
-        return self.client.get_session_usage(session_id)
+        """返回会话累计的 token 用量（input/output/cache_hit/total）。
+
+        会话记录过用量（``metadata["usage"]`` 存在）时以会话为准，因此 ``reset_session_usage()``
+        之后读到的是归零结果；会话尚未记录过时回退到 ``LLMClient`` 的计数。
+        """
+        session = self.store.get_session(session_id)
+        if session is not None and USAGE_KEY in session.metadata:
+            return session.usage()
+        return dict(self.client.get_session_usage(session_id))
+
+    def reset_session_usage(self, session_id: str = "default") -> Session | None:
+        """把会话累计的 token 用量归零；会话不存在时返回 ``None``。"""
+        session = self.store.get_session(session_id)
+        if session is not None:
+            session.reset_usage()
+        return session
