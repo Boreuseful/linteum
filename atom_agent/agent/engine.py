@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
 try:
     from ..context.middleware import ContextMiddleware
+    from ..context.session import Session
     from ..model.client import LLMClient
     from ..model.llm import LLMResponse, LLMStreamChunk
     from ..messages.agent_message import (
@@ -18,6 +20,7 @@ try:
     )
 except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
     from context.middleware import ContextMiddleware
+    from context.session import Session
     from model.client import LLMClient
     from model.llm import LLMResponse, LLMStreamChunk
     from messages.agent_message import AssistantMessage, Message, MessageInputs, ToolCall, normalize_messages, to_dict
@@ -92,6 +95,8 @@ class AgentResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     response: LLMResponse | None = None
+    # 本次执行使用的会话工作区（来自 Session；没有工具注册表时为 None）。
+    workspace: Path | None = None
 
     @property
     def output(self) -> Message:
@@ -103,6 +108,7 @@ class AgentResult:
             "text": self.text,
             "context": [to_dict(message) for message in self.context],
             "usage": self.usage,
+            "workspace": str(self.workspace) if self.workspace is not None else None,
             "tool_calls": [
                 {"id": call.id, "name": call.name, "arguments": call.arguments}
                 for call in self.tool_calls
@@ -160,11 +166,42 @@ class AgentEngine:
             metadata=dict(metadata or {}),
         )
 
+    def _bind_tool_context(
+        self,
+        registry: ToolRegistry | None,
+        session_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> Session | None:
+        """把会话绑定到工具注册表，让工具使用会话的工作区与工具配置。
+
+        - 会话工作区未显式指定时，继承注册表当前会话的工作区（保持旧行为）；
+        - 把注册表中的工具记录进会话（``session.registered_tools()``）；
+        - 本次调用 ``metadata`` 与会话元数据一起交给工具（会话元数据优先）；
+        - 保留注册表原有的 ``approve``/``cancelled`` 回调。
+        """
+        if registry is None:
+            return None
+        session = self.middleware.ensure_session(session_id)
+        previous = getattr(registry, "session", None) or getattr(registry, "context", None)
+        if session.workspace is None and previous is not None:
+            session.set_workspace(previous.effective_workspace)
+        # 记录本会话注册的工具，再生成会话视图，让视图也能读到 registered 列表。
+        session.register_tools(registry.all())
+        context_metadata = dict(getattr(previous, "metadata", {}) or {})
+        context_metadata.update(metadata or {})
+        registry.session = session.tool_context(
+            metadata=context_metadata,
+            approve=getattr(previous, "approve", None),
+            cancelled=getattr(previous, "cancelled", None),
+        )
+        return session
+
     def _wrap_response(
         self,
         request: AgentContext,
         response: LLMResponse,
         context: list[Message] | None = None,
+        session: Session | None = None,
     ) -> AgentResult:
         # middleware 已经把 response 包装成 AssistantMessage 并保存到 session；
         # 这里返回当前请求输入和本次 assistant 输出组成的结构化 context。
@@ -188,6 +225,7 @@ class AgentEngine:
             tool_calls=list(response.tool_calls),
             metadata=dict(request.metadata),
             response=response,
+            workspace=session.workspace if session is not None else None,
         )
 
     @staticmethod
@@ -267,6 +305,10 @@ class AgentEngine:
         )
         context.extend(results)
 
+    def _record_tool_results(self, session_id: str, results: list[MessageToolResult]) -> None:
+        if results:
+            self.middleware.append_tool_results(session_id, results)
+
     def run(
         self,
         prompt: MessageInputs,
@@ -283,6 +325,9 @@ class AgentEngine:
         self.events_bus.emit_sync({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
+        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
+        # 这样会话中禁用的工具不会被提供给 LLM。
+        session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
         try:
             response = self.middleware.complete(request.messages(), session_id=session_id, **kwargs)
@@ -291,17 +336,18 @@ class AgentEngine:
             for round_index in range(rounds + 1):
                 self.events_bus.emit_sync({"type": "turn_start"})
                 if not response.tool_calls or registry is None:
-                    result = self._wrap_response(request, response, execution_context)
+                    result = self._wrap_response(request, response, execution_context, session)
                     self.events_bus.emit_sync({"type": "message_start", "message": result.output})
                     self.events_bus.emit_sync({"type": "message_end", "message": result.output})
                     self.events_bus.emit_sync({"type": "turn_end", "message": result.output, "tool_results": []})
                     return result
-                if round_index >= rounds:
-                    raise RuntimeError("工具调用超过最大轮次")
                 results = self._tool_results(response, registry)
                 self._append_tool_round(execution_context, response, results)
                 self.events_bus.emit_sync({"type": "turn_end", "message": execution_context[-len(results)-1],
                                            "tool_results": results})
+                if round_index >= rounds:
+                    self._record_tool_results(session_id, results)
+                    raise RuntimeError("工具调用超过最大轮次")
                 response = self.middleware.complete(results, session_id=session_id, **kwargs)
             raise RuntimeError("工具调用超过最大轮次")
         finally:
@@ -323,6 +369,9 @@ class AgentEngine:
         await self.events_bus.emit({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
+        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
+        # 这样会话中禁用的工具不会被提供给 LLM。
+        session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
         try:
             response = await self.middleware.acomplete(request.messages(), session_id=session_id, **kwargs)
@@ -331,17 +380,18 @@ class AgentEngine:
             for round_index in range(rounds + 1):
                 await self.events_bus.emit({"type": "turn_start"})
                 if not response.tool_calls or registry is None:
-                    result = self._wrap_response(request, response, execution_context)
+                    result = self._wrap_response(request, response, execution_context, session)
                     await self.events_bus.emit({"type": "message_start", "message": result.output})
                     await self.events_bus.emit({"type": "message_end", "message": result.output})
                     await self.events_bus.emit({"type": "turn_end", "message": result.output, "tool_results": []})
                     return result
-                if round_index >= rounds:
-                    raise RuntimeError("工具调用超过最大轮次")
                 results = await self._tool_results_async(response, registry)
                 self._append_tool_round(execution_context, response, results)
                 await self.events_bus.emit({"type": "turn_end", "message": execution_context[-len(results)-1],
                                             "tool_results": results})
+                if round_index >= rounds:
+                    self._record_tool_results(session_id, results)
+                    raise RuntimeError("工具调用超过最大轮次")
                 response = await self.middleware.acomplete(results, session_id=session_id, **kwargs)
             raise RuntimeError("工具调用超过最大轮次")
         finally:
@@ -375,6 +425,9 @@ class AgentEngine:
         self.events_bus.emit_sync({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
+        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
+        # 这样会话中禁用的工具不会被提供给 LLM。
+        session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
         messages: MessageInputs = request.messages()
         execution_context = request.messages()
@@ -410,7 +463,7 @@ class AgentEngine:
                 return
             response = final_chunk.response
             if not response.tool_calls or registry is None:
-                result = self._wrap_response(request, response, execution_context)
+                result = self._wrap_response(request, response, execution_context, session)
                 self.events_bus.emit_sync({"type": "message_start", "message": result.output})
                 self.events_bus.emit_sync({"type": "message_end", "message": result.output})
                 self.events_bus.emit_sync({"type": "turn_end", "message": result.output, "tool_results": []})
@@ -422,12 +475,13 @@ class AgentEngine:
                 )
                 return
 
-            if round_index >= rounds:
-                raise RuntimeError("工具调用超过最大轮次")
             results = self._tool_results(response, registry)
             self._append_tool_round(execution_context, response, results)
             self.events_bus.emit_sync({"type": "turn_end", "message": execution_context[-len(results)-1],
                                        "tool_results": results})
+            if round_index >= rounds:
+                self._record_tool_results(session_id, results)
+                raise RuntimeError("工具调用超过最大轮次")
             messages = results
 
         raise RuntimeError("工具调用超过最大轮次")
@@ -448,6 +502,9 @@ class AgentEngine:
         await self.events_bus.emit({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
+        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
+        # 这样会话中禁用的工具不会被提供给 LLM。
+        session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
 
         messages: MessageInputs = request.messages()
@@ -484,7 +541,7 @@ class AgentEngine:
                 return
             response = final_chunk.response
             if not response.tool_calls or registry is None:
-                result = self._wrap_response(request, response, execution_context)
+                result = self._wrap_response(request, response, execution_context, session)
                 await self.events_bus.emit({"type": "message_start", "message": result.output})
                 await self.events_bus.emit({"type": "message_end", "message": result.output})
                 await self.events_bus.emit({"type": "turn_end", "message": result.output, "tool_results": []})
@@ -496,12 +553,13 @@ class AgentEngine:
                 )
                 return
 
-            if round_index >= rounds:
-                raise RuntimeError("工具调用超过最大轮次")
             results = await self._tool_results_async(response, registry)
             self._append_tool_round(execution_context, response, results)
             await self.events_bus.emit({"type": "turn_end", "message": execution_context[-len(results)-1],
                                         "tool_results": results})
+            if round_index >= rounds:
+                self._record_tool_results(session_id, results)
+                raise RuntimeError("工具调用超过最大轮次")
             messages = results
 
         raise RuntimeError("工具调用超过最大轮次")
@@ -509,5 +567,26 @@ class AgentEngine:
     def get_context(self, session_id: str = "default") -> list[Message]:
         return self.middleware.get_context(session_id)
 
+    def get_session(self, session_id: str = "default") -> Session | None:
+        """返回会话（工作区 + 上下文表示 + 元数据）；不存在时为 ``None``。"""
+        return self.middleware.get_session(session_id)
+
+    def ensure_session(self, session_id: str = "default", *, workspace: str | Path | None = None) -> Session:
+        """获取会话；不存在时创建。"""
+        return self.middleware.ensure_session(session_id, workspace=workspace)
+
+    def get_workspace(self, session_id: str = "default") -> Path:
+        """返回会话生效的工作区。"""
+        return self.middleware.session_workspace(session_id)
+
+    def set_workspace(self, session_id: str, workspace: str | Path | None) -> Session:
+        """设置会话工作区；``None`` 表示恢复为“运行时继承”。"""
+        return self.middleware.set_workspace(session_id, workspace)
+
     def get_session_usage(self, session_id: str = "default") -> dict[str, int]:
+        """返回会话累计 token usage（input/output/cache_hit/total）。"""
         return self.middleware.get_session_usage(session_id)
+
+    def reset_session_usage(self, session_id: str = "default") -> Session | None:
+        """把会话累计 token usage 归零；会话不存在时返回 ``None``。"""
+        return self.middleware.reset_session_usage(session_id)

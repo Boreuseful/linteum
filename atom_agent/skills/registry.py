@@ -6,7 +6,7 @@ from typing import Iterable, Literal,Any
 import re
 from .core import SkillMetadata,SkillSource
 
-from ..tools import RuntimeContext, Tool, ToolResult
+from ..tools import Session, Tool, ToolResult
 
 class SkillRegistry:
     """
@@ -235,6 +235,16 @@ class SkillRegistry:
         """
         return list(self._candidates.get(name, []))
 
+    def bind_session(self, session: Session) -> Session:
+        """
+        把当前生效的 Skill 记录到会话，返回该会话。
+
+        等价于 ``session.register_skills(self.list_skills())``，会话随后可用
+        ``session.registered_skills()`` 查看本会话注册了哪些 Skill。
+        """
+        session.register_skills(self.list_skills())
+        return session
+
     # ------------------------------------------------------------------
     # Prompt index
     # ------------------------------------------------------------------
@@ -307,7 +317,7 @@ class SkillRegistry:
         )
 
     def create_load_skill(self)-> Tool:
-        def execute(args:dict[str,Any], context: RuntimeContext):
+        def execute(args:dict[str,Any], context: Session):
             try:
                 value = self.load_skill(args.get("name", "."))
                 return ToolResult(value)
@@ -363,7 +373,7 @@ class SkillRegistry:
             use_cache=use_cache,
         )
     def create_load_reference(self)-> Tool:
-        def execute(args:dict[str,Any], context: RuntimeContext):
+        def execute(args:dict[str,Any], context: Session):
             try:
                 value = self.load_reference(args["skill_name",args['relative_path']])
                 return ToolResult(value)
