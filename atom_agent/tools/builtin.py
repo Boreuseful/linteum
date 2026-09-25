@@ -136,7 +136,7 @@ def create_write_file_tool() -> Tool:
 def create_bash_tool(timeout: float = 30) -> Tool:
     def execute(args: dict[str, Any], context: Session) -> ToolResult:
         try:
-            # 会话可以为该工具单独配置超时：metadata["tools"]["options"]["bash"]["timeout"]
+            # 会话可以为该工具单独配置超时：session.tools["options"]["bash"]["timeout"]
             effective_timeout = float(context.tool_options("bash").get("timeout", timeout))
             value = run_bash(args["command"], root_dir=context.effective_workspace,
                              cwd=args.get("cwd"), timeout=effective_timeout)

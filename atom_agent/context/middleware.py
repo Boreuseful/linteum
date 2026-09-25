@@ -18,7 +18,7 @@ try:
         to_dict,
     )
     from .store import ContextStore
-    from .session import USAGE_KEY, Session
+    from .session import Session, empty_usage
 except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
     from model.client import LLMClient
     from model.llm import LLMResponse, LLMStreamChunk
@@ -33,7 +33,7 @@ except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
         to_dict,
     )
     from store import ContextStore
-    from session import USAGE_KEY, Session
+    from session import Session, empty_usage
 
 ContextInjector = Callable[[str, list[Message]], Iterable[MessageInput]]
 
@@ -159,12 +159,15 @@ class ContextMiddleware:
     def get_session_usage(self, session_id: str = "default") -> dict[str, int]:
         """返回会话累计的 token 用量（input/output/cache_hit/total）。
 
-        会话记录过用量（``metadata["usage"]`` 存在）时以会话为准，因此 ``reset_session_usage()``
-        之后读到的是归零结果；会话尚未记录过时回退到 ``LLMClient`` 的计数。
+        会话存在时以独立字段 ``session.usage``（可持久化）为准，因此
+        ``reset_session_usage()`` 之后读到的是归零结果；会话不存在时回退到
+        ``LLMClient`` 的计数。
         """
         session = self.store.get_session(session_id)
-        if session is not None and USAGE_KEY in session.metadata:
-            return session.usage()
+        if session is not None:
+            usage = empty_usage()
+            usage.update(session.usage or {})
+            return usage
         return dict(self.client.get_session_usage(session_id))
 
     def reset_session_usage(self, session_id: str = "default") -> Session | None:

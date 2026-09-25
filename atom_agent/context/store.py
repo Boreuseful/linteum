@@ -15,17 +15,21 @@ except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
 
 
 class ContextStore:
-    """按 session 保存 ``Session``（工作区 + 上下文表示 + 元数据），并提供 JSON 持久化。
+    """按 session 保存 ``Session``（工作区 + 上下文表示 + 工具/Skill 配置 + usage），并提供 JSON 持久化。
 
     持久化格式为::
 
         {
-          "version": 2,
+          "version": 3,
           "sessions": {
             "demo-session": {
               "session_id": "demo-session",
               "workspace": "/workspace",
-              "metadata": {},
+              "metadata": {"owner": "alice"},
+              "tools": {"registered": ["read_file"], "disabled": ["bash"]},
+              "skills": {"registered": ["python-code-review"]},
+              "usage": {"input_tokens": 150, "output_tokens": 30,
+                        "cache_hit_tokens": 45, "total_tokens": 180},
               "created_at": "2026-01-01T00:00:00+00:00",
               "updated_at": "2026-01-01T00:00:00+00:00",
               "messages": [{"role": "user", "content": "你好"}]
@@ -33,14 +37,24 @@ class ContextStore:
           }
         }
 
-    ``version=1`` 的旧格式（``sessions`` 直接是消息列表）仍可读取：读取后这些会话的
-    ``workspace`` 取决于 store 的 ``default_workspace``（未配置时为 ``None``，运行时
-    继承工具注册表的工作区）。不使用 pickle，生成的内容可以直接检查、迁移或由其他
-    服务读取。
+    ``tools`` / ``skills`` / ``usage`` 是每个会话的顶层字段，与 ``metadata`` 平级。
+
+    向后兼容：
+
+    - ``version=2``：``tools`` / ``skills`` / ``usage`` 嵌在 ``metadata`` 中，读取时
+      自动迁移到独立字段并写回 version 3；
+    - ``version=1``：``sessions`` 直接是消息列表，加载后会话的 ``workspace`` 取决于
+      store 的 ``default_workspace``（未配置时为 ``None``，运行时继承工具注册表的
+      工作区）。
+
+    不使用 pickle，生成的内容可以直接检查、迁移或由其他服务读取。
     """
 
-    VERSION = 2
+    VERSION = 3
     LEGACY_VERSION = 1
+    # version 2：工具/Skill 配置与 usage 曾嵌在 ``metadata`` 中。
+    METADATA_VERSION = 2
+    READABLE_VERSIONS = (VERSION, METADATA_VERSION, LEGACY_VERSION)
 
     def __init__(
         self,
@@ -157,7 +171,7 @@ class ContextStore:
         if not isinstance(payload, dict):
             raise ValueError("上下文 JSON 根节点必须是对象")
         version = payload.get("version", self.LEGACY_VERSION)
-        if version not in (self.VERSION, self.LEGACY_VERSION):
+        if version not in self.READABLE_VERSIONS:
             raise ValueError(f"不支持的上下文版本: {version}")
         sessions = payload.get("sessions", {})
         if not isinstance(sessions, dict):

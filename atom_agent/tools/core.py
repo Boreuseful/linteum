@@ -12,7 +12,7 @@ except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
 
 # 工具运行上下文已经合并进 ``context.Session``：
 # - ``Session.effective_workspace``：工具工作区；
-# - ``Session.metadata`` / ``metadata["tools"]``：会话元数据与工具配置；
+# - ``Session.metadata``：会话元数据；``Session.tools``：工具配置；
 # - ``Session.approve`` / ``Session.cancelled`` / ``log()`` / ``is_cancelled()``：
 #   执行控制与输出通道。
 #

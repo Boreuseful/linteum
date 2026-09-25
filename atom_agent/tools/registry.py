@@ -15,8 +15,8 @@ class ToolRegistry:
     工具执行所需的配置全部来自 ``session``（即 ``context.Session``）：
 
     - ``session.effective_workspace``：工具工作区（内置 Tool 读取它做路径约束）；
-    - ``session.metadata["tools"]``：启用/禁用列表与每个工具的选项；
-    - ``session.metadata["tools"]["registered"]``：本会话注册的工具（``register()`` 时写入，
+    - ``session.tools``：会话级工具配置（``registered`` / ``enabled`` / ``disabled`` / ``options``）；
+    - ``session.tools["registered"]``：本会话注册的工具（``register()`` 时写入，
       可用 ``session.registered_tools()`` 读取）；
     - ``session.approve``：``requires_approval`` 工具的授权回调；
     - ``session.cancelled``：执行前的取消检查；
