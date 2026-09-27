@@ -8,3 +8,6 @@ wheels/
 test/
 .agent
 .vscode
+
+# 本地配置文件（可能包含 API Key）
+config.yaml
