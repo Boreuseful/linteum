@@ -20,7 +20,7 @@ class ContextStore:
     持久化格式为::
 
         {
-          "version": 3,
+          "version": 4,
           "sessions": {
             "demo-session": {
               "session_id": "demo-session",
@@ -32,29 +32,56 @@ class ContextStore:
                         "cache_hit_tokens": 45, "total_tokens": 180},
               "created_at": "2026-01-01T00:00:00+00:00",
               "updated_at": "2026-01-01T00:00:00+00:00",
-              "messages": [{"role": "user", "content": "你好"}]
+              "messages": [
+                {
+                  "round": 1,
+                  "context": [
+                    {"role": "user", "content": "你好"},
+                    {"role": "assistant", "content": "你好，有什么可以帮助你？"}
+                  ],
+                  "usage": {
+                    "input_tokens": 12, "output_tokens": 8,
+                    "cache_hit_tokens": 0, "total_tokens": 20,
+                    "context_tokens": 20, "context_chars": 42,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:05+00:00"
+                  }
+                }
+              ]
             }
           }
         }
+
+    ``messages`` 是**分轮的列表**：每一轮（= 一次完整 agent-loop）被包装成
+    ``{round, context, usage}``，其中 ``context`` 是这一轮的全部消息（请求 + 每次 LLM
+    调用 + 工具结果），``usage`` 保存这一轮的输入/输出 token 汇总、本轮占用的上下文空间
+    （``context_tokens`` / ``context_chars``）以及本轮起止时间
+    （``created_at`` / ``updated_at``）。
 
     ``tools`` / ``skills`` / ``usage`` 是每个会话的顶层字段，与 ``metadata`` 平级。
 
     向后兼容：
 
+    - ``version=3``：``messages`` 是扁平消息列表（``tools`` / ``skills`` / ``usage``
+      已是独立字段），读取时按「以 user 消息开始」切分成多轮；
     - ``version=2``：``tools`` / ``skills`` / ``usage`` 嵌在 ``metadata`` 中，读取时
-      自动迁移到独立字段并写回 version 3；
+      自动迁移到独立字段；
     - ``version=1``：``sessions`` 直接是消息列表，加载后会话的 ``workspace`` 取决于
       store 的 ``default_workspace``（未配置时为 ``None``，运行时继承工具注册表的
       工作区）。
 
+    保存时统一写成最新格式（version 4），因此读取一次旧文件即可完成格式升级。
+
     不使用 pickle，生成的内容可以直接检查、迁移或由其他服务读取。
     """
 
-    VERSION = 3
+    VERSION = 4
     LEGACY_VERSION = 1
     # version 2：工具/Skill 配置与 usage 曾嵌在 ``metadata`` 中。
     METADATA_VERSION = 2
-    READABLE_VERSIONS = (VERSION, METADATA_VERSION, LEGACY_VERSION)
+    # version 3：``messages`` 是扁平消息列表（尚未按轮包装）。
+    MESSAGES_VERSION = 3
+    READABLE_VERSIONS = (VERSION, MESSAGES_VERSION, METADATA_VERSION, LEGACY_VERSION)
 
     def __init__(
         self,

@@ -49,6 +49,45 @@ Session
 ``ContextMiddleware`` 每完成一轮 LLM 调用都会调用 ``Session.record_usage()``，
 因此 ``session.usage`` 可以直接读取本会话的累计用量，并且随会话 JSON 一起持久化。
 
+除累计用量外，**一次完整 agent-loop 会被包装成一个 ``Round``**（``session.rounds``）：
+``Round.context`` 是这一轮的全部消息（请求 + 每次 LLM 调用 + 工具结果），
+``Round.usage`` 是这一轮的 token 汇总与占用的上下文空间。``to_dict()`` 因此把
+``messages`` 序列化为**轮列表**::
+
+    "messages": [
+        {
+            "round": 1,
+            "context": [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "你好，有什么可以帮助你？"},
+            ],
+            "usage": {
+                "input_tokens": 12,       # 本轮输入 token
+                "output_tokens": 8,       # 本轮输出 token
+                "cache_hit_tokens": 0,    # 本轮命中的缓存 token
+                "total_tokens": 20,       # input + output
+                "context_tokens": 20,     # 本轮占用的上下文空间（估算 token 数）
+                "context_chars": 42,      # 本轮占用的上下文空间（字符数）
+                "created_at": "2026-01-01T00:00:00+00:00",   # 本轮开始时间
+                "updated_at": "2026-01-01T00:00:05+00:00",   # 本轮结束时间
+            },
+        },
+    ]
+
+一轮的生命周期是 ``begin_round()`` -> 多次 ``record_round()`` -> ``end_round()``：
+
+- ``AgentEngine``（``run`` / ``arun`` / ``stream`` / ``astream``）在工具循环开始前
+  ``begin_round()``、循环结束后（含异常、超轮次中断）``end_round()``，因此一次用户
+  请求「多次 LLM 调用 + 工具执行 + 最终回答」只占**一轮**；
+- 单独使用 ``ContextMiddleware`` 时没有 loop，一次 ``complete()`` / ``stream()``
+  自然就是一轮（``record_round()`` 会立即定稿）；
+- ``record_round()`` 把消息追加到 ``context``、把 token 累加到 ``session.usage`` 与
+  当前轮的 ``usage``；``Session.record_usage()`` 仍可单独更新累计用量；
+- 进行中的轮尚未 ``end_round()`` 时也会被 ``to_dict()`` 按当前进度输出，因此中途落盘
+  不会丢消息。
+
+读取旧格式（扁平消息列表）时会自动按轮切分/包装。
+
 兼容旧格式：``tools`` / ``skills`` / ``usage`` 曾嵌在 ``metadata`` 中，构造
 ``Session`` 或 ``Session.from_dict()`` 读取时会自动迁移到独立字段。
 
@@ -61,6 +100,7 @@ Session 中的工具配置。``tools.RuntimeContext`` 名字仍然可用，但�
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,6 +137,17 @@ REGISTERED_KEY = "registered"
 USAGE_KEY = "usage"
 # 会话累计的 token 指标；total_tokens 按 input + output 计算，与 LLMClient 一致。
 USAGE_METRICS = ("input_tokens", "output_tokens", "cache_hit_tokens", "total_tokens")
+
+# 分轮（round）持久化字段：``messages`` 中的每一项都是一个 Round。
+# 轮序号键（"round_1" 中的 1）、本轮消息键、以及本轮占用的上下文空间指标。
+ROUND_INDEX_KEY = "round"
+ROUND_CONTEXT_KEY = "context"
+# 本轮占用的上下文空间：估算 token 数与字符数。
+CONTEXT_TOKENS_KEY = "context_tokens"
+CONTEXT_CHARS_KEY = "context_chars"
+# 一轮对话 usage 中除 token 指标外的字段：占用的上下文空间 + 本轮起止时间。
+ROUND_SPACE_METRICS = (CONTEXT_TOKENS_KEY, CONTEXT_CHARS_KEY)
+ROUND_TIME_KEYS = ("created_at", "updated_at")
 
 # 需要从 metadata 独立出去的保留字段（兼容旧格式时用于迁移）。
 RESERVED_KEYS = (TOOL_CONFIG_KEY, SKILL_CONFIG_KEY, USAGE_KEY)
@@ -145,6 +196,190 @@ def _usage_delta(usage: Mapping[str, Any] | None) -> dict[str, int]:
         "total_tokens": input_tokens + output_tokens,
     }
 
+
+def _is_cjk(char: str) -> bool:
+    """判断字符是否按“一字 ≈ 一 token”估算（中日韩、全角符号等）。"""
+    code = ord(char)
+    return (
+        0x3000 <= code <= 0x303F      # CJK 标点
+        or 0x2E80 <= code <= 0x9FFF   # CJK 部首 / 汉字 / 假名
+        or 0xAC00 <= code <= 0xD7AF   # 谚文
+        or 0xF900 <= code <= 0xFAFF   # CJK 兼容汉字
+        or 0xFF00 <= code <= 0xFFEF   # 全角字符
+    )
+
+
+def estimate_tokens(text: str) -> int:
+    """粗略估算文本的 token 数：CJK 按 1 字 1 token、其余按 4 字符 1 token。
+
+    这里没有引入 tokenizer 依赖（不同 provider 的分词器不同），只用于记录“这一轮
+    对话占用的上下文空间”这一可比较的近似值。
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for char in text if _is_cjk(char))
+    latin = len(text) - cjk
+    return cjk + (latin + 3) // 4
+
+
+def measure_context(messages: MessageInputs) -> tuple[int, int]:
+    """测量一批消息占用的上下文空间，返回 ``(token 数, 字符数)``。
+
+    以 ``to_dict()`` 的内部格式（JSON 文本）作为度量口径，因此包含 role /
+    tool_calls 等结构开销，不同轮之间可比。
+    """
+    text = "".join(
+        json.dumps(message_to_dict(message), ensure_ascii=False)
+        for message in normalize_messages(messages)
+    )
+    return estimate_tokens(text), len(text)
+
+
+def _coerce_round_usage(value: Any) -> dict[str, Any]:
+    """归一化一轮对话的 usage：token 消耗 + 占用的上下文空间 + 起止时间。"""
+    raw: Mapping[str, Any] = value if isinstance(value, Mapping) else {}
+    delta = _usage_delta(raw)
+    usage: dict[str, Any] = {metric: delta[metric] for metric in USAGE_METRICS}
+    for metric in ROUND_SPACE_METRICS:
+        usage[metric] = int(raw.get(metric, 0) or 0)
+    for key in ROUND_TIME_KEYS:
+        usage[key] = str(raw.get(key) or utc_now())
+    return usage
+
+
+def _is_round_payload(value: Any) -> bool:
+    """判断 ``messages`` 中的一项是不是 round（普通消息没有 ``context`` 字段）。"""
+    return (
+        isinstance(value, Mapping)
+        and "role" not in value
+        and ROUND_CONTEXT_KEY in value
+    )
+
+
+def _message_role(value: Any) -> str | None:
+    """读取消息的 role（消息对象或字典都可以）。"""
+    role = getattr(value, "role", None)
+    if role is None and isinstance(value, Mapping):
+        role = value.get("role")
+    return str(role) if role else None
+
+
+def _flat_round(
+    messages: list[Any],
+    round: int,
+    created_at: str | None,
+    updated_at: str | None,
+) -> Round:
+    """把一段扁平消息包装成一轮（旧格式迁移用）；token 用量未知，按 0 记录。"""
+    tokens, chars = measure_context(messages)
+    return Round(
+        round=round,
+        context=messages,
+        usage={
+            **empty_usage(),
+            CONTEXT_TOKENS_KEY: tokens,
+            CONTEXT_CHARS_KEY: chars,
+            "created_at": created_at or utc_now(),
+            "updated_at": updated_at or utc_now(),
+        },
+    )
+
+
+def _rounds_from_flat(
+    messages: list[Any],
+    *,
+    created_at: str | None = None,
+    updated_at: str | None = None,
+) -> list[Round]:
+    """把旧格式的扁平消息列表按「以 user 消息开始」切分成多轮。"""
+    rounds: list[Round] = []
+    current: list[Any] = []
+    for item in messages:
+        if current and _message_role(item) == "user":
+            rounds.append(_flat_round(current, len(rounds) + 1, created_at, updated_at))
+            current = []
+        current.append(item)
+    if current:
+        rounds.append(_flat_round(current, len(rounds) + 1, created_at, updated_at))
+    return rounds
+
+
+def _split_rounds(
+    messages: Any,
+    *,
+    created_at: str | None = None,
+    updated_at: str | None = None,
+) -> tuple[list[Message], list["Round"]]:
+    """拆分会话快照的 ``messages``：新格式是轮列表，旧格式是扁平消息列表。
+
+    返回 ``(上下文消息, rounds)``。旧格式（version 1 / 2 / 3）会按「以 user 消息
+    开始」切分成多轮，token 用量未知时记 0（占用空间仍会测量）。
+    """
+    items = list(messages) if isinstance(messages, (list, tuple)) else []
+    if not any(_is_round_payload(item) for item in items):
+        return list(items), _rounds_from_flat(items, created_at=created_at, updated_at=updated_at)
+    rounds: list[Round] = []
+    context: list[Message] = []
+    for index, item in enumerate(items):
+        if _is_round_payload(item):
+            round = Round.from_dict(item, round=index + 1)
+            rounds.append(round)
+            context.extend(round.context)
+        else:  # 混排兜底：扁平消息仍然保留在上下文中
+            context.append(item)
+    return context, rounds
+
+
+def _normalize_rounds(value: Any) -> list["Round"]:
+    """把任意输入归一化成 ``list[Round]``（已实例化或字典都可以）。"""
+    rounds: list[Round] = []
+    for index, item in enumerate(value if isinstance(value, (list, tuple)) else []):
+        if isinstance(item, Round):
+            rounds.append(item)
+        elif isinstance(item, Mapping):
+            rounds.append(Round.from_dict(item, round=index + 1))
+    return rounds
+
+
+@dataclass
+class Round:
+    """一轮完整对话（一次 agent-loop）：本轮全部消息（``context``）+ 本轮汇总 usage。
+
+    ``usage`` 记录这一轮的输入/输出 token 汇总（loop 内各次 LLM 调用之和）、本轮占用
+    的上下文空间（``context_tokens`` / ``context_chars``）以及本轮的开始/结束时间
+    （``created_at`` / ``updated_at``）。序列化后对应 ``messages`` 中的一项::
+
+        {"round": 1, "context": [...], "usage": {...}}
+    """
+
+    round: int = 1
+    context: list[Message] = field(default_factory=list)
+    usage: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.round = int(self.round or 1)
+        self.context = normalize_messages(self.context)
+        self.usage = _coerce_round_usage(self.usage)
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可 JSON 序列化的轮快照。"""
+        return {
+            ROUND_INDEX_KEY: self.round,
+            ROUND_CONTEXT_KEY: [message_to_dict(message) for message in self.context],
+            USAGE_KEY: dict(self.usage),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any, *, round: int = 1) -> "Round":
+        """从 ``to_dict()`` 结果恢复；``payload`` 不是对象时视为空轮。"""
+        if isinstance(payload, Round):
+            return payload
+        value: Mapping[str, Any] = payload if isinstance(payload, Mapping) else {}
+        return cls(
+            round=int(value.get(ROUND_INDEX_KEY) or round or 1),
+            context=list(value.get(ROUND_CONTEXT_KEY) or []),
+            usage=value.get(USAGE_KEY),
+        )
 
 
 def _normalize_names(values: Any) -> list[str]:
@@ -196,6 +431,11 @@ class Session:
       与 ``registrations()``。
     - ``usage``：本会话累计的 token 用量（input / output / cache_hit / total），
       由 ``record_usage()`` 累加、``reset_usage()`` 归零，并随会话 JSON 持久化。
+    - ``rounds``：分轮记录，每一轮对话包装成 ``Round``（本轮 ``context`` + 本轮
+      ``usage``：input/output token、占用的上下文空间、起止时间）。**一轮 = 一次
+      完整 agent-loop**：``begin_round()`` 打开、``record_round()`` 并入、``end_round()``
+      定稿，因此一次用户请求（多次 LLM 调用 + 工具执行 + 最终回答）只占一轮；
+      ``to_dict()`` 据此把 ``messages`` 序列化为轮列表。
 
     为兼容旧数据，若 ``metadata`` 中仍带 ``tools`` / ``skills`` / ``usage``，
     构造时会自动迁移到上述字段，并从 ``metadata`` 中移除。
@@ -204,6 +444,10 @@ class Session:
     session_id: str = "default"
     workspace: Path | None = None
     context: list[Message] = field(default_factory=list)
+    # 分轮记录：每一轮对话的包装（本轮消息 + 本轮 usage）。上下文 = 各轮 context 的拼接。
+    rounds: list[Round] = field(default_factory=list)
+    # 进行中的轮（begin_round() 打开、end_round() 定稿前）；不是持久化字段。
+    _open_round: Round | None = field(default=None, init=False, repr=False, compare=False)
     # 会话级扩展信息（业务自定义；工具/Skill 配置与 usage 使用下面的独立字段）。
     metadata: dict[str, Any] = field(default_factory=dict)
     # 工具配置：registered / enabled / disabled / options 及全局选项。
@@ -222,6 +466,7 @@ class Session:
         if self.workspace is not None:
             self.workspace = Path(self.workspace).expanduser().resolve()
         self.context = normalize_messages(self.context)
+        self.rounds = _normalize_rounds(self.rounds)
         self.metadata = dict(self.metadata)
         self.tools = _capability_map(self.tools)
         self.skills = _capability_map(self.skills)
@@ -258,19 +503,198 @@ class Session:
         return list(self.context)
 
     def append(self, messages: MessageInput | Iterable[MessageInput]) -> "Session":
-        """追加消息（消息对象、字典或它们的集合）。"""
-        self.context.extend(normalize_messages(messages))
+        """追加消息（消息对象、字典或它们的集合）。
+
+        追加到 ``context``；若当前有进行中的轮（``begin_round()`` 打开），消息同时并入
+        该轮。需要单独记录本轮 usage 时使用 ``record_round()``。
+        """
+        items = normalize_messages(messages)
+        self.context.extend(items)
+        if self._open_round is not None:
+            self._open_round.context.extend(items)
         return self.touch()
 
     def replace(self, messages: MessageInputs) -> "Session":
-        """整体替换上下文表示。"""
+        """整体替换上下文表示（同时清空分轮记录与进行中的轮，保持两者一致）。"""
         self.context = normalize_messages(messages)
+        self.rounds = []
+        self._open_round = None
         return self.touch()
 
     def clear(self) -> "Session":
-        """清空上下文表示（保留工作区和元数据）。"""
+        """清空上下文表示与分轮记录（保留工作区和元数据）。"""
         self.context = []
+        self.rounds = []
+        self._open_round = None
         return self.touch()
+
+    # ------------------------------------------------------------------
+    # 分轮（round）包装：一轮 = 一次完整 agent-loop
+    # 轮 = context（本轮全部消息：请求 + 每轮回复 + 工具结果）+ usage（本轮汇总用量）
+    # ------------------------------------------------------------------
+
+    @property
+    def open_round(self) -> Round | None:
+        """返回进行中的轮（``begin_round()`` 打开、``end_round()`` 定稿前）。"""
+        return self._open_round
+
+    def begin_round(self, *, created_at: str | None = None) -> Round:
+        """开始一轮完整对话（AgentEngine 用它把一次 agent-loop 收进一轮）。
+
+        已有进行中的轮时直接返回它（幂等）。在 ``end_round()`` 之前，``append()`` /
+        ``record_round()`` 写入的消息与 usage 都会并入这一轮，因此一轮覆盖「一次用户
+        请求 -> 多次 LLM 调用 + 工具执行 -> 最终回答」。
+        """
+        if self._open_round is None:
+            round = Round(round=len(self.rounds) + 1)
+            start = created_at or utc_now()
+            usage = _coerce_round_usage(round.usage)
+            usage["created_at"] = start
+            usage["updated_at"] = start
+            round.usage = usage
+            self._open_round = round
+        return self._open_round
+
+    def end_round(self, *, updated_at: str | None = None) -> Round | None:
+        """结束进行中的轮（一次完整对话结束）：定稿本轮消息与 usage 到 ``rounds``。
+
+        结束时会用本轮的全部消息重新测量占用的上下文空间，并刷新本轮结束时间。
+        没有进行中的轮、或本轮还没有任何消息时返回 ``None``（不产生空轮）。
+        """
+        round = self._open_round
+        if round is None:
+            return None
+        self._open_round = None
+        if not round.context:
+            return None
+        round.round = len(self.rounds) + 1
+        self.rounds.append(self._refresh_round(round, updated_at=updated_at))
+        self.touch()
+        return round
+
+    def record_round(
+        self,
+        messages: MessageInputs = (),
+        usage: Mapping[str, Any] | None = None,
+        *,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> "Session":
+        """把一轮对话的消息与 usage 写入会话。
+
+        - 有进行中的轮（``begin_round()``，例如 AgentEngine 正在跑的完整 agent-loop）
+          时，本轮消息与 usage **并入**该轮（``created_at`` / ``updated_at`` 沿用该轮）；
+        - 否则这一轮**立即定稿**为独立的一轮（单独使用 ``ContextMiddleware`` 时，
+          一次 ``complete()`` / ``stream()`` 就是一轮）。
+
+        ``messages`` 追加到 ``context``，``usage`` 的本轮 token 同时累加到
+        ``session.usage``。返回 ``self``，便于链式调用。
+        """
+        items = normalize_messages(messages)
+        delta = _usage_delta(usage)
+        self._add_session_usage(delta)
+        round = self._open_round
+        if round is not None:
+            self.context.extend(items)
+            round.context.extend(items)
+            self._merge_round_usage(round, delta)
+            return self.touch()
+        self.context.extend(items)
+        self.rounds.append(
+            Round(
+                round=len(self.rounds) + 1,
+                context=items,
+                usage=self._round_usage(
+                    items, delta=delta, created_at=created_at, updated_at=updated_at
+                ),
+            )
+        )
+        return self.touch()
+
+    def _add_session_usage(self, delta: Mapping[str, int]) -> None:
+        """把一次调用的 token 增量累加到会话级 ``usage``。"""
+        current = _coerce_usage(self.usage)
+        for metric in USAGE_METRICS:
+            current[metric] += delta[metric]
+        self.usage = current
+
+    def _merge_round_usage(self, round: Round, delta: Mapping[str, int]) -> None:
+        """把一次调用的 token 增量并入某一轮的 usage，并刷新占用空间/结束时间。"""
+        usage = _coerce_round_usage(round.usage)
+        for metric in USAGE_METRICS:
+            usage[metric] += delta[metric]
+        self._refresh_usage_space(usage, round.context)
+        usage["updated_at"] = utc_now()
+        round.usage = usage
+
+    @staticmethod
+    def _refresh_usage_space(usage: dict[str, Any], messages: MessageInputs) -> None:
+        """重新测量一批消息占用的上下文空间，写回 usage。"""
+        tokens, chars = measure_context(messages)
+        usage[CONTEXT_TOKENS_KEY] = tokens
+        usage[CONTEXT_CHARS_KEY] = chars
+
+    def _refresh_round(self, round: Round, *, updated_at: str | None = None) -> Round:
+        """按本轮现有消息刷新 usage（占用空间 + 结束时间）后返回该轮。"""
+        usage = _coerce_round_usage(round.usage)
+        self._refresh_usage_space(usage, round.context)
+        usage["updated_at"] = updated_at or utc_now()
+        round.usage = usage
+        return round
+
+    def _round_usage(
+        self,
+        messages: MessageInputs,
+        *,
+        delta: Mapping[str, int] | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> dict[str, Any]:
+        """构造一轮对话的 usage：token 消耗 + 占用的上下文空间 + 起止时间。"""
+        counters = _usage_delta(None) if delta is None else dict(delta)
+        tokens, chars = measure_context(messages)
+        return {
+            **counters,
+            CONTEXT_TOKENS_KEY: tokens,
+            CONTEXT_CHARS_KEY: chars,
+            "created_at": created_at or self.updated_at or utc_now(),
+            "updated_at": updated_at or utc_now(),
+        }
+
+    def round_messages(self) -> list[Message]:
+        """按轮展开所有已定稿 ``Round`` 的消息（副本；不含进行中的轮）。"""
+        messages: list[Message] = []
+        for round in self.rounds:
+            messages.extend(round.context)
+        return messages
+
+    def round_payloads(self) -> list[dict[str, Any]]:
+        """把上下文序列化为分轮的 ``messages`` 列表。
+
+        - 已定稿的轮（``self.rounds``）直接输出；
+        - 进行中的轮（``begin_round()`` 打开、尚未 ``end_round()``）按当前进度输出
+          （重新测量占用空间），保证在 agent-loop 中途落盘也不丢消息；
+        - 其余未被任何轮覆盖的消息补成一轮。
+
+        因此任何消息都不会在持久化时丢失。
+        """
+        payloads = [round.to_dict() for round in self.rounds]
+        covered = sum(len(item.context) for item in self.rounds)
+        open_round = self._open_round
+        if open_round is not None:
+            covered += len(open_round.context)
+            if open_round.context:
+                payloads.append(self._refresh_round(open_round).to_dict())
+        leftover = list(self.context[covered:])
+        if leftover:
+            payloads.append(
+                Round(
+                    round=len(payloads) + 1,
+                    context=leftover,
+                    usage=self._round_usage(leftover),
+                ).to_dict()
+            )
+        return payloads
 
     # ------------------------------------------------------------------
     # 会话信息
@@ -456,12 +880,10 @@ class Session:
         ``input_tokens`` / ``output_tokens`` / ``cache_hit_tokens`` 逐次累加，
         ``total_tokens`` 按 ``input + output`` 累加（与 ``LLMClient`` 一致）。
         传入 ``None`` 或空 usage 不会改变累计值。
+
+        只更新会话累计值；需要同时记录到某一轮（分轮 usage）时用 ``record_round()``。
         """
-        current = _coerce_usage(self.usage)
-        delta = _usage_delta(usage)
-        for metric in USAGE_METRICS:
-            current[metric] += delta[metric]
-        self.usage = current
+        self._add_session_usage(_usage_delta(usage))
         return self.touch()
 
     def reset_usage(self) -> "Session":
@@ -615,7 +1037,10 @@ class Session:
         """转换为可 JSON 序列化的会话快照。
 
         ``tools`` / ``skills`` / ``usage`` 是会话快照的顶层字段，不再嵌在
-        ``metadata`` 中（version 3 格式）。
+        ``metadata`` 中（version 3 格式）；``messages`` 是**分轮的列表**
+        （version 4 格式），每一项形如::
+
+            {"round": 1, "context": [...], "usage": {...}}
         """
         return {
             "session_id": self.session_id,
@@ -626,7 +1051,7 @@ class Session:
             "usage": dict(self.usage),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "messages": [message_to_dict(message) for message in self.context],
+            "messages": self.round_payloads(),
         }
 
     @classmethod
@@ -638,7 +1063,9 @@ class Session:
         - version 1：``payload`` 直接是消息列表，``workspace`` 为 ``None``
           （运行时继承工具注册表的工作区）；
         - version 2：``tools`` / ``skills`` / ``usage`` 嵌在 ``metadata`` 中，
-          读取时自动迁移到独立字段。
+          读取时自动迁移到独立字段；
+        - version 3：``messages`` 是扁平消息列表，读取时按「以 user 消息开始」
+          切分成多轮（旧数据没有分轮 token，按 0 记录，占用的上下文空间仍会测量）。
         """
         if isinstance(payload, Session):
             return payload if payload.session_id == session_id else replace(payload, session_id=session_id)
@@ -652,21 +1079,28 @@ class Session:
         for key in RESERVED_KEYS:
             if payload.get(key) is not None:
                 metadata.pop(key, None)
+        created_at = payload.get("created_at") or utc_now()
+        updated_at = payload.get("updated_at") or utc_now()
+        context, rounds = _split_rounds(
+            payload.get("messages") or [], created_at=created_at, updated_at=updated_at
+        )
         return cls(
             session_id=str(payload.get("session_id") or session_id),
             workspace=None if workspace is None else Path(workspace),
-            context=list(payload.get("messages") or []),
+            context=context,
+            rounds=rounds,
             metadata=metadata,
             tools=payload.get(TOOL_CONFIG_KEY),
             skills=payload.get(SKILL_CONFIG_KEY),
             usage=payload.get(USAGE_KEY),
-            created_at=payload.get("created_at") or utc_now(),
-            updated_at=payload.get("updated_at") or utc_now(),
+            created_at=created_at,
+            updated_at=updated_at,
         )
 
 
 __all__ = [
     "Session",
+    "Round",
     "ApproveFn",
     "CancelFn",
     "TOOL_CONFIG_KEY",
@@ -674,8 +1108,16 @@ __all__ = [
     "REGISTERED_KEY",
     "USAGE_KEY",
     "USAGE_METRICS",
+    "ROUND_INDEX_KEY",
+    "ROUND_CONTEXT_KEY",
+    "CONTEXT_TOKENS_KEY",
+    "CONTEXT_CHARS_KEY",
+    "ROUND_SPACE_METRICS",
+    "ROUND_TIME_KEYS",
     "RESERVED_KEYS",
     "empty_usage",
+    "estimate_tokens",
+    "measure_context",
     "utc_now",
 ]
 

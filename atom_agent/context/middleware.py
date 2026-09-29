@@ -18,7 +18,7 @@ try:
         to_dict,
     )
     from .store import ContextStore
-    from .session import Session, empty_usage
+    from .session import Round, Session, empty_usage, utc_now
 except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
     from model.client import LLMClient
     from model.llm import LLMResponse, LLMStreamChunk
@@ -33,7 +33,7 @@ except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
         to_dict,
     )
     from store import ContextStore
-    from session import Session, empty_usage
+    from session import Round, Session, empty_usage, utc_now
 
 ContextInjector = Callable[[str, list[Message]], Iterable[MessageInput]]
 
@@ -43,7 +43,9 @@ class ContextMiddleware:
 
     注入顺序：持久化历史 -> 静态注入内容 -> 动态 injector 内容 -> 当前请求。
     ``store`` 中保存的是 ``Session``（工作区 + 上下文表示 + 元数据），而不是
-    provider 专用 JSON；每个会话的消息即 ``Session.context``。
+    provider 专用 JSON；每个会话的消息即 ``Session.context``。写入的消息与 usage 会
+    并入当前进行中的轮（``begin_round()`` / ``end_round()``，**一轮 = 一次完整
+    agent-loop**）；没有进行中的轮时，一次 ``complete()`` / ``stream()`` 就是一轮。
     """
 
     def __init__(
@@ -80,14 +82,27 @@ class ContextMiddleware:
             reasoning_content=response.reasoning_content or None,
         )
 
-    def _save_turn(self, session_id: str, messages: MessageInputs, response: LLMResponse) -> None:
+    def _save_turn(
+        self,
+        session_id: str,
+        messages: MessageInputs,
+        response: LLMResponse,
+        *,
+        created_at: str | None = None,
+    ) -> None:
+        """把「本次请求入参 + 本次回复」写入会话。
+
+        这一组消息与 ``response.usage`` 会并入当前进行中的轮（``begin_round()`` 打开的
+        完整 agent-loop）；没有进行中的轮时（单独使用 Middleware）会立即定稿成一轮。
+        轮的 ``usage`` 汇总本轮的 token 消耗（同时累加到 ``session.usage``）、本轮占用
+        的上下文空间（``context_tokens`` / ``context_chars``）以及起止时间。
+        """
+        session = self.ensure_session(session_id)
+        items: list[Message] = []
         if self.persist_user_messages:
-            self.store.append(session_id, messages)
-        self.store.append(session_id, self._response_message(response))
-        # 累计本轮 token 用量（input/output/cache_hit）到会话，随会话一起持久化。
-        session = self.store.get_session(session_id)
-        if session is not None:
-            session.record_usage(response.usage)
+            items.extend(normalize_messages(messages))
+        items.append(self._response_message(response))
+        session.record_round(items, response.usage, created_at=created_at)
 
     def get_context(self, session_id: str = "default") -> list[Message]:
         return self.store.get(session_id)
@@ -99,32 +114,36 @@ class ContextMiddleware:
         self.store.append(session_id, results)
 
     def complete(self, messages: MessageInputs, *, session_id: str = "default", **kwargs: Any) -> LLMResponse:
+        started_at = utc_now()
         response = self.client.complete(self._messages(session_id, messages), session_id=session_id, **kwargs)
-        self._save_turn(session_id, messages, response)
+        self._save_turn(session_id, messages, response, created_at=started_at)
         return response
 
     def stream(self, messages: MessageInputs, *, session_id: str = "default", **kwargs: Any) -> Iterator[LLMStreamChunk]:
+        started_at = utc_now()
         final: LLMResponse | None = None
         for chunk in self.client.stream(self._messages(session_id, messages), session_id=session_id, **kwargs):
             if chunk.done and chunk.response:
                 final = chunk.response
             yield chunk
         if final:
-            self._save_turn(session_id, messages, final)
+            self._save_turn(session_id, messages, final, created_at=started_at)
 
     async def acomplete(self, messages: MessageInputs, *, session_id: str = "default", **kwargs: Any) -> LLMResponse:
+        started_at = utc_now()
         response = await self.client.acomplete(self._messages(session_id, messages), session_id=session_id, **kwargs)
-        self._save_turn(session_id, messages, response)
+        self._save_turn(session_id, messages, response, created_at=started_at)
         return response
 
     async def astream(self, messages: MessageInputs, *, session_id: str = "default", **kwargs: Any) -> AsyncIterator[LLMStreamChunk]:
+        started_at = utc_now()
         final: LLMResponse | None = None
         async for chunk in self.client.astream(self._messages(session_id, messages), session_id=session_id, **kwargs):
             if chunk.done and chunk.response:
                 final = chunk.response
             yield chunk
         if final:
-            self._save_turn(session_id, messages, final)
+            self._save_turn(session_id, messages, final, created_at=started_at)
 
     # ------------------------------------------------------------------
     # Session（工作区 + 上下文表示 + 元数据）
@@ -176,3 +195,37 @@ class ContextMiddleware:
         if session is not None:
             session.reset_usage()
         return session
+
+    def get_session_rounds(self, session_id: str = "default") -> list[Round]:
+        """返回会话的分轮记录：每一轮 ``{context, usage}``；会话不存在时为空列表。
+
+        一轮 = 一次完整 agent-loop：``context`` 是本轮全部消息（请求 + 每次 LLM 调用 +
+        工具结果），``usage`` 是本轮输入/输出 token 汇总、本轮占用的上下文空间
+        （``context_tokens`` / ``context_chars``）以及本轮起止时间
+        （``created_at`` / ``updated_at``）。
+        """
+        session = self.store.get_session(session_id)
+        return list(session.rounds) if session is not None else []
+
+    # ------------------------------------------------------------------
+    # 分轮（round）：一轮 = 一次完整 agent-loop
+    # ------------------------------------------------------------------
+
+    def begin_round(self, session_id: str = "default") -> Round:
+        """开始一轮完整对话（一轮 = 一次 agent-loop）；已有进行中的轮时直接复用。
+
+        ``AgentEngine`` 在工具循环开始前调用本方法、循环结束后调用 ``end_round()``，
+        因此这一轮覆盖「一次请求 -> 多次 LLM 调用 + 工具执行 -> 最终回答」；期间
+        ``complete()`` / ``stream()`` 写入的消息与 usage 都会并入这一轮。
+        """
+        return self.ensure_session(session_id).begin_round()
+
+    def end_round(self, session_id: str = "default") -> Round | None:
+        """结束进行中的轮（把本轮消息 + usage 定稿到会话）；没有则返回 ``None``。"""
+        session = self.store.get_session(session_id)
+        return session.end_round() if session is not None else None
+
+    def open_round(self, session_id: str = "default") -> Round | None:
+        """返回进行中的轮（尚未 ``end_round()``）；没有时返回 ``None``。"""
+        session = self.store.get_session(session_id)
+        return session.open_round if session is not None else None
