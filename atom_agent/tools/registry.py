@@ -5,7 +5,7 @@ import threading
 from collections.abc import Iterable
 from typing import Any
 
-from .core import Session, Tool, ToolResult
+from .core import ApproveFn, Session, Tool, ToolResult
 from .validation import validate_arguments
 
 
@@ -18,7 +18,8 @@ class ToolRegistry:
     - ``session.tools``：会话级工具配置（``registered`` / ``enabled`` / ``disabled`` / ``options``）；
     - ``session.tools["registered"]``：本会话注册的工具（``register()`` 时写入，
       可用 ``session.registered_tools()`` 读取）；
-    - ``session.approve``：``requires_approval`` 工具的授权回调；
+    - ``session.approve``：``requires_approval`` 工具的授权回调（也可通过 ``approve=``
+      直接传入，等价于设置 ``session.approve``）；
     - ``session.cancelled``：执行前的取消检查；
     - ``session.metadata`` / ``session.log()``：会话信息与工具输出通道。
 
@@ -31,10 +32,14 @@ class ToolRegistry:
         *,
         session: Session | None = None,
         context: Session | None = None,
+        approve: ApproveFn | None = None,
     ):
         self._tools: dict[str, Tool] = {}
         self._lock = threading.RLock()
         self.session: Session = session or context or Session.cwd()
+        if approve is not None:
+            # requires_approval 工具执行前会调用 session.approve；这里提供直接注入入口。
+            self.session.approve = approve
         for tool in tools or []:
             self.register(tool)
 
@@ -166,4 +171,4 @@ class ToolRegistry:
                 for t in self.all() if include_disabled or self.is_tool_enabled(t.name)]
 
 
-__all__ = ["ToolRegistry", "Tool", "Session"]
+__all__ = ["ToolRegistry", "Tool", "Session", "ApproveFn"]

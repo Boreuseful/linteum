@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .core import Session, Tool, ToolResult
+from .core import ApproveFn, Session, Tool, ToolResult
 from .registry import ToolRegistry
 
 
@@ -149,15 +149,20 @@ def create_bash_tool(timeout: float = 30) -> Tool:
 
 
 def create_builtin_tools(*, include_bash: bool = False, bash_timeout: float = 30,
-                         workspace: str | Path = ".", session: Session | None = None) -> ToolRegistry:
+                         workspace: str | Path = ".", session: Session | None = None,
+                         approve: ApproveFn | None = None) -> ToolRegistry:
     """按目标 Tool 工厂格式创建内置工具。
 
     工具配置保存在 ``Session`` 中：``session=`` 可以直接复用调用方会话，
     否则用 ``workspace`` 创建一个 ``session_id="default"`` 的会话。
+
+    ``approve`` 会传给 ``ToolRegistry``（写入 ``session.approve``）：启用 ``bash``
+    时它是 ``requires_approval=True`` 工具的授权回调，缺省（``None``）则沿用会话里
+    已有的回调。
     """
     session = session or Session(session_id="default", workspace=Path(workspace))
     tools = [create_read_tool(), create_list_files_tool(), create_write_file_tool()]
     if include_bash:
         tools.append(create_bash_tool(bash_timeout))
-    return ToolRegistry(tools, session=session)
+    return ToolRegistry(tools, session=session, approve=approve)
 

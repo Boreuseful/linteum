@@ -166,7 +166,7 @@ class ContextStore:
     def dumps(self, *, indent: int | None = 2) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
 
-    def loads(self, value: str | bytes) -> None:
+    def loads(self, value: str | bytes, *, merge: bool = False) -> None:
         payload = json.loads(value)
         if not isinstance(payload, dict):
             raise ValueError("上下文 JSON 根节点必须是对象")
@@ -176,7 +176,21 @@ class ContextStore:
         sessions = payload.get("sessions", {})
         if not isinstance(sessions, dict):
             raise ValueError("上下文 JSON 的 sessions 必须是对象")
-        self.replace_all(sessions)
+        if merge:
+            self.merge(sessions)
+        else:
+            self.replace_all(sessions)
+
+    def merge(self, sessions: Mapping[str, Any]) -> None:
+        """把快照里的会话**合并**进当前 store：同 id 覆盖，其它会话保留。
+
+        与 ``replace_all()`` 的区别：后者会丢弃 store 中已有的会话，前者不会。
+        ``AgentRunner`` 载入某个会话时用本方法，避免把其它会话的记忆一起清掉。
+        """
+        with self._lock:
+            for session_id, value in sessions.items():
+                key = str(session_id)
+                self._sessions[key] = self._coerce_session(key, value)
 
     def replace_all(self, sessions: Mapping[str, Any]) -> None:
         """原子替换全部会话。
@@ -203,8 +217,28 @@ class ContextStore:
     def save(self, path: str | Path) -> None:
         Path(path).write_text(self.dumps(), encoding="utf-8")
 
-    def load(self, path: str | Path) -> None:
-        self.loads(Path(path).read_text(encoding="utf-8"))
+    def save_session(self, path: str | Path, session_id: str) -> None:
+        """只把 ``session_id`` 这一个会话写入文件（一份文件 = 一个会话）。
+
+        与 ``save()`` 的区别：后者写出 store 中的**全部**会话。按
+        ``.agent/sessions/<session_id>.json`` 的命名约定，调用方通常只需要
+        当前会话，因此不会把其它会话（例如刚构造出来的空会话）带进这个文件。
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"会话不存在: {session_id}")
+            payload = {
+                "version": self.VERSION,
+                "sessions": {session_id: session.to_dict()},
+            }
+        Path(path).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def load(self, path: str | Path, *, merge: bool = False) -> None:
+        """从文件读取会话；``merge=True`` 时保留 store 中已有的其它会话。"""
+        self.loads(Path(path).read_text(encoding="utf-8"), merge=merge)
 
 
 __all__ = ["ContextStore", "Session"]
