@@ -8,6 +8,7 @@
 - 订阅事件做实时渲染：``on()`` / ``add_listener()``（事件流与宿主类型无关）
 - 读取响应：``response()`` -> ``AgentResponse``（正文 / 思维链 / 工具调用 / usage）
 - 持久化上下文：``save_context()`` / ``load_context()`` / ``close()``
+- 列出全部会话：``list_sessions()`` / ``AgentRunner.list_sessions()`` -> ``SessionInfo`` 摘要
 
 会话标识默认使用 UUID（``uuid4``），并把同一份上下文同时保存到**项目根目录**与
 **工作区**下的 ``.agent/sessions/<session_id>.json``（两个位置的文件互为副本）。
@@ -17,6 +18,9 @@
 - 构造 ``AgentRunner`` **主动查找**会话：先看显式 ``session_id`` / ``context_path``，
   否则按 ``session_priority``（**默认工作区优先**）查找工作区与项目根目录下已有的上下文，
   命中即把 ``session_id`` 设为该会话并记入 ``found_context_path``；没命中才用新 ``uuid4``；
+- 工作区里没有、回退到项目根目录时还要比对 JSON 里记录的 ``workspace``：与当前工作区不一致的
+  **不是**本次要查找的上下文（项目级是多个工作区共享的），视为未命中（见
+  ``context_matches_workspace()``）；
 - 但构造**不载入内容、不创建文件**：``loaded_context_paths`` 为空、``get_context()`` 为空，
   直到显式调用 ``load_session()``（或 ``load_context(path)``）；
 - 查到既有会话却未显式载入时，``send()`` / ``stream()`` / ``save_context()`` 会先报错
@@ -127,9 +131,16 @@ __all__ = [
     "new_session_id",
     "session_context_paths",
     "session_search_dirs",
+    "context_json_workspace",
+    "context_matches_workspace",
     "find_context_json",
     "find_context_jsons",
     "create_context_json",
+    "SessionInfo",
+    "list_sessions",
+    "SESSION_SCOPE_WORKSPACE",
+    "SESSION_SCOPE_PROJECT",
+    "SESSION_SCOPE_CONTEXT",
     "SESSION_PRIORITY_WORKSPACE",
     "SESSION_PRIORITY_PROJECT",
     "DEFAULT_SESSION_PRIORITY",
@@ -357,6 +368,55 @@ def session_search_dirs(
     return dirs
 
 
+def context_json_workspace(
+    path: str | Path,
+    *,
+    session_id: str | None = None,
+) -> Path | None:
+    """读取上下文 JSON 里记录的会话工作区（只读，不会创建任何文件）。
+
+    - ``session_id`` 给定时读取该会话的记录；未给定时只在该文件恰好只含一个会话时读取；
+    - 返回 ``None`` 表示「无法确定」：文件读不了 / 不是本模块的 ``ContextStore`` 格式 /
+      该会话尚未记录工作区（version 1 旧格式，运行时继承当前工作区）。
+    """
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    sessions = payload.get("sessions") if isinstance(payload, dict) else None
+    if not isinstance(sessions, dict):
+        return None
+
+    entry: Any = None
+    if session_id is not None:
+        entry = sessions.get(session_id)
+    elif len(sessions) == 1:
+        entry = next(iter(sessions.values()))
+
+    recorded = entry.get("workspace") if isinstance(entry, dict) else None
+    if not recorded:
+        return None
+    return Path(str(recorded)).expanduser().resolve()
+
+
+def context_matches_workspace(
+    path: str | Path,
+    workspace: str | Path,
+    *,
+    session_id: str | None = None,
+) -> bool:
+    """判断上下文 JSON 记录的会话工作区是否与 ``workspace`` 一致。
+
+    - 文件里没有记录工作区（旧格式 / 无法读取）：按 ``Session`` 的语义是「运行时继承
+      当前工作区」，因此返回 ``True``；
+    - 记录了工作区：与 ``workspace`` 一起解析为绝对路径后比较，一致才返回 ``True``。
+
+    项目根目录下的会话文件是**多个工作区共享**的（同一 session_id 只写 ``<id>.json``），
+    因此回退到项目级查找时必须用它确认「这份上下文确实属于当前工作区」。
+    """
+    return _same_workspace(context_json_workspace(path, session_id=session_id), workspace)
+
+
 def find_context_jsons(
     workspace: str | Path,
     *,
@@ -373,18 +433,30 @@ def find_context_jsons(
     - 未给定：先列出高优先级目录里的 ``*.json``（目录内按 mtime 从新到旧），
       再列出另一个目录的，同路径去重。
 
+    工作区目录（``<workspace>/<dirname>``）下的文件天然属于当前工作区，直接采纳；
+    **项目根目录**下的是多个工作区共享的，必须比对文件里记录的 ``workspace``
+    （``context_matches_workspace()``）：与当前 ``workspace`` 不一致的**不是**本次要
+    查找的上下文，直接跳过 —— 工作区里没有、项目级又不匹配时结果为空列表。
+
     注意与 ``session_context_paths()`` 的区别：后者是**写入/枚举顺序**（项目根目录 ->
     工作区），本函数是**查找顺序**（默认工作区 -> 项目根目录）。
     """
     directories = session_search_dirs(
         workspace, project_dir=project_dir, dirname=dirname, priority=priority
     )
+    workspace_dir = Path(workspace).expanduser() / dirname
+
+    def usable(candidate: Path) -> bool:
+        """工作区目录里的文件直接采纳；项目级文件必须先比对记录的工作区。"""
+        if candidate.parent == workspace_dir:
+            return True
+        return context_matches_workspace(candidate, workspace, session_id=session_id)
 
     if session_id is not None:
         found: list[Path] = []
         for directory in directories:
             candidate = directory / f"{session_id}.json"
-            if candidate.is_file() and candidate not in found:
+            if candidate.is_file() and candidate not in found and usable(candidate):
                 found.append(candidate)
         return found
 
@@ -394,7 +466,7 @@ def find_context_jsons(
             continue
         files = [path for path in directory.glob("*.json") if path.is_file()]
         files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-        ordered.extend(path for path in files if path not in ordered)
+        ordered.extend(path for path in files if path not in ordered and usable(path))
     return ordered
 
 
@@ -410,6 +482,12 @@ def find_context_json(
 
     这是「查找工作区上下文」的入口：默认**工作区优先**（``priority="workspace"``），
     工作区里没有才回退到项目根目录；同一目录内取最新修改的那一个。
+
+    回退到项目根目录时还会比对文件里记录的 ``workspace``：与当前 ``workspace``
+    不一致的**不是**本次要查找的上下文（项目级是多个工作区共享的），直接返回 ``None``
+    —— 宁可让调用方新建会话，也不把别的工作区的历史当成本次上下文；旧格式没有记录
+    工作区时按「运行时继承」处理，仍然采纳（详见 ``context_matches_workspace()``）。
+
     只读查找，不会创建任何文件；需要继续某个会话时请由调用方**显式**决定。
     """
     files = find_context_jsons(
@@ -462,6 +540,214 @@ def create_context_json(
         store.save_session(target, session_id)
         created.append(target)
     return created
+
+
+# ----------------------------------------------------------------------
+# 会话清单：列出全部会话（工作区 + 项目根目录，只读）
+# ----------------------------------------------------------------------
+
+# ``SessionInfo.scope`` 的取值：会话文件所在位置 / 来源。
+SESSION_SCOPE_WORKSPACE = "workspace"   # <workspace>/<dirname>/<id>.json
+SESSION_SCOPE_PROJECT = "project"       # <project_dir>/<dirname>/<id>.json
+SESSION_SCOPE_CONTEXT = "context"       # 显式 context_path 指定的单个文件
+
+
+@dataclass
+class SessionInfo:
+    """一个会话的**只读摘要**（id / 文件路径 / 位置 / 时间 / 规模 / 用量）。
+
+    由 ``list_sessions()``（模块级）与 ``AgentRunner.list_sessions()`` 产出，供宿主列出
+    「全部会话」；**不含完整消息历史** —— 需要历史时用 ``load_session()`` 载入，再
+    ``get_context()`` 读取。``to_dict()`` / ``to_json()`` 便于直接返回给 Web / TUI。
+
+    字段：
+
+    - ``session_id``：会话 ID（文件里 ``sessions`` 的键）；
+    - ``path``：该会话所在的上下文 JSON 文件；
+    - ``scope``：文件位置 —— ``"workspace"`` / ``"project"`` / ``"context"``（显式
+      ``context_path``）；
+    - ``workspace``：文件里记录的工作区；``None`` = 「运行时继承当前工作区」；
+    - ``matches_workspace``：记录的工作区是否与查询用 ``workspace`` 一致
+      （``None`` 视为一致，口径同 ``context_matches_workspace()``）；
+    - ``created_at`` / ``updated_at``：会话创建 / 更新时间（UTC ISO8601）；
+    - ``message_count`` / ``round_count``：消息条数 / 对话轮数；
+    - ``usage``：会话累计 token 用量；
+    - ``metadata`` / ``tools`` / ``skills``：会话元数据与工具 / Skill 配置；
+    - ``size`` / ``mtime``：文件字节数与最后修改时间。
+    """
+
+    session_id: str
+    path: Path
+    scope: str
+    workspace: Path | None = None
+    matches_workspace: bool = True
+    created_at: str = ""
+    updated_at: str = ""
+    message_count: int = 0
+    round_count: int = 0
+    usage: dict[str, int] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    tools: dict[str, Any] = field(default_factory=dict)
+    skills: dict[str, Any] = field(default_factory=dict)
+    size: int = 0
+    mtime: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可直接 JSON 化的字典（``path`` / ``workspace`` 转为字符串）。"""
+        return {
+            "session_id": self.session_id,
+            "path": str(self.path),
+            "scope": self.scope,
+            "workspace": str(self.workspace) if self.workspace is not None else None,
+            "matches_workspace": self.matches_workspace,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "message_count": self.message_count,
+            "round_count": self.round_count,
+            "usage": dict(self.usage),
+            "metadata": dict(self.metadata),
+            "tools": dict(self.tools),
+            "skills": dict(self.skills),
+            "size": self.size,
+            "mtime": self.mtime,
+        }
+
+    def to_json(self, *, indent: int | None = 2) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent, default=str)
+
+
+def _same_workspace(recorded: Path | None, workspace: str | Path) -> bool:
+    """``context_matches_workspace()`` 的纯内存版本（``recorded`` 已由 ``Session`` 解析）。
+
+    记录为 ``None``（旧格式 / 未指定）→ 按「运行时继承当前工作区」返回 ``True``。
+    """
+    if recorded is None:
+        return True
+    try:
+        current = Path(workspace).expanduser().resolve()
+    except OSError:  # pragma: no cover - 兜底（例如坏掉的符号链接）
+        current = Path(workspace).expanduser()
+    return Path(recorded) == current
+
+
+def _file_stat(path: Path) -> tuple[int, float]:
+    """返回 ``(size, mtime)``；文件读不到时返回 ``(0, 0.0)``（不抛异常）。"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0, 0.0
+    return stat.st_size, stat.st_mtime
+
+
+def _sessions_in_file(path: str | Path) -> list[Session]:
+    """读出一个上下文文件里的全部 ``Session``（只读；坏文件 / 非法数据返回空列表）。"""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    sessions = payload.get("sessions") if isinstance(payload, dict) else None
+    if not isinstance(sessions, dict):
+        return []
+
+    parsed: list[Session] = []
+    for session_id, value in sessions.items():
+        if isinstance(value, dict) and "role" in value:
+            continue  # 单项消息，不是会话快照
+        try:
+            parsed.append(Session.from_dict(str(session_id), value))
+        except (TypeError, ValueError):
+            continue
+    return parsed
+
+
+def _session_info(
+    session: Session,
+    path: Path,
+    scope: str,
+    *,
+    workspace: str | Path,
+) -> SessionInfo:
+    """把 ``Session`` 与其所在文件整理成 ``SessionInfo``。"""
+    size, mtime = _file_stat(path)
+    return SessionInfo(
+        session_id=session.session_id,
+        path=path,
+        scope=scope,
+        workspace=session.workspace,
+        matches_workspace=_same_workspace(session.workspace, workspace),
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        message_count=len(session.messages()),
+        round_count=len(session.rounds),
+        usage=dict(session.usage),
+        metadata=dict(session.metadata),
+        tools=dict(session.tools),
+        skills=dict(session.skills),
+        size=size,
+        mtime=mtime,
+    )
+
+
+def _sort_infos(infos: list[SessionInfo]) -> list[SessionInfo]:
+    """按 ``updated_at`` 从新到旧排序（其次 ``session_id``），返回同一个列表。"""
+    infos.sort(key=lambda info: (info.updated_at, info.session_id), reverse=True)
+    return infos
+
+
+def list_sessions(
+    workspace: str | Path,
+    *,
+    project_dir: str | Path | None = None,
+    dirname: str | Path = DEFAULT_SESSION_DIRNAME,
+    include_project: bool = True,
+    only_current_workspace: bool = False,
+    dedupe: bool = True,
+    priority: str = DEFAULT_SESSION_PRIORITY,
+) -> list[SessionInfo]:
+    """列出**全部会话**的只读摘要（不载入内容、不创建任何文件）。
+
+    扫描 ``priority`` 顺序下的会话目录（默认工作区在前、项目根目录在后）里的 ``*.json``，
+    把每个文件里的每个会话整理成一个 ``SessionInfo``：
+
+    - ``include_project=False``：只列工作区目录；``True``（默认）额外列项目根目录；
+    - ``only_current_workspace=True``：只保留 ``matches_workspace`` 为真的会话（口径与
+      ``find_context()`` 的项目级回退比对一致，即不把别的工作区的会话算进来）；
+    - ``dedupe=True``（默认）：同一个 ``session_id`` 在工作区 / 项目根目录各有一份副本时，
+      只保留优先级高的那一份（默认工作区副本，见 ``scope``）；``False`` 时两份都返回；
+    - 排序：``updated_at`` 从新到旧，其次 ``session_id``；
+    - 容错：文件损坏 / 不是 ``ContextStore`` 格式 / 单个会话数据非法 → 跳过该条，不抛异常；
+    - 需要「仅仅是文件路径」（不解析内容）时用 ``find_context_jsons()``；
+    - ``SessionInfo.to_dict()`` / ``to_json()`` 可直接交给 Web / TUI 渲染。
+
+    只读操作，不会创建目录或文件。
+    """
+    workspace_dir = Path(workspace).expanduser() / dirname
+    directories = session_search_dirs(
+        workspace, project_dir=project_dir, dirname=dirname, priority=priority
+    )
+    if not include_project:
+        directories = [directory for directory in directories if directory == workspace_dir]
+
+    infos: list[SessionInfo] = []
+    seen: set[str] = set()
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        scope = (
+            SESSION_SCOPE_WORKSPACE if directory == workspace_dir else SESSION_SCOPE_PROJECT
+        )
+        files = [path for path in directory.glob("*.json") if path.is_file()]
+        files.sort(key=lambda path: _file_stat(path)[1], reverse=True)
+        for path in files:
+            for session in _sessions_in_file(path):
+                if dedupe and session.session_id in seen:
+                    continue
+                info = _session_info(session, path, scope, workspace=workspace)
+                if only_current_workspace and not info.matches_workspace:
+                    continue
+                infos.append(info)
+                seen.add(session.session_id)
+    return _sort_infos(infos)
 
 
 # ----------------------------------------------------------------------
@@ -768,13 +1054,17 @@ class AgentRunner:
        token 用量）。**构造过程主动查找会话，但不载入内容、不创建文件**：
 
        - 查找优先级：显式 ``session_id`` / ``context_path`` > 按 ``session_priority``
-         查找（**默认工作区优先**）> 新的 ``uuid4``；命中的文件记入 ``found_context_path``；
+         查找（**默认工作区优先**，工作区里没有才回退项目根目录；回退时比对文件里记录的
+         ``workspace``，不是当前工作区的会话视为未命中）> 新的 ``uuid4``；命中的文件记入
+         ``found_context_path``；
        - 继续已有会话要**显式**调用 ``load_session()``（或 ``load_context(path)``）；
          ``has_unloaded_session`` 为真时发送 / 落盘会先报错，避免覆盖既有历史；
        - 开始新对话要**显式**调用 ``create_context()``：未指定 ``session_id`` 时每次都会
          生成新的 ``uuid4``，因此不会覆盖 / 重置其它会话；
        - 落盘通过 ``save_context()``，或 ``close()``（仅当本次确实有改动时）完成，一式两份
          写入项目根目录与工作区下的 ``.agent/sessions/<session_id>.json``。
+       - 列出全部会话用 ``list_sessions()``：只读摘要（``SessionInfo``：id / 文件路径 /
+         位置 / 时间 / 消息数 / 轮数 / usage / 元数据），不载入内容、不创建文件。
 
     3. **Tool 注册**：内置 ``read_file`` / ``list_files`` / ``write_file``（可选 ``bash``）
        注册进 ``ToolRegistry``，并通过 ``extra_tools`` 扩展；``requires_approval=True``
@@ -948,7 +1238,8 @@ class AgentRunner:
         3. 显式 ``context_path``：存在则用该文件里的会话 ID，否则新建 uuid4；
         4. 注入的 ``store`` 里已有会话：用第一个（内容已在内存里）；
         5. ``reuse_existing=False``：不查找，直接用新的 uuid4；
-        6. 否则按 ``session_priority`` 查找（**默认工作区优先**），命中则用其中的会话；
+        6. 否则按 ``session_priority`` 查找（**默认工作区优先**；回退项目级时比对文件里记录的
+           工作区，不是当前工作区的会话视为未命中），命中则用其中的会话；
         7. 都没命中：使用新的 uuid4。
 
         第 1/3/6 种情况命中的文件会记到 ``_unloaded_session_file``：此时 runner 已绑定该
@@ -996,7 +1287,11 @@ class AgentRunner:
         self._unloaded_session_file = path
 
     def _find_session_path(self, session_id: str) -> Path | None:
-        """返回该会话已存在的上下文文件（按 ``session_priority``：默认工作区优先）。"""
+        """返回该会话已存在的上下文文件（按 ``session_priority``：默认工作区优先）。
+
+        回退到项目根目录时会比对文件里记录的 ``workspace``（见
+        ``context_matches_workspace()``）：不是当前工作区的会话不返回。
+        """
         if self.context_path is not None:
             return self.context_path if self.context_path.is_file() else None
         candidates = find_context_jsons(
@@ -1529,7 +1824,10 @@ class AgentRunner:
 
         - ``session_id`` 给定时：只找该会话的两份副本，按 ``priority`` 返回优先级最高的；
         - ``context_path`` 给定时：只检查该文件；
-        - 否则：扫描工作区 + 项目根目录，返回优先级最高（默认工作区）、其次最新的一份；
+        - 否则：**先扫工作区**，工作区里没有才回退项目根目录，返回优先级最高（默认工作区）、
+          其次最新的一份；
+        - 回退到项目根目录时比对文件里记录的 ``workspace``：与 ``self.workspace`` 不一致的
+          **不是**本次要查找的上下文（项目级是多个工作区共享的），直接返回 ``None``；
         - 找不到返回 ``None``。
 
         ``priority`` 省略时使用构造参数 ``session_priority``（默认 ``"workspace"``）。
@@ -1550,6 +1848,48 @@ class AgentRunner:
             project_dir=self.project_dir,
             dirname=self.session_dirname,
             priority=resolved_priority,
+        )
+
+    def list_sessions(
+        self,
+        *,
+        include_project: bool = True,
+        only_current_workspace: bool = False,
+        dedupe: bool = True,
+        priority: str | None = None,
+    ) -> list[SessionInfo]:
+        """列出**全部会话**的只读摘要（模块级 ``list_sessions()`` 的便捷入口）。
+
+        列出工作区（默认还含项目根目录）下的每个会话：id / 文件路径 / 位置 / 时间 / 消息数 /
+        轮数 / usage / 元数据等（``SessionInfo``）。**只读**：不载入内容、不创建文件。
+
+        - ``persist=False``：纯内存模式不读盘，直接返回 ``[]``；
+        - 构造时给了 ``context_path``：只列出该文件里的会话（``scope="context"``）；
+        - ``include_project`` / ``only_current_workspace`` / ``dedupe`` 语义见模块级
+          ``list_sessions()``；``priority`` 省略时用构造参数 ``session_priority``。
+        """
+        if not self.persist:
+            return []
+        if self.context_path is not None:
+            target = Path(self.context_path).expanduser()
+            if not target.is_file():
+                return []
+            return _sort_infos(
+                [
+                    _session_info(
+                        session, target, SESSION_SCOPE_CONTEXT, workspace=self.workspace
+                    )
+                    for session in _sessions_in_file(target)
+                ]
+            )
+        return list_sessions(
+            self.workspace,
+            project_dir=self.project_dir,
+            dirname=self.session_dirname,
+            include_project=include_project,
+            only_current_workspace=only_current_workspace,
+            dedupe=dedupe,
+            priority=self.session_priority if priority is None else priority,
         )
 
     def create_context(
