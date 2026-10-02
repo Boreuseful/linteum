@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 try:
-    from ..context.session import TOOL_CONFIG_KEY, Session
+    from ..context.session import TOOL_CONFIG_KEY, ApproveFn, Session
 except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
-    from context.session import TOOL_CONFIG_KEY, Session
+    from context.session import TOOL_CONFIG_KEY, ApproveFn, Session
 
 # 工具运行上下文已经合并进 ``context.Session``：
 # - ``Session.effective_workspace``：工具工作区；
@@ -43,4 +43,4 @@ class Tool:
         return self.execute_fn(arguments, context)
 
 
-__all__ = ["Session", "RuntimeContext", "Tool", "ToolResult", "ExecuteFn", "TOOL_CONFIG_KEY"]
+__all__ = ["Session", "RuntimeContext", "Tool", "ToolResult", "ExecuteFn", "ApproveFn", "TOOL_CONFIG_KEY"]

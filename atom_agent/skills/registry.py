@@ -324,8 +324,8 @@ class SkillRegistry:
             except Exception as exc:
                 return ToolResult(str(exc), is_error=True)
         return Tool("load_skill", "延迟加载完整的 SKILL.md", {
-            "type": "object", "properties": {"name": {"type": "string"}, "recursive": {"type": "boolean"}},
-            "additionalProperties": False}, execute)
+            "type": "object", "properties": {"name": {"type": "string"}},
+            "required": ["name"], "additionalProperties": False}, execute)
 
     def load_reference(
         self,
@@ -375,13 +375,13 @@ class SkillRegistry:
     def create_load_reference(self)-> Tool:
         def execute(args:dict[str,Any], context: Session):
             try:
-                value = self.load_reference(args["skill_name",args['relative_path']])
+                value = self.load_reference(args["skill_name"], args["relative_path"])
                 return ToolResult(value)
             except Exception as exc:
                 return ToolResult(str(exc), is_error=True)
         return Tool("load_reference", "延迟加载 Skill 目录内的附加资料", {
             "type": "object", "properties": {"skill_name": {"type": "string"}, "relative_path": {"type": "string"}},
-            "additionalProperties": False}, execute)
+            "required": ["skill_name", "relative_path"], "additionalProperties": False}, execute)
 
 
     def _read_text(

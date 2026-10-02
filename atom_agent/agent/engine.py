@@ -7,7 +7,7 @@ from typing import Any, AsyncIterator, Iterator
 
 try:
     from ..context.middleware import ContextMiddleware
-    from ..context.session import Session
+    from ..context.session import Round, Session
     from ..model.client import LLMClient
     from ..model.llm import LLMResponse, LLMStreamChunk
     from ..messages.agent_message import (
@@ -20,7 +20,7 @@ try:
     )
 except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
     from context.middleware import ContextMiddleware
-    from context.session import Session
+    from context.session import Round, Session
     from model.client import LLMClient
     from model.llm import LLMResponse, LLMStreamChunk
     from messages.agent_message import AssistantMessage, Message, MessageInputs, ToolCall, normalize_messages, to_dict
@@ -329,6 +329,8 @@ class AgentEngine:
         # 这样会话中禁用的工具不会被提供给 LLM。
         session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
+        # 一轮 = 一次完整 agent-loop：循环开始前打开轮，循环结束（含异常）后定稿。
+        self.middleware.begin_round(session_id)
         try:
             response = self.middleware.complete(request.messages(), session_id=session_id, **kwargs)
             execution_context = request.messages()
@@ -351,6 +353,7 @@ class AgentEngine:
                 response = self.middleware.complete(results, session_id=session_id, **kwargs)
             raise RuntimeError("工具调用超过最大轮次")
         finally:
+            self.middleware.end_round(session_id)
             self.events_bus.emit_sync({"type": "agent_end", "messages": execution_context if 'execution_context' in locals() else []})
 
     async def arun(
@@ -373,6 +376,8 @@ class AgentEngine:
         # 这样会话中禁用的工具不会被提供给 LLM。
         session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
+        # 一轮 = 一次完整 agent-loop：循环开始前打开轮，循环结束（含异常）后定稿。
+        self.middleware.begin_round(session_id)
         try:
             response = await self.middleware.acomplete(request.messages(), session_id=session_id, **kwargs)
             execution_context = request.messages()
@@ -395,6 +400,7 @@ class AgentEngine:
                 response = await self.middleware.acomplete(results, session_id=session_id, **kwargs)
             raise RuntimeError("工具调用超过最大轮次")
         finally:
+            self.middleware.end_round(session_id)
             await self.events_bus.emit({"type": "agent_end", "messages": execution_context if 'execution_context' in locals() else []})
 
     @staticmethod
@@ -429,62 +435,68 @@ class AgentEngine:
         # 这样会话中禁用的工具不会被提供给 LLM。
         session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
+        # 一轮 = 一次完整 agent-loop：循环开始前打开轮，循环结束（含异常 / 提前关闭）
+        # 后定稿，因此这一轮覆盖「请求 -> 多次 LLM 调用 + 工具执行 -> 最终回答」。
+        self.middleware.begin_round(session_id)
         messages: MessageInputs = request.messages()
         execution_context = request.messages()
         rounds = max_tool_rounds if max_tool_rounds is not None else self.max_tool_rounds
-        for round_index in range(rounds + 1):
-            self.events_bus.emit_sync({"type": "turn_start"})
-            final_chunk: LLMStreamChunk | None = None
-            for chunk in self.middleware.stream(messages, session_id=session_id, **kwargs):
-                if chunk.done:
-                    final_chunk = chunk
-                    continue
-                if chunk.reasoning_content:
-                    self.events_bus.emit_sync({
-                        "type": "message_update",
-                        "message": AssistantMessage(reasoning_content=chunk.reasoning_content),
-                        "assistant_message_event": {"type": "reasoning_delta", "text": chunk.reasoning_content},
-                    })
-                if chunk.delta:
-                    self.events_bus.emit_sync({
-                        "type": "message_update",
-                        "message": AssistantMessage(content=chunk.delta),
-                        "assistant_message_event": {"type": "text_delta", "text": chunk.delta},
-                    })
-                if chunk.reasoning_content or chunk.delta:
+        try:
+            for round_index in range(rounds + 1):
+                self.events_bus.emit_sync({"type": "turn_start"})
+                final_chunk: LLMStreamChunk | None = None
+                for chunk in self.middleware.stream(messages, session_id=session_id, **kwargs):
+                    if chunk.done:
+                        final_chunk = chunk
+                        continue
+                    if chunk.reasoning_content:
+                        self.events_bus.emit_sync({
+                            "type": "message_update",
+                            "message": AssistantMessage(reasoning_content=chunk.reasoning_content),
+                            "assistant_message_event": {"type": "reasoning_delta", "text": chunk.reasoning_content},
+                        })
+                    if chunk.delta:
+                        self.events_bus.emit_sync({
+                            "type": "message_update",
+                            "message": AssistantMessage(content=chunk.delta),
+                            "assistant_message_event": {"type": "text_delta", "text": chunk.delta},
+                        })
+                    if chunk.reasoning_content or chunk.delta:
+                        yield AgentStreamChunk(
+                            delta=chunk.delta,
+                            reasoning_delta=chunk.reasoning_content,
+                            raw_chunk=chunk,
+                        )
+
+                if final_chunk is None or final_chunk.response is None:
+                    self.events_bus.emit_sync({"type": "agent_end", "messages": execution_context})
+                    return
+                response = final_chunk.response
+                if not response.tool_calls or registry is None:
+                    result = self._wrap_response(request, response, execution_context, session)
+                    self.events_bus.emit_sync({"type": "message_start", "message": result.output})
+                    self.events_bus.emit_sync({"type": "message_end", "message": result.output})
+                    self.events_bus.emit_sync({"type": "turn_end", "message": result.output, "tool_results": []})
                     yield AgentStreamChunk(
-                        delta=chunk.delta,
-                        reasoning_delta=chunk.reasoning_content,
-                        raw_chunk=chunk,
+                        done=True,
+                        usage=final_chunk.usage,
+                        result=result,
+                        raw_chunk=final_chunk,
                     )
+                    return
 
-            if final_chunk is None or final_chunk.response is None:
-                self.events_bus.emit_sync({"type": "agent_end", "messages": execution_context})
-                return
-            response = final_chunk.response
-            if not response.tool_calls or registry is None:
-                result = self._wrap_response(request, response, execution_context, session)
-                self.events_bus.emit_sync({"type": "message_start", "message": result.output})
-                self.events_bus.emit_sync({"type": "message_end", "message": result.output})
-                self.events_bus.emit_sync({"type": "turn_end", "message": result.output, "tool_results": []})
-                yield AgentStreamChunk(
-                    done=True,
-                    usage=final_chunk.usage,
-                    result=result,
-                    raw_chunk=final_chunk,
-                )
-                return
+                results = self._tool_results(response, registry)
+                self._append_tool_round(execution_context, response, results)
+                self.events_bus.emit_sync({"type": "turn_end", "message": execution_context[-len(results)-1],
+                                           "tool_results": results})
+                if round_index >= rounds:
+                    self._record_tool_results(session_id, results)
+                    raise RuntimeError("工具调用超过最大轮次")
+                messages = results
 
-            results = self._tool_results(response, registry)
-            self._append_tool_round(execution_context, response, results)
-            self.events_bus.emit_sync({"type": "turn_end", "message": execution_context[-len(results)-1],
-                                       "tool_results": results})
-            if round_index >= rounds:
-                self._record_tool_results(session_id, results)
-                raise RuntimeError("工具调用超过最大轮次")
-            messages = results
-
-        raise RuntimeError("工具调用超过最大轮次")
+            raise RuntimeError("工具调用超过最大轮次")
+        finally:
+            self.middleware.end_round(session_id)
 
     async def astream(
         self,
@@ -507,62 +519,68 @@ class AgentEngine:
         session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
 
+        # 一轮 = 一次完整 agent-loop：循环开始前打开轮，循环结束（含异常 / 提前关闭）
+        # 后定稿，因此这一轮覆盖「请求 -> 多次 LLM 调用 + 工具执行 -> 最终回答」。
+        self.middleware.begin_round(session_id)
         messages: MessageInputs = request.messages()
         execution_context = request.messages()
         rounds = max_tool_rounds if max_tool_rounds is not None else self.max_tool_rounds
-        for round_index in range(rounds + 1):
-            await self.events_bus.emit({"type": "turn_start"})
-            final_chunk: LLMStreamChunk | None = None
-            async for chunk in self.middleware.astream(messages, session_id=session_id, **kwargs):
-                if chunk.done:
-                    final_chunk = chunk
-                    continue
-                if chunk.reasoning_content:
-                    await self.events_bus.emit({
-                        "type": "message_update",
-                        "message": AssistantMessage(reasoning_content=chunk.reasoning_content),
-                        "assistant_message_event": {"type": "reasoning_delta", "text": chunk.reasoning_content},
-                    })
-                if chunk.delta:
-                    await self.events_bus.emit({
-                        "type": "message_update",
-                        "message": AssistantMessage(content=chunk.delta),
-                        "assistant_message_event": {"type": "text_delta", "text": chunk.delta},
-                    })
-                if chunk.reasoning_content or chunk.delta:
+        try:
+            for round_index in range(rounds + 1):
+                await self.events_bus.emit({"type": "turn_start"})
+                final_chunk: LLMStreamChunk | None = None
+                async for chunk in self.middleware.astream(messages, session_id=session_id, **kwargs):
+                    if chunk.done:
+                        final_chunk = chunk
+                        continue
+                    if chunk.reasoning_content:
+                        await self.events_bus.emit({
+                            "type": "message_update",
+                            "message": AssistantMessage(reasoning_content=chunk.reasoning_content),
+                            "assistant_message_event": {"type": "reasoning_delta", "text": chunk.reasoning_content},
+                        })
+                    if chunk.delta:
+                        await self.events_bus.emit({
+                            "type": "message_update",
+                            "message": AssistantMessage(content=chunk.delta),
+                            "assistant_message_event": {"type": "text_delta", "text": chunk.delta},
+                        })
+                    if chunk.reasoning_content or chunk.delta:
+                        yield AgentStreamChunk(
+                            delta=chunk.delta,
+                            reasoning_delta=chunk.reasoning_content,
+                            raw_chunk=chunk,
+                        )
+
+                if final_chunk is None or final_chunk.response is None:
+                    await self.events_bus.emit({"type": "agent_end", "messages": execution_context})
+                    return
+                response = final_chunk.response
+                if not response.tool_calls or registry is None:
+                    result = self._wrap_response(request, response, execution_context, session)
+                    await self.events_bus.emit({"type": "message_start", "message": result.output})
+                    await self.events_bus.emit({"type": "message_end", "message": result.output})
+                    await self.events_bus.emit({"type": "turn_end", "message": result.output, "tool_results": []})
                     yield AgentStreamChunk(
-                        delta=chunk.delta,
-                        reasoning_delta=chunk.reasoning_content,
-                        raw_chunk=chunk,
+                        done=True,
+                        usage=final_chunk.usage,
+                        result=result,
+                        raw_chunk=final_chunk,
                     )
+                    return
 
-            if final_chunk is None or final_chunk.response is None:
-                await self.events_bus.emit({"type": "agent_end", "messages": execution_context})
-                return
-            response = final_chunk.response
-            if not response.tool_calls or registry is None:
-                result = self._wrap_response(request, response, execution_context, session)
-                await self.events_bus.emit({"type": "message_start", "message": result.output})
-                await self.events_bus.emit({"type": "message_end", "message": result.output})
-                await self.events_bus.emit({"type": "turn_end", "message": result.output, "tool_results": []})
-                yield AgentStreamChunk(
-                    done=True,
-                    usage=final_chunk.usage,
-                    result=result,
-                    raw_chunk=final_chunk,
-                )
-                return
+                results = await self._tool_results_async(response, registry)
+                self._append_tool_round(execution_context, response, results)
+                await self.events_bus.emit({"type": "turn_end", "message": execution_context[-len(results)-1],
+                                            "tool_results": results})
+                if round_index >= rounds:
+                    self._record_tool_results(session_id, results)
+                    raise RuntimeError("工具调用超过最大轮次")
+                messages = results
 
-            results = await self._tool_results_async(response, registry)
-            self._append_tool_round(execution_context, response, results)
-            await self.events_bus.emit({"type": "turn_end", "message": execution_context[-len(results)-1],
-                                        "tool_results": results})
-            if round_index >= rounds:
-                self._record_tool_results(session_id, results)
-                raise RuntimeError("工具调用超过最大轮次")
-            messages = results
-
-        raise RuntimeError("工具调用超过最大轮次")
+            raise RuntimeError("工具调用超过最大轮次")
+        finally:
+            self.middleware.end_round(session_id)
 
     def get_context(self, session_id: str = "default") -> list[Message]:
         return self.middleware.get_context(session_id)
@@ -590,3 +608,7 @@ class AgentEngine:
     def reset_session_usage(self, session_id: str = "default") -> Session | None:
         """把会话累计 token usage 归零；会话不存在时返回 ``None``。"""
         return self.middleware.reset_session_usage(session_id)
+
+    def get_session_rounds(self, session_id: str = "default") -> list[Round]:
+        """返回会话的分轮记录：每一轮 ``{context, usage}``（本轮 token 消耗 + 占用空间 + 起止时间）。"""
+        return self.middleware.get_session_rounds(session_id)
