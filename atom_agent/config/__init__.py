@@ -4,7 +4,7 @@
 
     from atom_agent.config import ConfigStore, LLMConfig
 
-    store = ConfigStore()             # 默认 -> <项目根目录>/config.yaml
+    store = ConfigStore()             # 默认 -> <项目根目录>/.agent/config.yaml
     config = store.load(create=True)  # 文件不存在时先写入默认配置再读取
 
     config.set_llm(LLMConfig(provider="openai", model="gpt-4o-mini", api_key="sk-xxx"))
@@ -31,10 +31,10 @@ from .schema import (CONFIG_VERSION, DEFAULT_MODEL, DEFAULT_PROVIDER,
                      ConfigError, LLMConfig, default_llm_config,
                      empty_config, llm_from_dict, llm_to_dict,
                      validate_llm_config)
-from .store import (CONFIG_HEADER, CONFIG_PATH_ENV, DEFAULT_CONFIG_FILENAME,
-                    ConfigStore, default_config_path, default_config_yaml,
-                    get_config_store, load_config, project_root, save_config,
-                    set_config_store, to_yaml)
+from .store import (AGENT_DIRNAME, CONFIG_HEADER, CONFIG_PATH_ENV,
+                    DEFAULT_CONFIG_FILENAME, ConfigStore, default_config_path,
+                    default_config_yaml, get_config_store, load_config,
+                    project_root, save_config, set_config_store, to_yaml)
 
 __all__ = [
     # 数据模型
@@ -53,6 +53,7 @@ __all__ = [
     "validate_llm_config",
     # 文件读写
     "ConfigStore",
+    "AGENT_DIRNAME",
     "CONFIG_HEADER",
     "CONFIG_PATH_ENV",
     "DEFAULT_CONFIG_FILENAME",
