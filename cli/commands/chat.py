@@ -17,12 +17,18 @@ def _workspace(args) -> Path:
 
 
 def _build_runner(args):
-    """按 argv 构造 ``AgentRunner``（惰性 import，避免为其它子命令付启动成本）。"""
-    from atom_agent.run_agent import build_agent
+    """按 argv 构造 ``AgentRunner``（惰性 import，避免为其它子命令付启动成本）。
 
+    会话选择：显式 ``-s/--session`` > **当前会话**（``atom sessions new/switch`` 设置）>
+    由 ``AgentRunner`` 按工作区自动查找 / 新建。
+    """
+    from atom_agent.run_agent import build_agent
+    from cli.session_state import get_current_session
+
+    session_id = getattr(args, "session", None) or get_current_session()
     return build_agent(
         workspace=_workspace(args),
-        session_id=getattr(args, "session", None),
+        session_id=session_id,
         config_path=getattr(args, "config", None),
         auto_approve=bool(getattr(args, "auto_approve", False)),
         enable_bash=bool(getattr(args, "enable_bash", False)),
@@ -31,9 +37,12 @@ def _build_runner(args):
 
 
 def _prepare_session(runner, args) -> None:
-    """决定「新建」还是「继续」：``--new`` 新建，否则载入构造时查到的既有会话。"""
+    """决定「新建」还是「继续」：``--new`` 新建并设为当前会话，否则载入查到的既有会话。"""
     if getattr(args, "new", False):
+        from cli.session_state import set_current_session
+
         runner.create_context()
+        set_current_session(runner.session_id)
     elif getattr(runner, "has_unloaded_session", False):
         runner.load_session()
 

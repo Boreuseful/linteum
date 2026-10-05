@@ -9,6 +9,7 @@ from pathlib import Path
 def run_status(args) -> int:
     from atom_agent.config import ConfigStore, project_root
     from atom_agent.run_agent import list_sessions
+    from cli.session_state import get_current_session
     from cli.snapshot import load_snapshot, snapshot_path
 
     workspace = Path(getattr(args, "workspace", None) or Path.cwd()).expanduser()
@@ -26,6 +27,7 @@ def run_status(args) -> int:
         "model": llm.model,
         "snapshot_path": str(snapshot_path()),
         "has_snapshot": snap is not None,
+        "current_session": get_current_session(),
         "session_count": len(list_sessions(str(workspace))),
     }
 
@@ -41,5 +43,6 @@ def run_status(args) -> int:
     print(f"model        : {payload['model']}")
     snap_note = "" if payload["has_snapshot"] else "（尚无快照）"
     print(f"snapshot     : {payload['snapshot_path']}{snap_note}")
+    print(f"session      : {payload['current_session'] or '(未设置当前会话)'}")
     print(f"sessions     : {payload['session_count']}")
     return 0

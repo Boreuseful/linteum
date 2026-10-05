@@ -40,14 +40,14 @@ def add_shared_flags(parser: argparse.ArgumentParser, *, inherited: bool = False
             default=False,
             help="自动批准需要授权的工具调用（如 bash）")
 
-    # 快照（默认启用）：--no-snapshot 关闭；--use-snapshot 使用快照保存的工作区。
+    # 快照：只有 chat 会写；--use-snapshot 只读快照里的工作区。
     parser.add_argument(
         "--snapshot", dest="snapshot", action="store_true",
         default=(suppress if inherited else True),
-        help="运行后把模型配置 / config / 工作区写入快照（默认开启）")
+        help="chat 运行后把模型配置 / config / 工作区写入快照（默认开启；仅 chat 写）")
     parser.add_argument(
         "--no-snapshot", dest="snapshot", action="store_false", default=suppress,
-        help="本次运行不写快照")
+        help="本次 chat 运行不写快照")
     parser.add_argument(
         "--use-snapshot", dest="use_snapshot", action="store_true",
         default=(suppress if inherited else False),

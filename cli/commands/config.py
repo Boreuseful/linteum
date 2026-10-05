@@ -85,8 +85,6 @@ def _set(args) -> int:
 
     config.set_llm(llm)
     store.save(config)
-    from cli import snapshot
-
-    snapshot.refresh(args)  # 让快照与新的 config 同步
+    # 注意：config set 不写快照 —— 快照只由 chat 更新（见 cli/snapshot.py）。
     print(f"{args.key} = {getattr(llm, field)!r}")
     return 0
