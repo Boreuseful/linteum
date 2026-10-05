@@ -1,0 +1,34 @@
+"""``atom tools`` 的实现：列出内置工具（离线，不构造 Agent）。"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+
+def run_tools(args) -> int:
+    if getattr(args, "tools_action", None) != "list":
+        print("用法：atom tools list ...", file=sys.stderr)
+        return 2
+
+    from atom_agent.tools.builtin import create_builtin_tools
+
+    workspace = getattr(args, "workspace", None) or str(Path.cwd())
+    registry = create_builtin_tools(
+        include_bash=bool(getattr(args, "enable_bash", False)),
+        workspace=workspace,
+    )
+    infos = registry.tool_info()
+
+    if getattr(args, "json", False):
+        print(json.dumps(infos, ensure_ascii=False, indent=2, default=str))
+        return 0
+    if not infos:
+        print("（没有可用工具）")
+        return 0
+    for info in infos:
+        state = "enabled " if info.get("enabled") else "disabled"
+        approval = " (需授权)" if info.get("requires_approval") else ""
+        print(f"{info['name']:<16} {state}{approval}  {info.get('description', '')}")
+    return 0
