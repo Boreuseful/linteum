@@ -1,4 +1,4 @@
-"""``atom sessions`` 的实现：列出 / 查看会话（只读，不构造 Agent）。"""
+"""``atom sessions`` 的实现：列出 / 查看 / 创建 / 切换会话（不构造 Agent）。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,13 @@ def run_sessions(args) -> int:
         return _list(args)
     if action == "show":
         return _show(args)
-    print("用法：atom sessions {list,show} ...", file=sys.stderr)
+    if action == "new":
+        return _new(args)
+    if action == "switch":
+        return _switch(args)
+    if action == "current":
+        return _current(args)
+    print("用法：atom sessions {list,show,new,switch,current} ...", file=sys.stderr)
     return 2
 
 
@@ -107,6 +113,82 @@ def _show(args) -> int:
     print("-" * 60)
     for message in messages:
         _print_message(message)
+    return 0
+
+
+def _new(args) -> int:
+    """创建新会话（默认一式两份写入 .agent/sessions），并设为当前会话。"""
+    from atom_agent.run_agent import create_context_json, new_session_id
+
+    session_id = getattr(args, "session_id", None) or new_session_id()
+    paths = create_context_json(
+        session_id, _workspace(args), overwrite=bool(getattr(args, "force", False)))
+
+    switched = bool(getattr(args, "switch", True))
+    if switched:
+        from cli.session_state import set_current_session
+
+        set_current_session(session_id)
+
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {"session_id": session_id, "paths": [str(p) for p in paths], "switched": switched},
+            ensure_ascii=False, indent=2, default=str))
+        return 0
+    print(f"新会话   : {session_id}")
+    for path in paths:
+        print(f"文件     : {path}")
+    print(f"当前会话 : {'已切换' if switched else '未切换（--no-switch）'}")
+    return 0
+
+
+def _switch(args) -> int:
+    """把已存在的会话设为当前会话（支持唯一前缀）。"""
+    from cli.session_state import set_current_session
+
+    workspace = _workspace(args)
+    needle = args.session_id
+    found = _resolve_session(workspace, needle)
+    if found is None:
+        print(f"未找到会话：{needle}（可先 `atom sessions new --id {needle}` 创建）",
+              file=sys.stderr)
+        return 1
+    if isinstance(found, list):
+        print(f"前缀 '{needle}' 匹配到多个会话：", file=sys.stderr)
+        for info in found:
+            print(f"  {info.session_id}", file=sys.stderr)
+        return 2
+
+    set_current_session(found.session_id)
+    print(f"当前会话 : {found.session_id}")
+    print(f"文件     : {found.path}")
+    return 0
+
+
+def _current(args) -> int:
+    """显示当前会话（未设置时给出提示，不算错误）。"""
+    from cli.session_state import current_session_path, get_current_session
+
+    session_id = get_current_session()
+    if session_id is None:
+        if getattr(args, "json", False):
+            print(json.dumps({"session_id": None}, ensure_ascii=False))
+        else:
+            print("（尚未设置当前会话；用 `atom sessions new` 新建，"
+                  "或 `atom sessions switch <id>` 切换）")
+        return 0
+
+    found = _resolve_session(_workspace(args), session_id)
+    path = None if (found is None or isinstance(found, list)) else str(found.path)
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {"session_id": session_id, "path": path,
+             "current_session_path": str(current_session_path())},
+            ensure_ascii=False, indent=2))
+        return 0
+    print(f"当前会话 : {session_id}")
+    if path is not None:
+        print(f"文件     : {path}")
     return 0
 
 
