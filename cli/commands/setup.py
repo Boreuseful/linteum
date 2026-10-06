@@ -1,4 +1,4 @@
-"""``atom setup`` 的实现：初始化 ``config.yaml`` 与用户级状态。
+"""``linteum setup`` 的实现：初始化 ``config.yaml`` 与用户级状态。
 
 这是初始化的**唯一入口**：当前写入默认 ``config.yaml``（位于用户主目录
 ``~/.agent/config.yaml``）；未来新增的初始化步骤（技能目录、默认工具等）
@@ -13,7 +13,7 @@ import sys
 
 
 def run_setup(args) -> int:
-    from atom_agent.config import (AGENT_DIRNAME, ConfigStore, default_config_yaml,
+    from linteum_agent.config import (AGENT_DIRNAME, ConfigStore, default_config_yaml,
                                    empty_config, project_root)
 
     if getattr(args, "print_only", False):

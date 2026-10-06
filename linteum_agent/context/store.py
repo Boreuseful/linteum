@@ -9,7 +9,7 @@ from typing import Any, Iterable, Mapping
 try:
     from ..messages.agent_message import Message, MessageInput, MessageInputs, normalize_messages
     from .session import Session
-except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
+except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
     from messages.agent_message import Message, MessageInput, MessageInputs, normalize_messages
     from session import Session
 

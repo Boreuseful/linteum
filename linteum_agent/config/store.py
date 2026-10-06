@@ -2,7 +2,7 @@
 
 用法::
 
-    from atom_agent.config import ConfigStore, LLMConfig
+    from linteum_agent.config import ConfigStore, LLMConfig
 
     store = ConfigStore()             # 默认 -> ~/.agent/config.yaml
     config = store.load(create=True)  # 文件不存在时先写入默认配置再读取
@@ -19,7 +19,7 @@
 
     store.llm()            # 唯一的 LLM（已规范化为 LLMConfig）
 
-路径优先级：``ConfigStore(path=...)`` > 环境变量 ``ATOM_AGENT_CONFIG`` >
+路径优先级：``ConfigStore(path=...)`` > 环境变量 ``linteum_agent_CONFIG`` >
 ``~/.agent/config.yaml``。写入使用“临时文件 + ``os.replace``”原子替换；
 配置里出现 ``api_key`` 时会把文件权限尽量收紧到 ``0600``（失败时忽略）。
 """
@@ -37,7 +37,7 @@ import yaml
 try:  # 包内导入
     from .schema import (CONFIG_VERSION, Config, ConfigError, LLMConfig,
                          empty_config)
-except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
+except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
     from schema import (CONFIG_VERSION, Config, ConfigError, LLMConfig,
                         empty_config)
 
@@ -47,13 +47,13 @@ AGENT_DIRNAME = ".agent"
 # 默认配置文件名（位于用户主目录的 ``.agent`` 下）。
 DEFAULT_CONFIG_FILENAME = "config.yaml"
 # 环境变量：覆盖默认配置文件路径。
-CONFIG_PATH_ENV = "ATOM_AGENT_CONFIG"
+CONFIG_PATH_ENV = "linteum_agent_CONFIG"
 # 出现这些字段时收紧文件权限（0600）。
 _SECRET_FIELDS = ("api_key",)
 
 # 新建配置文件时写入的注释头，方便手工编辑。
 CONFIG_HEADER = """\
-# atom_agent 项目配置文件（YAML）
+# linteum_agent 项目配置文件（YAML）
 #
 # llm:       唯一的 LLM 配置；api_key / base_url 可留空，由 provider 回退到环境变量
 #            （OPENAI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY 等）。
@@ -65,7 +65,7 @@ CONFIG_HEADER = """\
 
 
 def project_root() -> Path:
-    """返回项目根目录：``atom_agent`` 包的上一级目录。
+    """返回项目根目录：``linteum_agent`` 包的上一级目录。
 
     注意：这只是代码仓库 / 安装位置，**不再**作为用户状态的存储位置
     （配置 / 快照 / 会话都已改到 :func:`agent_home`）；保留它仅用于展示与旧位置迁移。
@@ -86,10 +86,10 @@ def agent_home() -> Path:
 def default_config_path() -> Path:
     """返回默认配置文件路径。
 
-    优先级：环境变量 ``ATOM_AGENT_CONFIG`` > ``~/.agent/config.yaml``。
+    优先级：环境变量 ``linteum_agent_CONFIG`` > ``~/.agent/config.yaml``。
 
     默认落在用户主目录的 ``.agent``（用户级状态目录）下，与会话 / 快照同处一地；
-    首次使用时由 ``atom setup`` 生成。
+    首次使用时由 ``linteum setup`` 生成。
     """
     override = os.getenv(CONFIG_PATH_ENV)
     if override and override.strip():

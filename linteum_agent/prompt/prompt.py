@@ -22,7 +22,7 @@ Inputs are kept flexible (duck typing): ``tools`` accepts a ``ToolRegistry`` / a
 
 Usage::
 
-    from atom_agent.prompt import build_system_prompt
+    from linteum_agent.prompt import build_system_prompt
 
     prompt_text = build_system_prompt(
         tools=runner.registry,

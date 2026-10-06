@@ -13,7 +13,7 @@ from typing import (
 
 try:
     from ..messages.agent_message import SystemPrompt, UserPrompt, AssistantMessage, ToolResult
-except ImportError:  # 支持将 atom_agent 目录直接加入 sys.path
+except ImportError:  # 支持将 linteum_agent 目录直接加入 sys.path
     from messages.agent_message import SystemPrompt, UserPrompt, AssistantMessage, ToolResult
 
 AgentMessage = Union[

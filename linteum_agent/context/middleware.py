@@ -19,7 +19,7 @@ try:
     )
     from .store import ContextStore
     from .session import Round, Session, empty_usage, utc_now
-except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
+except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
     from model.client import LLMClient
     from model.llm import LLMResponse, LLMStreamChunk
     from messages.agent_message import (

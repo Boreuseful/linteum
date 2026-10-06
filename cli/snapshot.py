@@ -3,14 +3,14 @@
 语义：
 
 - **默认位置**：``~/.agent/snapshot.json``（与 ``~/.agent/config.yaml`` 同处）；
-- **只有 ``chat`` 写快照**（含裸 ``atom``）：每次 ``chat`` 运行前把当前「模型配置 + config +
-  工作区」写回，使后续 ``atom --use-snapshot chat`` 无需重复指定工作区；``--no-snapshot`` 关闭；
+- **只有 ``chat`` 写快照**（含裸 ``linteum``）：每次 ``chat`` 运行前把当前「模型配置 + config +
+  工作区」写回，使后续 ``linteum --use-snapshot chat`` 无需重复指定工作区；``--no-snapshot`` 关闭；
 - **其它命令只读**：``status`` / ``sessions`` / ``config`` / ``model`` / ``tools`` / ``skills``
   等绝不改动快照；``--use-snapshot`` 仅用于**读取**快照里的工作区；
 - ``setup`` / ``snapshot`` 跳过 ``boot()``；``snapshot save`` / ``snapshot clear`` 是唯一的
   显式管理入口。
 
-本模块属于 CLI（只读 ``atom_agent.config``），不修改 Agent 业务逻辑。
+本模块属于 CLI（只读 ``linteum_agent.config``），不修改 Agent 业务逻辑。
 """
 
 from __future__ import annotations
@@ -27,23 +27,23 @@ SNAPSHOT_VERSION = 1
 #: 快照文件名（位于用户级 ``~/.agent``）。
 SNAPSHOT_FILENAME = "snapshot.json"
 #: 环境变量：覆盖快照文件路径（便于测试 / 多项目）。
-SNAPSHOT_PATH_ENV = "ATOM_AGENT_SNAPSHOT"
+SNAPSHOT_PATH_ENV = "linteum_agent_SNAPSHOT"
 
 #: 自行管理快照、跳过 ``boot()`` 自动写入的子命令。
 _SELF_MANAGED_COMMANDS = frozenset({"setup", "snapshot"})
-#: **唯一**会自动写快照的命令（裸 ``atom`` 也落到 chat）。其余命令一律只读。
+#: **唯一**会自动写快照的命令（裸 ``linteum`` 也落到 chat）。其余命令一律只读。
 _SNAPSHOT_WRITERS = frozenset({"chat"})
 
 
 def agent_dir() -> Path:
     """用户级状态目录：``~/.agent``（配置 / 快照 / 当前会话等用户状态都放这里）。"""
-    from atom_agent.config import agent_home
+    from linteum_agent.config import agent_home
 
     return agent_home()
 
 
 def snapshot_path() -> Path:
-    """快照文件路径（环境变量 ``ATOM_AGENT_SNAPSHOT`` 可覆盖）。"""
+    """快照文件路径（环境变量 ``linteum_agent_SNAPSHOT`` 可覆盖）。"""
     override = os.getenv(SNAPSHOT_PATH_ENV)
     if override and override.strip():
         return Path(override).expanduser()
@@ -66,7 +66,7 @@ def load_snapshot() -> dict[str, Any] | None:
 def save_snapshot(workspace: str | Path, *, config_path: str | Path | None = None,
                   path: str | Path | None = None) -> Path:
     """把「模型配置 + config + 工作区」原子写入快照，返回写入路径。"""
-    from atom_agent.config import ConfigStore, llm_to_dict
+    from linteum_agent.config import ConfigStore, llm_to_dict
 
     config = ConfigStore(config_path).load(create=False)
     llm = config.llm
@@ -119,7 +119,7 @@ def boot(args) -> None:
 
     - 先解析工作区（``--use-snapshot`` 时读快照，否则用命令启动目录）并回写到 namespace，
       供各 handler 复用；
-    - 仅当命令是 ``chat``（含裸 ``atom``）且 ``--snapshot`` 开启时，才把「模型配置 + config +
+    - 仅当命令是 ``chat``（含裸 ``linteum``）且 ``--snapshot`` 开启时，才把「模型配置 + config +
       工作区」写回快照；其余命令（status / sessions / config / model / tools / skills …）绝不写；
     - ``setup`` / ``snapshot`` 自行管理，直接跳过；
     - 任何写入失败都静默（快照绝不阻止命令执行）。

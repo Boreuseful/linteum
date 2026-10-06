@@ -1,4 +1,4 @@
-"""``atom chat`` 子命令 parser（也是无子命令时的默认命令）。"""
+"""``linteum chat`` 子命令 parser（也是无子命令时的默认命令）。"""
 
 from __future__ import annotations
 

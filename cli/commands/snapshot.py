@@ -1,4 +1,4 @@
-"""``atom snapshot`` 的实现：查看 / 写入 / 清除 / 定位快照。"""
+"""``linteum snapshot`` 的实现：查看 / 写入 / 清除 / 定位快照。"""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ def run_snapshot(args) -> int:
         return _save(args)
     if action == "clear":
         return _clear(args)
-    print("用法：atom snapshot {show,save,clear,path} ...", file=sys.stderr)
+    print("用法：linteum snapshot {show,save,clear,path} ...", file=sys.stderr)
     return 2
 
 

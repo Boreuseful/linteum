@@ -1,4 +1,4 @@
-"""``atom skills`` 子命令 parser。"""
+"""``linteum skills`` 子命令 parser。"""
 
 from __future__ import annotations
 

@@ -13,7 +13,7 @@ def add_shared_flags(parser: argparse.ArgumentParser, *, inherited: bool = False
     """添加顶层 / 子命令共享的 flag：``-w/--workspace``、``-s/--session``、``--config``、``-y``。
 
     ``inherited=True``（子命令侧）时默认值用 ``argparse.SUPPRESS``：属性只在命令行**显式给出**
-    时才写入 namespace，因此 ``atom --workspace X chat`` 顶层解析出的 ``X`` 不会被 chat
+    时才写入 namespace，因此 ``linteum --workspace X chat`` 顶层解析出的 ``X`` 不会被 chat
     子 parser 的默认值覆盖（顶层与子命令共享同一个 namespace）。
     """
     suppress = argparse.SUPPRESS
@@ -62,7 +62,7 @@ def add_json_flag(parser: argparse.ArgumentParser, help: str) -> None:
 def group_dispatch(parser: argparse.ArgumentParser, handler, *, action_dest: str):
     """构造带子动作的组命令的分发函数（``set_defaults(func=...)`` 用）。
 
-    - 未给出子动作（如 ``atom sessions``）→ 打印该组 ``--help`` 并返回 0，而不是静默退出；
+    - 未给出子动作（如 ``linteum sessions``）→ 打印该组 ``--help`` 并返回 0，而不是静默退出；
     - 给出子动作 → 交给注入的 ``handler``。
 
     与 hermes 的 ``_dispatch_sessions`` 同一模式：parser 通过闭包注入，handler 仍是

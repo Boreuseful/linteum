@@ -1,7 +1,7 @@
-"""``atom chat`` 的实现：构造 :class:`AgentRunner` 并对话。
+"""``linteum chat`` 的实现：构造 :class:`AgentRunner` 并对话。
 
-本模块只做**宿主适配**（读取 argv -> 调用 atom_agent），不包含任何 Agent 业务逻辑；
-真正的能力来自 ``atom_agent.run_agent.build_agent``。
+本模块只做**宿主适配**（读取 argv -> 调用 linteum_agent），不包含任何 Agent 业务逻辑；
+真正的能力来自 ``linteum_agent.run_agent.build_agent``。
 """
 
 from __future__ import annotations
@@ -28,10 +28,10 @@ def _warn_max_tool_rounds() -> None:
 def _build_runner(args):
     """按 argv 构造 ``AgentRunner``（惰性 import，避免为其它子命令付启动成本）。
 
-    会话选择：显式 ``-s/--session`` > **当前会话**（``atom sessions new/switch`` 设置）>
+    会话选择：显式 ``-s/--session`` > **当前会话**（``linteum sessions new/switch`` 设置）>
     由 ``AgentRunner`` 按工作区自动查找 / 新建。
     """
-    from atom_agent.run_agent import build_agent
+    from linteum_agent.run_agent import build_agent
     from cli.session_state import get_current_session
 
     session_id = getattr(args, "session", None) or get_current_session()
@@ -110,7 +110,7 @@ def run_chat(args) -> int:
 
 
 def _one_shot(runner, args, prompt: str) -> int:
-    from atom_agent.agent import MaxToolRoundsError
+    from linteum_agent.agent import MaxToolRoundsError
 
     stream = bool(getattr(args, "stream", True))
     as_json = bool(getattr(args, "json", False))
@@ -152,9 +152,9 @@ def _one_shot(runner, args, prompt: str) -> int:
 
 
 def _repl(runner, args) -> int:
-    from atom_agent.agent import MaxToolRoundsError
+    from linteum_agent.agent import MaxToolRoundsError
 
-    print(f"atom 会话 {runner.session_id}（输入 exit / quit 退出）")
+    print(f"linteum 会话 {runner.session_id}（输入 exit / quit 退出）")
     printer = _ConsolePrinter()
     detach = runner.add_listener(printer)
     try:

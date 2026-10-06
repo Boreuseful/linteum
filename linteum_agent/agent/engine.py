@@ -18,7 +18,7 @@ try:
         normalize_messages,
         to_dict,
     )
-except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
+except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
     from context.middleware import ContextMiddleware
     from context.session import Round, Session
     from model.client import LLMClient

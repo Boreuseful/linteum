@@ -17,7 +17,7 @@
       reasoning_effort: null
       thinking: null
 
-``Config``（本模块）负责数据与 (反)序列化，文件读写见 ``atom_agent.config.store``。
+``Config``（本模块）负责数据与 (反)序列化，文件读写见 ``linteum_agent.config.store``。
 
 设计约定：
 
@@ -39,7 +39,7 @@ from typing import Any, Mapping
 
 try:  # 包内导入
     from ..model.config import LLMConfig
-except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
+except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
     from model.config import LLMConfig
 
 
@@ -292,7 +292,7 @@ class Config:
             raise ConfigError(f"version 需要整数，实际为 {version!r}") from exc
         if version > CONFIG_VERSION:
             raise ConfigError(
-                f"配置文件 version={version} 高于当前支持版本 {CONFIG_VERSION}，请升级 atom_agent"
+                f"配置文件 version={version} 高于当前支持版本 {CONFIG_VERSION}，请升级 linteum_agent"
             )
 
         removed = sorted(_REMOVED_TOP_LEVEL_KEYS & set(data))

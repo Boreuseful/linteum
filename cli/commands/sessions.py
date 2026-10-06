@@ -1,4 +1,4 @@
-"""``atom sessions`` 的实现：列出 / 查看 / 创建 / 切换会话（不构造 Agent）。"""
+"""``linteum sessions`` 的实现：列出 / 查看 / 创建 / 切换会话（不构造 Agent）。"""
 
 from __future__ import annotations
 
@@ -24,12 +24,12 @@ def run_sessions(args) -> int:
         return _switch(args)
     if action == "current":
         return _current(args)
-    print("用法：atom sessions {list,show,new,switch,current} ...", file=sys.stderr)
+    print("用法：linteum sessions {list,show,new,switch,current} ...", file=sys.stderr)
     return 2
 
 
 def _list(args) -> int:
-    from atom_agent.run_agent import list_sessions
+    from linteum_agent.run_agent import list_sessions
 
     infos = list_sessions(
         _workspace(args),
@@ -55,7 +55,7 @@ def _list(args) -> int:
 
 def _resolve_session(workspace: str, needle: str):
     """按 ID 或唯一前缀解析会话；返回 ``SessionInfo`` / 前缀歧义列表 / ``None``。"""
-    from atom_agent.run_agent import list_sessions
+    from linteum_agent.run_agent import list_sessions
 
     infos = list_sessions(workspace)
     for info in infos:
@@ -70,7 +70,7 @@ def _resolve_session(workspace: str, needle: str):
 
 
 def _show(args) -> int:
-    from atom_agent.context import ContextStore
+    from linteum_agent.context import ContextStore
 
     workspace = _workspace(args)
     needle = args.session_id
@@ -118,7 +118,7 @@ def _show(args) -> int:
 
 def _new(args) -> int:
     """创建新会话（默认一式两份写入 .agent/sessions），并设为当前会话。"""
-    from atom_agent.run_agent import create_context_json, new_session_id
+    from linteum_agent.run_agent import create_context_json, new_session_id
 
     session_id = getattr(args, "session_id", None) or new_session_id()
     paths = create_context_json(
@@ -150,7 +150,7 @@ def _switch(args) -> int:
     needle = args.session_id
     found = _resolve_session(workspace, needle)
     if found is None:
-        print(f"未找到会话：{needle}（可先 `atom sessions new --id {needle}` 创建）",
+        print(f"未找到会话：{needle}（可先 `linteum sessions new --id {needle}` 创建）",
               file=sys.stderr)
         return 1
     if isinstance(found, list):
@@ -174,8 +174,8 @@ def _current(args) -> int:
         if getattr(args, "json", False):
             print(json.dumps({"session_id": None}, ensure_ascii=False))
         else:
-            print("（尚未设置当前会话；用 `atom sessions new` 新建，"
-                  "或 `atom sessions switch <id>` 切换）")
+            print("（尚未设置当前会话；用 `linteum sessions new` 新建，"
+                  "或 `linteum sessions switch <id>` 切换）")
         return 0
 
     found = _resolve_session(_workspace(args), session_id)

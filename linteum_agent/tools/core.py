@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 try:
     from ..context.session import TOOL_CONFIG_KEY, ApproveFn, Session
-except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
+except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
     from context.session import TOOL_CONFIG_KEY, ApproveFn, Session
 
 # 工具运行上下文已经合并进 ``context.Session``：

@@ -91,7 +91,7 @@ Session
 兼容旧格式：``tools`` / ``skills`` / ``usage`` 曾嵌在 ``metadata`` 中，构造
 ``Session`` 或 ``Session.from_dict()`` 读取时会自动迁移到独立字段。
 
-工具执行上下文（原来的 ``atom_agent.tools.RuntimeContext``）已经合并进
+工具执行上下文（原来的 ``linteum_agent.tools.RuntimeContext``）已经合并进
 ``Session``：``workspace`` / ``metadata`` / ``approve`` / ``cancelled`` /
 ``log()`` / ``is_cancelled()`` 全部由 Session 提供，``ToolRegistry`` 直接读取
 Session 中的工具配置。``tools.RuntimeContext`` 名字仍然可用，但它只是
@@ -114,7 +114,7 @@ try:
         normalize_messages,
         to_dict as message_to_dict,
     )
-except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
+except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
     from messages.agent_message import (
         Message,
         MessageInput,

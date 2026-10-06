@@ -1,4 +1,4 @@
-"""``atom skills`` 的实现：发现系统 / 项目 Skill（离线，不构造 Agent）。"""
+"""``linteum skills`` 的实现：发现系统 / 项目 Skill（离线，不构造 Agent）。"""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from pathlib import Path
 
 def run_skills(args) -> int:
     if getattr(args, "skills_action", None) != "list":
-        print("用法：atom skills list ...", file=sys.stderr)
+        print("用法：linteum skills list ...", file=sys.stderr)
         return 2
 
-    from atom_agent.skills import SkillRegistry
+    from linteum_agent.skills import SkillRegistry
 
     workspace = Path(getattr(args, "workspace", None) or Path.cwd()).expanduser()
     registry = SkillRegistry(

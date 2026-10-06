@@ -1,4 +1,4 @@
-"""``atom`` 命令行入口：注册子命令、解析 ``argv``、分发到 handler。
+"""``linteum`` 命令行入口：注册子命令、解析 ``argv``、分发到 handler。
 
 架构（对齐 hermes 的 Builder + 依赖注入）:
 
@@ -9,7 +9,7 @@
   ``importlib.import_module(target)``，因此
   (a) 快路径不为重模块付启动成本；(b) ``patch("<module>.<attr>")`` 仍能拦截。
 - ``_build_cli_parser()`` 逐个 ``build_<group>_parser(subparsers, cmd_<group>=handler)``，
-  **注册顺序即 ``atom --help`` 顺序**。
+  **注册顺序即 ``linteum --help`` 顺序**。
 - 统一分发契约：每个叶子 parser ``set_defaults(func=handler)``，``main()`` 统一
   ``args.func(args)``；handler 返回 ``int`` 时作为进程退出码（``None`` = 成功）。
 
@@ -22,7 +22,7 @@ import os
 import sys
 
 # 允许 `python cli/main.py` 直接运行：确保项目根目录在 sys.path 上，这样包内绝对导入
-# `cli.*` 与 `atom_agent.*` 都能解析（`python -m cli.main` 时无副作用）。
+# `cli.*` 与 `linteum_agent.*` 都能解析（`python -m cli.main` 时无副作用）。
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
@@ -46,7 +46,7 @@ from cli.subcommands.tools import build_tools_parser  # noqa: E402
 
 def _forward_command(name: str, module: str, attr: str, *, forward_return: bool = False,
                      doc: str = ""):
-    """返回一个 ``atom <cmd>`` handler：调用时才把 ``args`` 交给 ``<module>.<attr>``。
+    """返回一个 ``linteum <cmd>`` handler：调用时才把 ``args`` 交给 ``<module>.<attr>``。
 
     ``importlib.import_module`` 放在**调用时**，因此
     (a) 启动 / ``--help`` 不为实现模块付 import 成本；
@@ -106,7 +106,7 @@ _CHAT_DEFAULTS = {
 
 
 def _default_to_chat(args):
-    """``atom``（无子命令）→ 走 ``cmd_chat``，补上未解析的 chat 默认值。"""
+    """``linteum``（无子命令）→ 走 ``cmd_chat``，补上未解析的 chat 默认值。"""
     args.command = "chat"
     for name, default in _CHAT_DEFAULTS.items():
         if not hasattr(args, name):
@@ -120,9 +120,9 @@ def _default_to_chat(args):
 
 
 def _build_cli_parser():
-    """构建完整 ``atom`` argparse 树 -> ``(parser, subparsers)``。
+    """构建完整 ``linteum`` argparse 树 -> ``(parser, subparsers)``。
 
-    注册顺序即 ``atom --help`` 顺序，保持稳定。每个组的 parser 在
+    注册顺序即 ``linteum --help`` 顺序，保持稳定。每个组的 parser 在
     ``cli/subcommands/<group>.py`` 里构建，handler 在这里注入，因此那些模块从不 import main。
     """
     parser, subparsers = build_top_level_parser()
@@ -141,7 +141,7 @@ def _build_cli_parser():
 
 
 def _parse_cli_args(parser, subparsers, argv):
-    """解析 ``argv``；子命令可省略（裸 ``atom`` 落到 chat），因此 subparsers 非必需。"""
+    """解析 ``argv``；子命令可省略（裸 ``linteum`` 落到 chat），因此 subparsers 非必需。"""
     subparsers.required = False
     return parser.parse_args(argv)
 
@@ -180,7 +180,7 @@ def main(argv=None) -> int:
     # setup / snapshot 子命令自行管理，boot() 会跳过。
     snapshot.boot(args)
 
-    # 没有子命令（可带顶层 -w / -s / -y）→ 默认 chat；`atom` 直接进入交互式对话。
+    # 没有子命令（可带顶层 -w / -s / -y）→ 默认 chat；`linteum` 直接进入交互式对话。
     if args.command is None:
         return _run(_default_to_chat, args)
 

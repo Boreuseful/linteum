@@ -70,10 +70,10 @@ from typing import Any, AsyncIterator, Callable, Iterable, Iterator, Mapping, Te
 
 # ----------------------------------------------------------------------
 # 兼容两种导入方式：
-# 1) ``from atom_agent.run_agent import ...``（包内相对导入）；
-# 2) 直接把 ``/workspace/atom_agent`` 加入 sys.path 后 ``import run_agent``。
+# 1) ``from linteum_agent.run_agent import ...``（包内相对导入）；
+# 2) 直接把 ``/workspace/linteum_agent`` 加入 sys.path 后 ``import run_agent``。
 # skills 包内部使用 ``from ..tools import ...``，因此后者必须把项目根目录加入
-# sys.path，再以 ``atom_agent.*`` 绝对导入，避免 "attempted relative import"。
+# sys.path，再以 ``linteum_agent.*`` 绝对导入，避免 "attempted relative import"。
 # ----------------------------------------------------------------------
 try:  # pragma: no cover - 取决于调用方式
     from .agent.engine import AgentEngine, AgentResult, AgentStreamChunk
@@ -99,13 +99,13 @@ except ImportError:  # 直接导入 run_agent：补上项目根目录后改用�
     if str(_SCRIPT_ROOT) not in sys.path:
         sys.path.insert(0, str(_SCRIPT_ROOT))
 
-    from atom_agent.agent.engine import AgentEngine, AgentResult, AgentStreamChunk
-    from atom_agent.config import ConfigStore, LLMConfig
-    from atom_agent.context.middleware import ContextMiddleware
-    from atom_agent.context.session import ApproveFn, Session
-    from atom_agent.context.store import ContextStore
-    from atom_agent.evnts import AgentEvent, AgentEventListener, EventBus
-    from atom_agent.messages.agent_message import (
+    from linteum_agent.agent.engine import AgentEngine, AgentResult, AgentStreamChunk
+    from linteum_agent.config import ConfigStore, LLMConfig
+    from linteum_agent.context.middleware import ContextMiddleware
+    from linteum_agent.context.session import ApproveFn, Session
+    from linteum_agent.context.store import ContextStore
+    from linteum_agent.evnts import AgentEvent, AgentEventListener, EventBus
+    from linteum_agent.messages.agent_message import (
         AssistantMessage,
         MessageInput,
         MessageInputs,
@@ -113,10 +113,10 @@ except ImportError:  # 直接导入 run_agent：补上项目根目录后改用�
         UserPrompt,
         normalize_messages,
     )
-    from atom_agent.model.client import LLMClient
-    from atom_agent.prompt import build_system_prompt as _build_default_system_prompt
-    from atom_agent.skills import SkillRegistry
-    from atom_agent.tools import Tool, ToolRegistry, create_builtin_tools
+    from linteum_agent.model.client import LLMClient
+    from linteum_agent.prompt import build_system_prompt as _build_default_system_prompt
+    from linteum_agent.skills import SkillRegistry
+    from linteum_agent.tools import Tool, ToolRegistry, create_builtin_tools
 
 
 __all__ = [
@@ -1083,7 +1083,7 @@ class AgentRunner:
        回调直接返回 ``True``（不提示、不询问），否则提示风险并询问用户确认。
     4. **Skill 注册**：``SkillRegistry`` 发现 SKILL.md -> 写入 ``session.skills`` ->
        注册 ``load_skill`` / ``load_reference`` 工具 -> 索引注入 system prompt。
-    5. **默认系统提示词**：``use_default_system_prompt=True`` 时用 ``atom_agent.prompt``
+    5. **默认系统提示词**：``use_default_system_prompt=True`` 时用 ``linteum_agent.prompt``
        的默认模板渲染系统提示词（预填充工具清单 / Skill 清单 / 用户系统环境）并注入；
        此时不再重复注入 Skill 索引（模板里已含 Skill 清单）。
 

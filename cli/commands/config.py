@@ -1,4 +1,4 @@
-"""``atom config`` 的实现：读写 ``config.yaml``。"""
+"""``linteum config`` 的实现：读写 ``config.yaml``。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ _MISSING = object()
 
 
 def _store(args):
-    from atom_agent.config import ConfigStore
+    from linteum_agent.config import ConfigStore
 
     return ConfigStore(getattr(args, "config", None))
 
@@ -25,12 +25,12 @@ def run_config(args) -> int:
         return _get(args)
     if action == "set":
         return _set(args)
-    print("用法：atom config {path,show,get,set} ...", file=sys.stderr)
+    print("用法：linteum config {path,show,get,set} ...", file=sys.stderr)
     return 2
 
 
 def _show(args) -> int:
-    from atom_agent.config import to_yaml
+    from linteum_agent.config import to_yaml
 
     config = _store(args).load(create=False)
     sys.stdout.write(to_yaml(config))
@@ -61,7 +61,7 @@ def _get(args) -> int:
 
 
 def _set(args) -> int:
-    from atom_agent.config import llm_from_dict, llm_to_dict
+    from linteum_agent.config import llm_from_dict, llm_to_dict
 
     parts = args.key.split(".")
     if len(parts) != 2 or parts[0] != "llm":

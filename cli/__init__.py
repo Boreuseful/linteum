@@ -1,4 +1,4 @@
-"""atom_agent 命令行前端包。
+"""linteum_agent 命令行前端包。
 
 对外入口（二者等价）::
 
@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 #: 命令行程序名（``argparse`` 的 ``prog``，也是 ``--help`` / 用法行的前缀）。
-PROG = "atom"
+PROG = "linteum"
 
 #: CLI 版本号。
 __version__ = "0.1.0"

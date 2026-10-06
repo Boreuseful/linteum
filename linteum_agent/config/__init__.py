@@ -2,7 +2,7 @@
 
 快速上手::
 
-    from atom_agent.config import ConfigStore, LLMConfig
+    from linteum_agent.config import ConfigStore, LLMConfig
 
     store = ConfigStore()             # 默认 -> ~/.agent/config.yaml
     config = store.load(create=True)  # 文件不存在时先写入默认配置再读取

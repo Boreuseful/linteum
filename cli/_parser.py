@@ -14,17 +14,17 @@ import difflib
 from cli import PROG
 from cli.subcommands._shared import add_shared_flags
 
-#: ``atom --help`` 结尾的用法示例（与注册顺序一起构成用户可见的命令面）。
+#: ``linteum --help`` 结尾的用法示例（与注册顺序一起构成用户可见的命令面）。
 _EPILOGUE = """\
 示例:
-  atom                                    进入交互式对话（默认写快照）
-  atom setup                              初始化 ~/.agent/config.yaml
-  atom chat -p "总结这个仓库"              单次问答
-  atom chat --bash -y                     启用 bash 工具并自动授权
-  atom --use-snapshot                     用快照里保存的工作区启动
-  atom snapshot show                      查看快照（模型配置 + config + 工作区）
-  atom sessions list                      列出工作区里的会话
-  atom status                             查看运行时状态
+  linteum                                 进入交互式对话（默认写快照）
+  linteum setup                           初始化 ~/.agent/config.yaml
+  linteum chat -p "总结这个仓库"           单次问答
+  linteum chat --bash -y                  启用 bash 工具并自动授权
+  linteum --use-snapshot                  用快照里保存的工作区启动
+  linteum snapshot show                   查看快照（模型配置 + config + 工作区）
+  linteum sessions list                   列出工作区里的会话
+  linteum status                          查看运行时状态
 """
 
 
@@ -55,13 +55,13 @@ def build_top_level_parser() -> tuple[argparse.ArgumentParser, argparse._SubPars
     """
     parser = CliArgumentParser(
         prog=PROG,
-        description="atom_agent —— 带工具调用能力的命令行 Agent",
+        description="linteum_agent —— 带工具调用能力的命令行 Agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_EPILOGUE,
     )
     _add_top_level_flags(parser)
-    # metavar=<command> 让 usage 行保持 ``atom [...] <command>``，而不是把全部子命令名铺开；
-    # ``atom --help`` 仍会逐条列出每个命令。
+    # metavar=<command> 让 usage 行保持 ``linteum [...] <command>``，而不是把全部子命令名铺开；
+    # ``linteum --help`` 仍会逐条列出每个命令。
     subparsers = parser.add_subparsers(dest="command", help="要运行的子命令", metavar="<command>")
     return parser, subparsers
 

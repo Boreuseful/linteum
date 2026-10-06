@@ -1,4 +1,4 @@
-"""``atom tools`` 的实现：列出内置工具（离线，不构造 Agent）。"""
+"""``linteum tools`` 的实现：列出内置工具（离线，不构造 Agent）。"""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from pathlib import Path
 
 def run_tools(args) -> int:
     if getattr(args, "tools_action", None) != "list":
-        print("用法：atom tools list ...", file=sys.stderr)
+        print("用法：linteum tools list ...", file=sys.stderr)
         return 2
 
-    from atom_agent.tools.builtin import create_builtin_tools
+    from linteum_agent.tools.builtin import create_builtin_tools
 
     workspace = getattr(args, "workspace", None) or str(Path.cwd())
     registry = create_builtin_tools(

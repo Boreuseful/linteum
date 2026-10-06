@@ -1,4 +1,4 @@
-"""``atom model`` 的实现：查看 / 切换默认模型（写回 ``config.yaml``）。"""
+"""``linteum model`` 的实现：查看 / 切换默认模型（写回 ``config.yaml``）。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import sys
 
 
 def _store(args):
-    from atom_agent.config import ConfigStore
+    from linteum_agent.config import ConfigStore
 
     return ConfigStore(getattr(args, "config", None))
 
@@ -17,7 +17,7 @@ def run_model(args) -> int:
         return _show(args)
     if action == "set":
         return _set(args)
-    print("用法：atom model {show,set} ...", file=sys.stderr)
+    print("用法：linteum model {show,set} ...", file=sys.stderr)
     return 2
 
 
@@ -29,7 +29,7 @@ def _show(args) -> int:
 
 
 def _set(args) -> int:
-    from atom_agent.config import llm_from_dict, llm_to_dict
+    from linteum_agent.config import llm_from_dict, llm_to_dict
 
     store = _store(args)
     config = store.load(create=True)
