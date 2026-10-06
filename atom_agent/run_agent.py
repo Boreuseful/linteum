@@ -91,6 +91,7 @@ try:  # pragma: no cover - 取决于调用方式
         normalize_messages,
     )
     from .model.client import LLMClient
+    from .prompt import build_system_prompt as _build_default_system_prompt
     from .skills import SkillRegistry
     from .tools import Tool, ToolRegistry, create_builtin_tools
 except ImportError:  # 直接导入 run_agent：补上项目根目录后改用绝对导入
@@ -114,6 +115,7 @@ except ImportError:  # 直接导入 run_agent：补上项目根目录后改用�
         normalize_messages,
     )
     from atom_agent.model.client import LLMClient
+    from atom_agent.prompt import build_system_prompt as _build_default_system_prompt
     from atom_agent.skills import SkillRegistry
     from atom_agent.tools import Tool, ToolRegistry, create_builtin_tools
 
@@ -1073,6 +1075,9 @@ class AgentRunner:
        回调直接返回 ``True``（不提示、不询问），否则提示风险并询问用户确认。
     4. **Skill 注册**：``SkillRegistry`` 发现 SKILL.md -> 写入 ``session.skills`` ->
        注册 ``load_skill`` / ``load_reference`` 工具 -> 索引注入 system prompt。
+    5. **默认系统提示词**：``use_default_system_prompt=True`` 时用 ``atom_agent.prompt``
+       的默认模板渲染系统提示词（预填充工具清单 / Skill 清单 / 用户系统环境）并注入；
+       此时不再重复注入 Skill 索引（模板里已含 Skill 清单）。
 
     随后用 ``send()`` / ``asend()`` 发送用户消息，用 ``stream()`` / ``astream()`` 流式消费；
     响应内容由 ``ResponseCollector`` 从 ``EventBus`` 事件里聚合，读取 ``response.text`` 即可。
@@ -1100,6 +1105,8 @@ class AgentRunner:
         # --- system prompt / 额外上下文 ---
         system_prompt: MessageInputs | str | None = None,
         context: MessageInputs | None = None,
+        # 启用后用默认模板（预填充工具清单 / Skill 清单 / 用户环境）作为系统提示词。
+        use_default_system_prompt: bool = True,
         # --- Tool 注册 ---
         include_builtin_tools: bool = True,
         enable_bash: bool = False,
@@ -1206,11 +1213,19 @@ class AgentRunner:
             approve=self.approve,
         )
 
-        # 6) 中间件 + 引擎。
+        # 6) 默认系统提示词（可选）：用默认模板预填充工具 / Skill / 用户环境。
+        self.use_default_system_prompt = use_default_system_prompt
+        self.default_system_prompt = (
+            self.build_default_system_prompt() if use_default_system_prompt else ""
+        )
+
+        # 7) 中间件 + 引擎。
         self.middleware = ContextMiddleware(
             self.client,
             self.store,
-            context=self._build_context(system_prompt, context, self.skill_index),
+            context=self._build_context(
+                system_prompt, context, self.skill_index, self.default_system_prompt
+            ),
             workspace=self.workspace,
         )
         self.engine = AgentEngine(
@@ -1519,24 +1534,38 @@ class AgentRunner:
         self.session.register_tools(registry.all())
         return registry
 
+    def build_default_system_prompt(self) -> str:
+        """用默认模板渲染系统提示词（工具清单 + Skill 清单 + 用户系统环境）。
+
+        与构造参数 ``use_default_system_prompt`` 配合：启用时构造阶段即渲染一份并注入
+        （见 ``self.default_system_prompt``）；未启用时也可调用本方法按需预览。
+        """
+        return _build_default_system_prompt(tools=self.registry, skills=self.skill_registry)
+
     @staticmethod
     def _build_context(
         system_prompt: MessageInputs | str | None,
         context: MessageInputs | None,
         skill_index: str,
+        default_system_prompt: str = "",
     ) -> list[MessageInput]:
         """组装注入到 ``ContextMiddleware`` 的静态上下文。
 
-        顺序：system prompt -> Skill 索引 -> 调用方额外上下文。中间件会把它放在
-        「持久化历史」之后、「当前请求」之前（见 ``ContextMiddleware._messages``）。
+        顺序：默认系统提示词 -> system prompt -> Skill 索引 -> 调用方额外上下文。中间件
+        会把它放在「持久化历史」之后、「当前请求」之前（见 ``ContextMiddleware._messages``）。
+
+        ``default_system_prompt`` 非空（``use_default_system_prompt=True``）时它已包含
+        Skill 清单，因此不再单独注入 ``skill_index``，避免重复。
         """
         items: list[MessageInput] = []
+        if default_system_prompt:
+            items.append(SystemPrompt(content=default_system_prompt))
         if system_prompt is not None:
             if isinstance(system_prompt, str):
                 items.append(SystemPrompt(content=system_prompt))
             else:
                 items.extend(normalize_messages(system_prompt))
-        if skill_index:
+        if skill_index and not default_system_prompt:
             items.append(SystemPrompt(content=skill_index))
         if context is not None:
             items.extend(normalize_messages(context))
