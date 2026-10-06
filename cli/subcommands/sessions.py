@@ -11,14 +11,14 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     """把 ``sessions`` 子命令（list / show / new / switch / current）挂到 ``subparsers`` 上。"""
     parser = subparsers.add_parser(
         "sessions", help="会话历史（list / show / new / switch / current）",
-        description="查看、创建与切换工作区与项目根目录下 .agent/sessions 里的会话。")
+        description="查看、创建与切换工作区与用户主目录下 .agent/sessions 里的会话。")
     sub = parser.add_subparsers(dest="sessions_action")
 
     lst = sub.add_parser("list", help="列出会话摘要")
     add_shared_flags(lst, inherited=True)
     lst.add_argument(
         "--workspace-only", dest="workspace_only", action="store_true",
-        help="只列工作区目录里的会话，不含项目根目录")
+        help="只列工作区目录里的会话，不含用户级 ~/.agent/sessions")
     lst.add_argument(
         "--current-workspace", dest="current_workspace", action="store_true",
         help="只列与当前工作区匹配的会话")

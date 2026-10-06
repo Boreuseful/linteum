@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 def run_status(args) -> int:
-    from atom_agent.config import ConfigStore, project_root
+    from atom_agent.config import ConfigStore, agent_home, project_root
     from atom_agent.run_agent import list_sessions
     from cli.session_state import get_current_session
     from cli.snapshot import load_snapshot, snapshot_path
@@ -21,6 +21,7 @@ def run_status(args) -> int:
     payload = {
         "workspace": str(workspace),
         "project_root": str(project_root()),
+        "agent_home": str(agent_home()),
         "config_path": str(store.path),
         "config_exists": exists,
         "provider": llm.provider,
@@ -37,6 +38,7 @@ def run_status(args) -> int:
 
     print(f"workspace    : {payload['workspace']}")
     print(f"project_root : {payload['project_root']}")
+    print(f"agent_home   : {payload['agent_home']}")
     config_note = "" if exists else "（尚未创建）"
     print(f"config       : {payload['config_path']}{config_note}")
     print(f"provider     : {payload['provider']}")

@@ -1,9 +1,9 @@
 """当前会话（current session）指针。
 
-`atom sessions new/switch` 会把选中的会话 ID 写入 ``<项目根目录>/.agent/current_session``；
+`atom sessions new/switch` 会把选中的会话 ID 写入 ``~/.agent/current_session``；
 `atom chat` 在未显式给 ``-s/--session`` 时**默认沿用**该会话。
 
-- 默认位置：``<项目根目录>/.agent/current_session``（一个只含会话 ID 的文本文件）；
+- 默认位置：``~/.agent/current_session``（一个只含会话 ID 的文本文件）；
 - 环境变量 ``ATOM_AGENT_CURRENT_SESSION`` 可覆盖文件路径（测试 / 多项目）；
 - 读写都容忍文件缺失：读不到返回 ``None``（表示「未设置当前会话」），绝不抛异常。
 """
@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-#: 当前会话文件名（位于 ``<项目根目录>/.agent``）。
+#: 当前会话文件名（位于用户级 ``~/.agent``）。
 CURRENT_SESSION_FILENAME = "current_session"
 #: 环境变量：覆盖当前会话文件路径。
 CURRENT_SESSION_PATH_ENV = "ATOM_AGENT_CURRENT_SESSION"

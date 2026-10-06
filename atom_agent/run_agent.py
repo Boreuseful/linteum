@@ -10,16 +10,17 @@
 - 持久化上下文：``save_context()`` / ``load_context()`` / ``close()``
 - 列出全部会话：``list_sessions()`` / ``AgentRunner.list_sessions()`` -> ``SessionInfo`` 摘要
 
-会话标识默认使用 UUID（``uuid4``），并把同一份上下文同时保存到**项目根目录**与
-**工作区**下的 ``.agent/sessions/<session_id>.json``（两个位置的文件互为副本）。
+会话标识默认使用 UUID（``uuid4``），并把同一份上下文同时保存到**用户主目录**（``~``）与
+**工作区**下的 ``.agent/sessions/<session_id>.json``（两个位置的文件互为副本；用户级那份
+即 ``~/.agent/sessions``，不再写进项目仓库 / 安装目录）。
 
 会话生命周期（构造**主动查找**，加载**显式**）：
 
 - 构造 ``AgentRunner`` **主动查找**会话：先看显式 ``session_id`` / ``context_path``，
-  否则按 ``session_priority``（**默认工作区优先**）查找工作区与项目根目录下已有的上下文，
+  否则按 ``session_priority``（**默认工作区优先**）查找工作区与用户主目录下已有的上下文，
   命中即把 ``session_id`` 设为该会话并记入 ``found_context_path``；没命中才用新 ``uuid4``；
-- 工作区里没有、回退到项目根目录时还要比对 JSON 里记录的 ``workspace``：与当前工作区不一致的
-  **不是**本次要查找的上下文（项目级是多个工作区共享的），视为未命中（见
+- 工作区里没有、回退到用户主目录时还要比对 JSON 里记录的 ``workspace``：与当前工作区不一致的
+  **不是**本次要查找的上下文（用户级是多个工作区共享的），视为未命中（见
   ``context_matches_workspace()``）；
 - 但构造**不载入内容、不创建文件**：``loaded_context_paths`` 为空、``get_context()`` 为空，
   直到显式调用 ``load_session()``（或 ``load_context(path)``）；
@@ -77,7 +78,6 @@ from typing import Any, AsyncIterator, Callable, Iterable, Iterator, Mapping, Te
 try:  # pragma: no cover - 取决于调用方式
     from .agent.engine import AgentEngine, AgentResult, AgentStreamChunk
     from .config import ConfigStore, LLMConfig
-    from .config.store import project_root
     from .context.middleware import ContextMiddleware
     from .context.session import ApproveFn, Session
     from .context.store import ContextStore
@@ -101,7 +101,6 @@ except ImportError:  # 直接导入 run_agent：补上项目根目录后改用�
 
     from atom_agent.agent.engine import AgentEngine, AgentResult, AgentStreamChunk
     from atom_agent.config import ConfigStore, LLMConfig
-    from atom_agent.config.store import project_root
     from atom_agent.context.middleware import ContextMiddleware
     from atom_agent.context.session import ApproveFn, Session
     from atom_agent.context.store import ContextStore
@@ -152,12 +151,12 @@ __all__ = [
 DEFAULT_SESSION_ID = "default"
 DEFAULT_MAX_TOOL_ROUNDS = 8
 
-# 会话上下文默认存储目录：项目根目录与工作区各存一份（``<root>/.agent/sessions``）。
+# 会话上下文默认存储目录：用户主目录（``~``）与工作区各存一份（``<root>/.agent/sessions``）。
 DEFAULT_SESSION_DIRNAME = Path(".agent") / "sessions"
 
 # 会话查找优先级：同一会话在两个位置各有一份副本，查找时谁优先。
 # 默认 ``workspace`` = **工作区优先**，即先看当前工作区下的 ``.agent/sessions``，
-# 再看项目根目录；显式传 ``SESSION_PRIORITY_PROJECT`` 可让项目根目录优先。
+# 再看用户主目录（``~/.agent/sessions``）；显式传 ``SESSION_PRIORITY_PROJECT`` 可让用户级优先。
 SESSION_PRIORITY_WORKSPACE = "workspace"
 SESSION_PRIORITY_PROJECT = "project"
 DEFAULT_SESSION_PRIORITY = SESSION_PRIORITY_WORKSPACE
@@ -308,6 +307,15 @@ def new_session_id() -> str:
     return str(uuid.uuid4())
 
 
+def default_session_root() -> Path:
+    """会话存储的默认根目录：**用户主目录**（``~``）。
+
+    其下 ``.agent/sessions``（即 ``~/.agent/sessions``）是用户级共享副本；另一份在工作区
+    ``<workspace>/.agent/sessions``。二者互为副本，因此会话不再写进项目仓库 / 安装目录。
+    """
+    return Path.home()
+
+
 def session_context_paths(
     session_id: str,
     workspace: str | Path,
@@ -315,12 +323,12 @@ def session_context_paths(
     project_dir: str | Path | None = None,
     dirname: str | Path = DEFAULT_SESSION_DIRNAME,
 ) -> list[Path]:
-    """返回某个会话的两份上下文存储路径：项目根目录 + 工作区。
+    """返回某个会话的两份上下文存储路径：用户主目录 + 工作区。
 
-    路径形如 ``<root>/<dirname>/<session_id>.json``。项目根目录与工作区恰好相同时
-    会去重，因此最终只返回一份。
+    路径形如 ``<root>/<dirname>/<session_id>.json``（用户级即 ``~/.agent/sessions``）。
+    用户主目录与工作区恰好相同时会去重，因此最终只返回一份。
     """
-    root = Path(project_dir).expanduser() if project_dir is not None else project_root()
+    root = Path(project_dir).expanduser() if project_dir is not None else default_session_root()
     roots = [root, Path(workspace).expanduser()]
     paths: list[Path] = []
     for item in roots:
@@ -350,11 +358,11 @@ def session_search_dirs(
     dirname: str | Path = DEFAULT_SESSION_DIRNAME,
     priority: str = DEFAULT_SESSION_PRIORITY,
 ) -> list[Path]:
-    """返回会话查找目录，**按优先级排序**（默认为工作区在前、项目根目录在后）。
+    """返回会话查找目录，**按优先级排序**（默认为工作区在前、用户主目录在后）。
 
     两个根目录恰好相同时自动去重，因此通常只返回一个目录。
     """
-    root = Path(project_dir).expanduser() if project_dir is not None else project_root()
+    root = Path(project_dir).expanduser() if project_dir is not None else default_session_root()
     workspace_dir = Path(workspace).expanduser() / dirname
     project_leaf = root / dirname
     ordered = (
@@ -413,8 +421,8 @@ def context_matches_workspace(
       当前工作区」，因此返回 ``True``；
     - 记录了工作区：与 ``workspace`` 一起解析为绝对路径后比较，一致才返回 ``True``。
 
-    项目根目录下的会话文件是**多个工作区共享**的（同一 session_id 只写 ``<id>.json``），
-    因此回退到项目级查找时必须用它确认「这份上下文确实属于当前工作区」。
+    用户主目录下的会话文件是**多个工作区共享**的（同一 session_id 只写 ``<id>.json``），
+    因此回退到用户级查找时必须用它确认「这份上下文确实属于当前工作区」。
     """
     return _same_workspace(context_json_workspace(path, session_id=session_id), workspace)
 
@@ -436,12 +444,12 @@ def find_context_jsons(
       再列出另一个目录的，同路径去重。
 
     工作区目录（``<workspace>/<dirname>``）下的文件天然属于当前工作区，直接采纳；
-    **项目根目录**下的是多个工作区共享的，必须比对文件里记录的 ``workspace``
+    **用户主目录**下的是多个工作区共享的，必须比对文件里记录的 ``workspace``
     （``context_matches_workspace()``）：与当前 ``workspace`` 不一致的**不是**本次要
-    查找的上下文，直接跳过 —— 工作区里没有、项目级又不匹配时结果为空列表。
+    查找的上下文，直接跳过 —— 工作区里没有、用户级又不匹配时结果为空列表。
 
-    注意与 ``session_context_paths()`` 的区别：后者是**写入/枚举顺序**（项目根目录 ->
-    工作区），本函数是**查找顺序**（默认工作区 -> 项目根目录）。
+    注意与 ``session_context_paths()`` 的区别：后者是**写入/枚举顺序**（用户主目录 ->
+    工作区），本函数是**查找顺序**（默认工作区 -> 用户主目录）。
     """
     directories = session_search_dirs(
         workspace, project_dir=project_dir, dirname=dirname, priority=priority
@@ -449,7 +457,7 @@ def find_context_jsons(
     workspace_dir = Path(workspace).expanduser() / dirname
 
     def usable(candidate: Path) -> bool:
-        """工作区目录里的文件直接采纳；项目级文件必须先比对记录的工作区。"""
+        """工作区目录里的文件直接采纳；用户级文件必须先比对记录的工作区。"""
         if candidate.parent == workspace_dir:
             return True
         return context_matches_workspace(candidate, workspace, session_id=session_id)
@@ -483,10 +491,10 @@ def find_context_json(
     """查找单个上下文 JSON；找到时返回**优先级最高**的那一个，否则返回 ``None``。
 
     这是「查找工作区上下文」的入口：默认**工作区优先**（``priority="workspace"``），
-    工作区里没有才回退到项目根目录；同一目录内取最新修改的那一个。
+    工作区里没有才回退到用户主目录；同一目录内取最新修改的那一个。
 
-    回退到项目根目录时还会比对文件里记录的 ``workspace``：与当前 ``workspace``
-    不一致的**不是**本次要查找的上下文（项目级是多个工作区共享的），直接返回 ``None``
+    回退到用户主目录时还会比对文件里记录的 ``workspace``：与当前 ``workspace``
+    不一致的**不是**本次要查找的上下文（用户级是多个工作区共享的），直接返回 ``None``
     —— 宁可让调用方新建会话，也不把别的工作区的历史当成本次上下文；旧格式没有记录
     工作区时按「运行时继承」处理，仍然采纳（详见 ``context_matches_workspace()``）。
 
@@ -519,7 +527,7 @@ def create_context_json(
 
     - 文件已存在且 ``overwrite=False``：保留原内容，仅返回其路径；
     - ``overwrite=True``：用全新会话覆盖写入；
-    - 返回最终存在的文件路径列表（构造顺序：项目根目录 -> 工作区）。
+    - 返回最终存在的文件路径列表（构造顺序：用户主目录 -> 工作区）。
     """
     resolved_workspace = Path(workspace).expanduser()
     targets = (
@@ -545,12 +553,12 @@ def create_context_json(
 
 
 # ----------------------------------------------------------------------
-# 会话清单：列出全部会话（工作区 + 项目根目录，只读）
+# 会话清单：列出全部会话（工作区 + 用户主目录，只读）
 # ----------------------------------------------------------------------
 
 # ``SessionInfo.scope`` 的取值：会话文件所在位置 / 来源。
-SESSION_SCOPE_WORKSPACE = "workspace"   # <workspace>/<dirname>/<id>.json
-SESSION_SCOPE_PROJECT = "project"       # <project_dir>/<dirname>/<id>.json
+SESSION_SCOPE_WORKSPACE = "workspace"   # <workspace>/.agent/sessions/<id>.json
+SESSION_SCOPE_PROJECT = "project"       # 用户级 ~/.agent/sessions/<id>.json（历史命名，指用户主目录那份）
 SESSION_SCOPE_CONTEXT = "context"       # 显式 context_path 指定的单个文件
 
 
@@ -708,13 +716,13 @@ def list_sessions(
 ) -> list[SessionInfo]:
     """列出**全部会话**的只读摘要（不载入内容、不创建任何文件）。
 
-    扫描 ``priority`` 顺序下的会话目录（默认工作区在前、项目根目录在后）里的 ``*.json``，
+    扫描 ``priority`` 顺序下的会话目录（默认工作区在前、用户主目录在后）里的 ``*.json``，
     把每个文件里的每个会话整理成一个 ``SessionInfo``：
 
-    - ``include_project=False``：只列工作区目录；``True``（默认）额外列项目根目录；
+    - ``include_project=False``：只列工作区目录；``True``（默认）额外列用户主目录；
     - ``only_current_workspace=True``：只保留 ``matches_workspace`` 为真的会话（口径与
-      ``find_context()`` 的项目级回退比对一致，即不把别的工作区的会话算进来）；
-    - ``dedupe=True``（默认）：同一个 ``session_id`` 在工作区 / 项目根目录各有一份副本时，
+      ``find_context()`` 的用户级回退比对一致，即不把别的工作区的会话算进来）；
+    - ``dedupe=True``（默认）：同一个 ``session_id`` 在工作区 / 用户主目录各有一份副本时，
       只保留优先级高的那一份（默认工作区副本，见 ``scope``）；``False`` 时两份都返回；
     - 排序：``updated_at`` 从新到旧，其次 ``session_id``；
     - 容错：文件损坏 / 不是 ``ContextStore`` 格式 / 单个会话数据非法 → 跳过该条，不抛异常；
@@ -1056,7 +1064,7 @@ class AgentRunner:
        token 用量）。**构造过程主动查找会话，但不载入内容、不创建文件**：
 
        - 查找优先级：显式 ``session_id`` / ``context_path`` > 按 ``session_priority``
-         查找（**默认工作区优先**，工作区里没有才回退项目根目录；回退时比对文件里记录的
+         查找（**默认工作区优先**，工作区里没有才回退用户主目录；回退时比对文件里记录的
          ``workspace``，不是当前工作区的会话视为未命中）> 新的 ``uuid4``；命中的文件记入
          ``found_context_path``；
        - 继续已有会话要**显式**调用 ``load_session()``（或 ``load_context(path)``）；
@@ -1064,7 +1072,7 @@ class AgentRunner:
        - 开始新对话要**显式**调用 ``create_context()``：未指定 ``session_id`` 时每次都会
          生成新的 ``uuid4``，因此不会覆盖 / 重置其它会话；
        - 落盘通过 ``save_context()``，或 ``close()``（仅当本次确实有改动时）完成，一式两份
-         写入项目根目录与工作区下的 ``.agent/sessions/<session_id>.json``。
+         写入用户主目录与工作区下的 ``.agent/sessions/<session_id>.json``。
        - 列出全部会话用 ``list_sessions()``：只读摘要（``SessionInfo``：id / 文件路径 /
          位置 / 时间 / 消息数 / 轮数 / usage / 元数据），不载入内容、不创建文件。
 
@@ -1136,7 +1144,7 @@ class AgentRunner:
         # 会话查找优先级：默认工作区优先（workspace -> project）。
         self.session_priority = _normalize_session_priority(session_priority)
         self.project_dir = (
-            Path(project_dir).expanduser() if project_dir is not None else project_root()
+            Path(project_dir).expanduser() if project_dir is not None else default_session_root()
         )
         self.session_dirname = Path(session_dirname)
         # 显式单文件路径：给定后只读写这一份，不再一式两份。
@@ -1253,7 +1261,7 @@ class AgentRunner:
         3. 显式 ``context_path``：存在则用该文件里的会话 ID，否则新建 uuid4；
         4. 注入的 ``store`` 里已有会话：用第一个（内容已在内存里）；
         5. ``reuse_existing=False``：不查找，直接用新的 uuid4；
-        6. 否则按 ``session_priority`` 查找（**默认工作区优先**；回退项目级时比对文件里记录的
+        6. 否则按 ``session_priority`` 查找（**默认工作区优先**；回退用户级时比对文件里记录的
            工作区，不是当前工作区的会话视为未命中），命中则用其中的会话；
         7. 都没命中：使用新的 uuid4。
 
@@ -1304,7 +1312,7 @@ class AgentRunner:
     def _find_session_path(self, session_id: str) -> Path | None:
         """返回该会话已存在的上下文文件（按 ``session_priority``：默认工作区优先）。
 
-        回退到项目根目录时会比对文件里记录的 ``workspace``（见
+        回退到用户主目录时会比对文件里记录的 ``workspace``（见
         ``context_matches_workspace()``）：不是当前工作区的会话不返回。
         """
         if self.context_path is not None:
@@ -1764,7 +1772,7 @@ class AgentRunner:
         """返回该会话的上下文存储路径列表。
 
         - 构造时给了 ``context_path``：只返回这一个文件；
-        - 否则：项目根目录 + 工作区两份 ``.agent/sessions/<session_id>.json``
+        - 否则：用户主目录 + 工作区两份 ``.agent/sessions/<session_id>.json``
           （两个根目录相同时自动去重）。
         """
         if self.context_path is not None:
@@ -1779,7 +1787,7 @@ class AgentRunner:
     def save_context(self, path: str | Path | None = None) -> list[Path]:
         """把上下文写入 JSON，返回实际写入的路径列表。
 
-        默认一式两份（项目根目录 + 工作区，文件名即 UUID）；传入 ``path`` 时只写这一份。
+        默认一式两份（用户主目录 + 工作区，文件名即 UUID）；传入 ``path`` 时只写这一份。
         某个位置不可写（例如只读仓库目录）时会跳过它，只要还有一份成功就返回成功列表；
         全部失败才抛出异常。
 
@@ -1853,10 +1861,10 @@ class AgentRunner:
 
         - ``session_id`` 给定时：只找该会话的两份副本，按 ``priority`` 返回优先级最高的；
         - ``context_path`` 给定时：只检查该文件；
-        - 否则：**先扫工作区**，工作区里没有才回退项目根目录，返回优先级最高（默认工作区）、
+        - 否则：**先扫工作区**，工作区里没有才回退用户主目录，返回优先级最高（默认工作区）、
           其次最新的一份；
-        - 回退到项目根目录时比对文件里记录的 ``workspace``：与 ``self.workspace`` 不一致的
-          **不是**本次要查找的上下文（项目级是多个工作区共享的），直接返回 ``None``；
+        - 回退到用户主目录时比对文件里记录的 ``workspace``：与 ``self.workspace`` 不一致的
+          **不是**本次要查找的上下文（用户级是多个工作区共享的），直接返回 ``None``；
         - 找不到返回 ``None``。
 
         ``priority`` 省略时使用构造参数 ``session_priority``（默认 ``"workspace"``）。
@@ -1889,7 +1897,7 @@ class AgentRunner:
     ) -> list[SessionInfo]:
         """列出**全部会话**的只读摘要（模块级 ``list_sessions()`` 的便捷入口）。
 
-        列出工作区（默认还含项目根目录）下的每个会话：id / 文件路径 / 位置 / 时间 / 消息数 /
+        列出工作区（默认还含用户主目录）下的每个会话：id / 文件路径 / 位置 / 时间 / 消息数 /
         轮数 / usage / 元数据等（``SessionInfo``）。**只读**：不载入内容、不创建文件。
 
         - ``persist=False``：纯内存模式不读盘，直接返回 ``[]``；
@@ -1936,7 +1944,7 @@ class AgentRunner:
           对话，绝不会复用 / 覆盖其它会话的 ``session_id``；
         - 显式传入 ``session_id``：只创建（或写回）该会话的副本；``overwrite=False`` 时
           已存在的文件保持原内容；
-        - 默认一式两份（项目根目录 + 工作区）；构造时给了 ``context_path`` 则只创建那一份。
+        - 默认一式两份（用户主目录 + 工作区）；构造时给了 ``context_path`` 则只创建那一份。
         """
         target_session = str(session_id) if session_id is not None else new_session_id()
         paths = create_context_json(

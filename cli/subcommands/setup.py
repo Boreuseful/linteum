@@ -12,7 +12,7 @@ def build_setup_parser(subparsers, *, cmd_setup: Callable) -> None:
     parser = subparsers.add_parser(
         "setup",
         help="初始化配置与项目状态",
-        description="初始化 <项目根目录>/.agent/config.yaml（未来新增的设置也在这里初始化）。"
+        description="初始化 ~/.agent/config.yaml（未来新增的设置也在这里初始化）。"
                     "setup 不写快照 —— 快照只由 chat 更新。")
     add_shared_flags(parser, inherited=True)
     parser.add_argument(

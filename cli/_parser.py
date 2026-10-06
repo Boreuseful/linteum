@@ -18,7 +18,7 @@ from cli.subcommands._shared import add_shared_flags
 _EPILOGUE = """\
 示例:
   atom                                    进入交互式对话（默认写快照）
-  atom setup                              初始化 .agent/config.yaml
+  atom setup                              初始化 ~/.agent/config.yaml
   atom chat -p "总结这个仓库"              单次问答
   atom chat --bash -y                     启用 bash 工具并自动授权
   atom --use-snapshot                     用快照里保存的工作区启动

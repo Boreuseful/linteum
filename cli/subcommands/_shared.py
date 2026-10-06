@@ -27,7 +27,7 @@ def add_shared_flags(parser: argparse.ArgumentParser, *, inherited: bool = False
         help="会话 ID（默认按工作区自动查找）")
     parser.add_argument(
         "--config", metavar="PATH", default=default,
-        help="配置文件路径（默认 <项目根目录>/.agent/config.yaml）")
+        help="配置文件路径（默认 ~/.agent/config.yaml）")
 
     if inherited:
         parser.add_argument(

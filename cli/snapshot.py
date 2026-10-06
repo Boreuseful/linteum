@@ -2,7 +2,7 @@
 
 语义：
 
-- **默认位置**：``<项目根目录>/.agent/snapshot.json``（与被改到 ``.agent`` 的 config.yaml 同处）；
+- **默认位置**：``~/.agent/snapshot.json``（与 ``~/.agent/config.yaml`` 同处）；
 - **只有 ``chat`` 写快照**（含裸 ``atom``）：每次 ``chat`` 运行前把当前「模型配置 + config +
   工作区」写回，使后续 ``atom --use-snapshot chat`` 无需重复指定工作区；``--no-snapshot`` 关闭；
 - **其它命令只读**：``status`` / ``sessions`` / ``config`` / ``model`` / ``tools`` / ``skills``
@@ -24,7 +24,7 @@ from typing import Any
 
 #: 快照文件格式版本。
 SNAPSHOT_VERSION = 1
-#: 快照文件名（位于 ``<项目根目录>/.agent``）。
+#: 快照文件名（位于用户级 ``~/.agent``）。
 SNAPSHOT_FILENAME = "snapshot.json"
 #: 环境变量：覆盖快照文件路径（便于测试 / 多项目）。
 SNAPSHOT_PATH_ENV = "ATOM_AGENT_SNAPSHOT"
@@ -36,11 +36,10 @@ _SNAPSHOT_WRITERS = frozenset({"chat"})
 
 
 def agent_dir() -> Path:
-    """项目级状态目录：``<项目根目录>/.agent``。"""
-    from atom_agent.config import project_root
-    from atom_agent.config.store import AGENT_DIRNAME
+    """用户级状态目录：``~/.agent``（配置 / 快照 / 当前会话等用户状态都放这里）。"""
+    from atom_agent.config import agent_home
 
-    return project_root() / AGENT_DIRNAME
+    return agent_home()
 
 
 def snapshot_path() -> Path:

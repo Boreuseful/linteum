@@ -1,10 +1,10 @@
-"""配置文件读写：YAML 格式，默认保存到项目根目录的 ``.agent`` 目录。
+"""配置文件读写：YAML 格式，默认保存到用户主目录的 ``~/.agent`` 目录。
 
 用法::
 
     from atom_agent.config import ConfigStore, LLMConfig
 
-    store = ConfigStore()             # 默认 -> <项目根目录>/.agent/config.yaml
+    store = ConfigStore()             # 默认 -> ~/.agent/config.yaml
     config = store.load(create=True)  # 文件不存在时先写入默认配置再读取
 
     config.set_llm(
@@ -20,7 +20,7 @@
     store.llm()            # 唯一的 LLM（已规范化为 LLMConfig）
 
 路径优先级：``ConfigStore(path=...)`` > 环境变量 ``ATOM_AGENT_CONFIG`` >
-``project_root()/.agent/config.yaml``。写入使用“临时文件 + ``os.replace``”原子替换；
+``~/.agent/config.yaml``。写入使用“临时文件 + ``os.replace``”原子替换；
 配置里出现 ``api_key`` 时会把文件权限尽量收紧到 ``0600``（失败时忽略）。
 """
 
@@ -42,9 +42,9 @@ except ImportError:  # 支持直接将 /workspace/atom_agent 加入 sys.path
                         empty_config)
 
 
-# 项目级状态目录名（配置 / 快照 / 会话等都放在项目根目录的这个目录下）。
+# 用户级状态目录名（配置 / 快照 / 会话等都放在用户主目录的这个目录下，即 ``~/.agent``）。
 AGENT_DIRNAME = ".agent"
-# 默认配置文件名（位于项目根目录的 ``.agent`` 下）。
+# 默认配置文件名（位于用户主目录的 ``.agent`` 下）。
 DEFAULT_CONFIG_FILENAME = "config.yaml"
 # 环境变量：覆盖默认配置文件路径。
 CONFIG_PATH_ENV = "ATOM_AGENT_CONFIG"
@@ -65,22 +65,36 @@ CONFIG_HEADER = """\
 
 
 def project_root() -> Path:
-    """返回项目根目录：``atom_agent`` 包的上一级目录。"""
+    """返回项目根目录：``atom_agent`` 包的上一级目录。
+
+    注意：这只是代码仓库 / 安装位置，**不再**作为用户状态的存储位置
+    （配置 / 快照 / 会话都已改到 :func:`agent_home`）；保留它仅用于展示与旧位置迁移。
+    """
     return Path(__file__).resolve().parents[2]
+
+
+def agent_home() -> Path:
+    """用户级 agent 主目录：``~/.agent``。
+
+    配置（``config.yaml``）、CLI 快照（``snapshot.json``）、当前会话指针
+    （``current_session``）以及用户级会话副本（``sessions/``）都放在这里，
+    不再写进项目仓库 / 安装目录。
+    """
+    return Path.home() / AGENT_DIRNAME
 
 
 def default_config_path() -> Path:
     """返回默认配置文件路径。
 
-    优先级：环境变量 ``ATOM_AGENT_CONFIG`` > ``project_root()/.agent/config.yaml``。
+    优先级：环境变量 ``ATOM_AGENT_CONFIG`` > ``~/.agent/config.yaml``。
 
-    默认落在项目根目录的 ``.agent``（项目级状态目录）下，与会话 / 快照同处一地；
+    默认落在用户主目录的 ``.agent``（用户级状态目录）下，与会话 / 快照同处一地；
     首次使用时由 ``atom setup`` 生成。
     """
     override = os.getenv(CONFIG_PATH_ENV)
     if override and override.strip():
         return Path(override).expanduser()
-    return project_root() / AGENT_DIRNAME / DEFAULT_CONFIG_FILENAME
+    return agent_home() / DEFAULT_CONFIG_FILENAME
 
 
 def to_yaml(config: Config) -> str:
@@ -323,7 +337,7 @@ def set_config_store(store: ConfigStore) -> ConfigStore:
 
 
 def load_config(path: str | Path | None = None, *, create: bool = True) -> Config:
-    """读取配置（默认 ``<项目根目录>/.agent/config.yaml``；不存在时生成默认配置文件）。"""
+    """读取配置（默认 ``~/.agent/config.yaml``；不存在时生成默认配置文件）。"""
     return get_config_store(path).load(create=create)
 
 
