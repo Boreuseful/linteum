@@ -16,6 +16,15 @@ def _workspace(args) -> Path:
     return Path(workspace).expanduser() if workspace else Path.cwd()
 
 
+# 工具轮次超限时的友好提示：只给一句可操作的说明，不直接暴露底层 RuntimeError 文本。
+MAX_TOOL_ROUNDS_NOTICE = "（已达到最大工具调用轮次，本轮已停止；可用 --max-tool-rounds 调大上限）"
+
+
+def _warn_max_tool_rounds() -> None:
+    """打印「工具轮次超限」的友好提示（正文走 stdout，提示走 stderr）。"""
+    print(MAX_TOOL_ROUNDS_NOTICE, file=sys.stderr)
+
+
 def _build_runner(args):
     """按 argv 构造 ``AgentRunner``（惰性 import，避免为其它子命令付启动成本）。
 
@@ -101,6 +110,8 @@ def run_chat(args) -> int:
 
 
 def _one_shot(runner, args, prompt: str) -> int:
+    from atom_agent.agent import MaxToolRoundsError
+
     stream = bool(getattr(args, "stream", True))
     as_json = bool(getattr(args, "json", False))
 
@@ -110,12 +121,27 @@ def _one_shot(runner, args, prompt: str) -> int:
         try:
             for _chunk in runner.stream(prompt):
                 pass
+        except MaxToolRoundsError:
+            # 不抛出、不打印异常；正文已由 printer 流式输出，这里只补一句友好提示。
+            printer.ensure_newline()
+            _warn_max_tool_rounds()
+            return 1
         finally:
             detach()
         printer.ensure_newline()
         return 0 if runner.response().ok else 1
 
-    response = runner.send(prompt)
+    try:
+        response = runner.send(prompt)
+    except MaxToolRoundsError:
+        # 用已聚合的响应兜底（正文可能为空），而不是把 RuntimeError 打到终端。
+        response = runner.response()
+        if not as_json:
+            if response.reasoning:
+                print(f"\033[90m{response.reasoning}\033[0m")
+            print(response.text)
+        _warn_max_tool_rounds()
+        return 1
     if as_json:
         print(response.to_json())
     else:
@@ -126,6 +152,8 @@ def _one_shot(runner, args, prompt: str) -> int:
 
 
 def _repl(runner, args) -> int:
+    from atom_agent.agent import MaxToolRoundsError
+
     print(f"atom 会话 {runner.session_id}（输入 exit / quit 退出）")
     printer = _ConsolePrinter()
     detach = runner.add_listener(printer)
@@ -144,6 +172,10 @@ def _repl(runner, args) -> int:
             try:
                 for _chunk in runner.stream(text):
                     pass
+            except MaxToolRoundsError:
+                # 单轮工具轮次超限：不打印异常，友好提示后继续 REPL。
+                printer.ensure_newline()
+                _warn_max_tool_rounds()
             except Exception as exc:  # 单轮失败不退出 REPL
                 print(f"请求失败：{exc}", file=sys.stderr)
             printer.ensure_newline()
