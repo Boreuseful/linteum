@@ -41,7 +41,12 @@ ContextInjector = Callable[[str, list[Message]], Iterable[MessageInput]]
 class ContextMiddleware:
     """在 LLM 请求前注入上下文，在响应后自动保存对话消息。
 
-    注入顺序：持久化历史 -> 静态注入内容 -> 动态 injector 内容 -> 当前请求。
+    注入顺序：静态注入内容 -> 动态 injector 内容 -> 持久化历史 -> 当前请求。
+    注入内容（system prompt 等）放在历史**之前**，保证「assistant 的 tool_call」与
+    「当前请求里的 tool 结果」始终相邻：Responses API 要求 ``function_call`` 紧跟
+    ``function_call_output``，中间不能插入其它消息，否则会报
+    ``No tool output found for tool call ...``。
+
     ``store`` 中保存的是 ``Session``（工作区 + 上下文表示 + 元数据），而不是
     provider 专用 JSON；每个会话的消息即 ``Session.context``。写入的消息与 usage 会
     并入当前进行中的轮（``begin_round()`` / ``end_round()``，**一轮 = 一次完整
@@ -72,7 +77,10 @@ class ContextMiddleware:
         injected = list(self.context)
         if self.injector:
             injected.extend(normalize_messages(self.injector(session_id, history)))
-        return history + injected + normalize_messages(messages)
+        # 注入内容放在历史之前：这样「assistant 的 tool_call（在历史末尾）」与
+        # 「当前请求里的 tool 结果」不会被注入的 system 消息隔开——Responses API
+        # 要求 function_call 紧跟 function_call_output。
+        return injected + history + normalize_messages(messages)
 
     @staticmethod
     def _response_message(response: LLMResponse) -> AssistantMessage:
