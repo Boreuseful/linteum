@@ -21,6 +21,6 @@ from __future__ import annotations
 PROG = "linteum"
 
 #: CLI version number.
-__version__ = "0.1.0"
+__version__ = "0.1.0-rc.1"
 
 __all__ = ["PROG", "__version__"]
