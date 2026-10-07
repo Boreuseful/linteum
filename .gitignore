@@ -4,3 +4,10 @@ build/
 dist/
 wheels/
 *.egg-info
+
+test/
+.agent
+.vscode
+.venv
+
+config.yaml
