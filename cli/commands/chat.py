@@ -1,7 +1,7 @@
-"""``linteum chat`` 的实现：构造 :class:`AgentRunner` 并对话。
+"""Implementation of ``linteum chat``: build an :class:`AgentRunner` and converse.
 
-本模块只做**宿主适配**（读取 argv -> 调用 linteum_agent），不包含任何 Agent 业务逻辑；
-真正的能力来自 ``linteum_agent.run_agent.build_agent``。
+This module only does **host adaptation** (read argv -> call linteum_agent) and contains no Agent
+business logic; the real capability comes from ``linteum_agent.run_agent.build_agent``.
 """
 
 from __future__ import annotations
@@ -16,20 +16,22 @@ def _workspace(args) -> Path:
     return Path(workspace).expanduser() if workspace else Path.cwd()
 
 
-# 工具轮次超限时的友好提示：只给一句可操作的说明，不直接暴露底层 RuntimeError 文本。
-MAX_TOOL_ROUNDS_NOTICE = "（已达到最大工具调用轮次，本轮已停止；可用 --max-tool-rounds 调大上限）"
+# Friendly notice when tool rounds are exceeded: give one actionable sentence instead of exposing the
+# underlying RuntimeError text directly.
+MAX_TOOL_ROUNDS_NOTICE = "(maximum tool-call rounds reached; this turn has stopped. Use --max-tool-rounds to raise the limit)"
 
 
 def _warn_max_tool_rounds() -> None:
-    """打印「工具轮次超限」的友好提示（正文走 stdout，提示走 stderr）。"""
+    """Print the friendly "tool rounds exceeded" notice (body goes to stdout, the notice to stderr)."""
     print(MAX_TOOL_ROUNDS_NOTICE, file=sys.stderr)
 
 
 def _build_runner(args):
-    """按 argv 构造 ``AgentRunner``（惰性 import，避免为其它子命令付启动成本）。
+    """Build an ``AgentRunner`` from argv (lazy import to avoid startup cost for other subcommands).
 
-    会话选择：显式 ``-s/--session`` > **当前会话**（``linteum sessions new/switch`` 设置）>
-    由 ``AgentRunner`` 按工作区自动查找 / 新建。
+    Session selection: explicit ``-s/--session`` > the **current session** (set by
+    ``linteum sessions new/switch``) > automatic lookup / creation by ``AgentRunner`` based on the
+    workspace.
     """
     from linteum_agent.run_agent import build_agent
     from cli.session_state import get_current_session
@@ -46,7 +48,7 @@ def _build_runner(args):
 
 
 def _prepare_session(runner, args) -> None:
-    """决定「新建」还是「继续」：``--new`` 新建并设为当前会话，否则载入查到的既有会话。"""
+    """Decide between "create new" and "continue": ``--new`` creates and sets the current session, otherwise load the found existing session."""
     if getattr(args, "new", False):
         from cli.session_state import set_current_session
 
@@ -57,7 +59,7 @@ def _prepare_session(runner, args) -> None:
 
 
 class _ConsolePrinter:
-    """把事件流渲染成终端输出（正文 / 思维链 / 工具调用）。"""
+    """Render the event stream into terminal output (text / reasoning / tool calls)."""
 
     def __init__(self) -> None:
         self._pending_text = False
@@ -95,8 +97,8 @@ class _ConsolePrinter:
 def run_chat(args) -> int:
     try:
         runner = _build_runner(args)
-    except Exception as exc:  # 配置缺失 / API Key 未设置等
-        print(f"无法初始化 Agent：{exc}", file=sys.stderr)
+    except Exception as exc:  # missing config / API key not set, etc.
+        print(f"Unable to initialize Agent: {exc}", file=sys.stderr)
         return 2
 
     try:
@@ -122,7 +124,8 @@ def _one_shot(runner, args, prompt: str) -> int:
             for _chunk in runner.stream(prompt):
                 pass
         except MaxToolRoundsError:
-            # 不抛出、不打印异常；正文已由 printer 流式输出，这里只补一句友好提示。
+            # Do not raise or print the exception; the body was already streamed by the printer, so just
+            # add a friendly notice.
             printer.ensure_newline()
             _warn_max_tool_rounds()
             return 1
@@ -134,7 +137,7 @@ def _one_shot(runner, args, prompt: str) -> int:
     try:
         response = runner.send(prompt)
     except MaxToolRoundsError:
-        # 用已聚合的响应兜底（正文可能为空），而不是把 RuntimeError 打到终端。
+        # Fall back to the aggregated response (the text may be empty) instead of printing the RuntimeError to the terminal.
         response = runner.response()
         if not as_json:
             if response.reasoning:
@@ -154,7 +157,7 @@ def _one_shot(runner, args, prompt: str) -> int:
 def _repl(runner, args) -> int:
     from linteum_agent.agent import MaxToolRoundsError
 
-    print(f"linteum 会话 {runner.session_id}（输入 exit / quit 退出）")
+    print(f"linteum session {runner.session_id} (type exit / quit to quit)")
     printer = _ConsolePrinter()
     detach = runner.add_listener(printer)
     try:
@@ -173,11 +176,11 @@ def _repl(runner, args) -> int:
                 for _chunk in runner.stream(text):
                     pass
             except MaxToolRoundsError:
-                # 单轮工具轮次超限：不打印异常，友好提示后继续 REPL。
+                # Tool rounds exceeded within a single turn: do not print the exception; show a friendly notice and continue the REPL.
                 printer.ensure_newline()
                 _warn_max_tool_rounds()
-            except Exception as exc:  # 单轮失败不退出 REPL
-                print(f"请求失败：{exc}", file=sys.stderr)
+            except Exception as exc:  # a single-turn failure does not exit the REPL
+                print(f"Request failed: {exc}", file=sys.stderr)
             printer.ensure_newline()
     finally:
         detach()

@@ -1,4 +1,4 @@
-"""``linteum tools`` 子命令 parser。"""
+"""Parser for the ``linteum tools`` subcommand."""
 
 from __future__ import annotations
 
@@ -8,18 +8,18 @@ from cli.subcommands._shared import add_json_flag, add_shared_flags, group_dispa
 
 
 def build_tools_parser(subparsers, *, cmd_tools: Callable) -> None:
-    """把 ``tools`` 子命令（含 list）挂到 ``subparsers`` 上。"""
+    """Attach the ``tools`` subcommand (including list) to ``subparsers``."""
     parser = subparsers.add_parser(
-        "tools", help="工具列表",
-        description="列出内置工具及其启用状态。")
+        "tools", help="Tool list",
+        description="List the built-in tools and their enabled state.")
     sub = parser.add_subparsers(dest="tools_action")
 
-    lst = sub.add_parser("list", help="列出工具")
+    lst = sub.add_parser("list", help="List tools")
     add_shared_flags(lst, inherited=True)
     lst.add_argument(
         "--bash", dest="enable_bash", action="store_true", default=False,
-        help="包含 bash 工具（默认不含）")
-    add_json_flag(lst, "以 JSON 输出")
+        help="Include the bash tool (excluded by default)")
+    add_json_flag(lst, "Output as JSON")
     lst.set_defaults(func=cmd_tools)
 
     parser.set_defaults(func=group_dispatch(parser, cmd_tools, action_dest="tools_action"))

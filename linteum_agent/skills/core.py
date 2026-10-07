@@ -10,9 +10,9 @@ SkillScope = Literal["system", "project"]
 @dataclass(frozen=True)
 class SkillSource:
     """
-    Skill 的来源。
+    The source of a Skill.
 
-    priority 越大，优先级越高。
+    The larger the priority, the higher the precedence.
     """
 
     scope: SkillScope
@@ -23,9 +23,9 @@ class SkillSource:
 @dataclass(frozen=True)
 class SkillMetadata:
     """
-    Skill 注册阶段保存的轻量元数据。
+    Lightweight metadata saved during the Skill registration stage.
 
-    注册阶段只需要这些信息，不加载完整 SKILL.md 正文。
+    Only this information is needed at the registration stage; the full SKILL.md body is not loaded.
     """
 
     name: str
@@ -36,7 +36,7 @@ class SkillMetadata:
     @property
     def root(self) -> Path:
         """
-        Skill 目录，例如：
+        The Skill directory, for example:
 
         /project/.pi/skills/code-review
         """

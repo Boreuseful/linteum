@@ -1,4 +1,4 @@
-"""``linteum skills`` 的实现：发现系统 / 项目 Skill（离线，不构造 Agent）。"""
+"""Implementation of ``linteum skills``: discover system / project Skills (offline, no Agent construction)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 def run_skills(args) -> int:
     if getattr(args, "skills_action", None) != "list":
-        print("用法：linteum skills list ...", file=sys.stderr)
+        print("Usage: linteum skills list ...", file=sys.stderr)
         return 2
 
     from linteum_agent.skills import SkillRegistry
@@ -37,7 +37,7 @@ def run_skills(args) -> int:
         ))
         return 0
     if not skills:
-        print("（没有发现 Skill）")
+        print("(no Skills discovered)")
         return 0
     for skill in skills:
         print(f"{skill.name:<24} [{skill.source.scope}] {skill.description}")

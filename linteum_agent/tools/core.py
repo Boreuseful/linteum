@@ -7,16 +7,17 @@ from typing import Any, Callable
 
 try:
     from ..context.session import TOOL_CONFIG_KEY, ApproveFn, Session
-except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
+except ImportError:  # supports adding /workspace/linteum_agent to sys.path directly
     from context.session import TOOL_CONFIG_KEY, ApproveFn, Session
 
-# 工具运行上下文已经合并进 ``context.Session``：
-# - ``Session.effective_workspace``：工具工作区；
-# - ``Session.metadata``：会话元数据；``Session.tools``：工具配置；
-# - ``Session.approve`` / ``Session.cancelled`` / ``log()`` / ``is_cancelled()``：
-#   执行控制与输出通道。
+# The tool runtime context has been merged into ``context.Session``:
+# - ``Session.effective_workspace``: the tool workspace;
+# - ``Session.metadata``: session metadata; ``Session.tools``: tool config;
+# - ``Session.approve`` / ``Session.cancelled`` / ``log()`` / ``is_cancelled()``:
+#   execution control and output channels.
 #
-# 旧的 ``RuntimeContext`` 名字仍然可用，但它只是 ``Session`` 的兼容别名。
+# The old ``RuntimeContext`` name is still available, but it is only a compatibility alias for
+# ``Session``.
 RuntimeContext = Session
 
 

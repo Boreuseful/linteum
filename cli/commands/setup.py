@@ -1,10 +1,11 @@
-"""``linteum setup`` 的实现：初始化 ``config.yaml`` 与用户级状态。
+"""Implementation of ``linteum setup``: initialize ``config.yaml`` and user-level state.
 
-这是初始化的**唯一入口**：当前写入默认 ``config.yaml``（位于用户主目录
-``~/.agent/config.yaml``）；未来新增的初始化步骤（技能目录、默认工具等）
-都追加到 :func:`run_setup` 里。
+This is the **sole entry point** for initialization: it currently writes the default ``config.yaml``
+(located in the user home directory ``~/.agent/config.yaml``); future initialization steps (skill
+directories, default tools, etc.) are all appended to :func:`run_setup`.
 
-注意：**setup 不写快照** —— 快照只由 ``chat`` 更新（见 ``cli/snapshot.py``）。
+Note: **setup does not write the snapshot** -- the snapshot is only updated by ``chat`` (see
+``cli/snapshot.py``).
 """
 
 from __future__ import annotations
@@ -24,10 +25,11 @@ def run_setup(args) -> int:
     store = ConfigStore(config_path)
 
     if store.exists() and not getattr(args, "force", False):
-        print(f"配置已存在：{store.path}（使用 --force 覆盖）")
+        print(f"Config already exists: {store.path} (use --force to overwrite)")
     else:
-        # 未显式指定 --config 且新位置（~/.agent/config.yaml）尚无配置时，迁移旧默认位置：
-        # 先 `<项目根>/.agent/config.yaml`（上一版默认位置），再 `<项目根>/config.yaml`（更早）。
+        # When --config is not explicitly given and the new location (~/.agent/config.yaml) has no
+        # config yet, migrate from the old default locations: first `<project root>/.agent/config.yaml`
+        # (the previous default), then `<project root>/config.yaml` (even earlier).
         migrated_from = None
         if config_path is None and not store.exists():
             legacy_candidates = [
@@ -41,14 +43,15 @@ def run_setup(args) -> int:
                     store.save(ConfigStore(legacy).load(create=False))
                     migrated_from = legacy
                     break
-                except Exception:  # 旧文件读不了就尝试下一个 / 退回默认配置
+                except Exception:  # if the old file cannot be read, try the next one / fall back to the default config
                     continue
         if migrated_from is None:
             store.save(empty_config())
-            print(f"已写入默认配置：{store.path}")
+            print(f"Wrote default config: {store.path}")
         else:
-            print(f"已迁移旧配置：{migrated_from} -> {store.path}")
+            print(f"Migrated old config: {migrated_from} -> {store.path}")
 
-    # 未来新增的初始化设置在这里追加（本项目所有初始化都收敛到 setup）。
-    # 注意：setup 不写快照 —— 快照只由 chat 更新（见 cli/snapshot.py）。
+    # Future initialization settings are appended here (all initialization in this project converges
+    # on setup).
+    # Note: setup does not write the snapshot -- the snapshot is only updated by chat (see cli/snapshot.py).
     return 0

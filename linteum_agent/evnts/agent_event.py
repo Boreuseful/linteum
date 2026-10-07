@@ -13,7 +13,7 @@ from typing import (
 
 try:
     from ..messages.agent_message import SystemPrompt, UserPrompt, AssistantMessage, ToolResult
-except ImportError:  # 支持将 linteum_agent 目录直接加入 sys.path
+except ImportError:  # supports adding the linteum_agent directory to sys.path directly
     from messages.agent_message import SystemPrompt, UserPrompt, AssistantMessage, ToolResult
 
 AgentMessage = Union[
@@ -80,20 +80,20 @@ class ToolExecutionEndEvent(TypedDict):
 
 
 AgentEvent = Union[
-    # 第 1 层：Agent 生命周期
+    # Layer 1: Agent lifecycle
     AgentStartEvent,
     AgentEndEvent,
 
-    # 第 2 层：Turn 生命周期
+    # Layer 2: Turn lifecycle
     TurnStartEvent,
     TurnEndEvent,
 
-    # 第 3 层：Message 生命周期
+    # Layer 3: Message lifecycle
     MessageStartEvent,
     MessageUpdateEvent,
     MessageEndEvent,
 
-    # 第 4 层：Tool Execution 生命周期
+    # Layer 4: Tool Execution lifecycle
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
     ToolExecutionEndEvent,
@@ -101,7 +101,7 @@ AgentEvent = Union[
 
 class AgentEventListener:
     """
-    全量事件监听器接口。
+    The full event listener interface.
     """
 
     async def on_event(self, event: AgentEvent) -> None:
@@ -123,9 +123,9 @@ class EventBus:
         handler: EventHandler,
     ) -> Callable[[], None]:
         """
-        按事件类型监听。
+        Listen by event type.
 
-        例如：
+        For example:
             event_bus.on("message_update", handler)
         """
         self._handlers.setdefault(event_type, []).append(handler)
@@ -142,7 +142,7 @@ class EventBus:
         listener: AgentEventListener,
     ) -> Callable[[], None]:
         """
-        接收所有 AgentEvent。
+        Receive all AgentEvents.
         """
         self._listeners.append(listener)
 
@@ -166,7 +166,7 @@ class EventBus:
                 await result
 
     def emit_sync(self, event: AgentEvent) -> None:
-        """同步版本，供 ``AgentEngine.stream`` 和 ``run`` 使用。"""
+        """Synchronous version, used by ``AgentEngine.stream`` and ``run``."""
         event_type = event["type"]
         handlers: list[EventHandler] = [*self._handlers.get(event_type, [])]
         handlers.extend(listener.on_event for listener in self._listeners)
@@ -179,5 +179,5 @@ class EventBus:
                 except RuntimeError:
                     asyncio.run(result)
                 else:
-                    # 同步 API 不能阻塞正在运行的事件循环；尽可能交给循环执行。
+                    # A synchronous API must not block a running event loop; hand it to the loop whenever possible.
                     asyncio.create_task(result)

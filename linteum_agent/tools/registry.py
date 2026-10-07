@@ -10,20 +10,20 @@ from .validation import validate_arguments
 
 
 class ToolRegistry:
-    """负责 Tool 对象的注册、导出、校验、授权和执行。
+    """Responsible for registration, export, validation, approval, and execution of Tool objects.
 
-    工具执行所需的配置全部来自 ``session``（即 ``context.Session``）：
+    All configuration needed for tool execution comes from ``session`` (i.e. ``context.Session``):
 
-    - ``session.effective_workspace``：工具工作区（内置 Tool 读取它做路径约束）；
-    - ``session.tools``：会话级工具配置（``registered`` / ``enabled`` / ``disabled`` / ``options``）；
-    - ``session.tools["registered"]``：本会话注册的工具（``register()`` 时写入，
-      可用 ``session.registered_tools()`` 读取）；
-    - ``session.approve``：``requires_approval`` 工具的授权回调（也可通过 ``approve=``
-      直接传入，等价于设置 ``session.approve``）；
-    - ``session.cancelled``：执行前的取消检查；
-    - ``session.metadata`` / ``session.log()``：会话信息与工具输出通道。
+    - ``session.effective_workspace``: the tool workspace (built-in Tools read it for path constraints);
+    - ``session.tools``: session-level tool config (``registered`` / ``enabled`` / ``disabled`` / ``options``);
+    - ``session.tools["registered"]``: tools registered for this session (written on ``register()``,
+      readable via ``session.registered_tools()``);
+    - ``session.approve``: the approval callback for ``requires_approval`` tools (can also be passed
+      directly via ``approve=``, equivalent to setting ``session.approve``);
+    - ``session.cancelled``: the cancellation check before execution;
+    - ``session.metadata`` / ``session.log()``: session info and the tool output channel.
 
-    ``context=`` 参数与 ``context`` 属性是 ``session`` 的兼容别名。
+    The ``context=`` parameter and the ``context`` property are compatibility aliases for ``session``.
     """
 
     def __init__(
@@ -38,18 +38,18 @@ class ToolRegistry:
         self._lock = threading.RLock()
         self.session: Session = session or context or Session.cwd()
         if approve is not None:
-            # requires_approval 工具执行前会调用 session.approve；这里提供直接注入入口。
+            # requires_approval tools call session.approve before execution; this provides a direct injection point.
             self.session.approve = approve
         for tool in tools or []:
             self.register(tool)
 
     # ------------------------------------------------------------------
-    # Session 绑定
+    # Session binding
     # ------------------------------------------------------------------
 
     @property
     def context(self) -> Session:
-        """兼容旧命名：工具运行上下文就是 ``self.session``。"""
+        """Compatibility with the old naming: the tool runtime context is just ``self.session``."""
         return self.session
 
     @context.setter
@@ -58,29 +58,29 @@ class ToolRegistry:
 
     @property
     def workspace(self) -> Any:
-        """工具工作区（实时读取会话工作区）。"""
+        """The tool workspace (reads the session workspace in real time)."""
         return self.session.effective_workspace
 
     def bind_session(self, session: Session) -> Session:
-        """切换工具注册表使用的会话，并把已注册工具记录到该会话，返回它。"""
+        """Switch the session used by the tool registry, record the registered tools into that session, and return it."""
         self.session = session
         session.register_tools(self.all())
         return session
 
     # ------------------------------------------------------------------
-    # 注册与查询
+    # Registration and lookup
     # ------------------------------------------------------------------
 
     def register(self, tool: Tool) -> None:
         if not isinstance(tool, Tool):
-            raise TypeError("registry.register() 需要 Tool 实例")
+            raise TypeError("registry.register() requires a Tool instance")
         if not tool.name:
             raise ValueError("tool name cannot be empty")
         with self._lock:
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool name: {tool.name}")
             self._tools[tool.name] = tool
-        # 在会话中登记本会话注册（可用）的工具，供 session.registered_tools() 读取。
+        # Record the tools registered (available) for this session, for session.registered_tools() to read.
         self.session.register_tools(tool)
 
     def all(self) -> list[Tool]:
@@ -106,7 +106,7 @@ class ToolRegistry:
                 for t in self.all() if self.is_tool_enabled(t.name)]
 
     def set_enabled(self, name: str, enabled: bool) -> Tool:
-        """切换 Tool 自身的 ``enabled`` 开关（会话配置仍然优先）。"""
+        """Toggle the Tool's own ``enabled`` switch (session config still takes precedence)."""
         tool = self._require(name)
         tool.enabled = bool(enabled)
         return tool
@@ -115,12 +115,12 @@ class ToolRegistry:
         return self.is_tool_enabled(name)
 
     def is_tool_enabled(self, name: str) -> bool:
-        """结合 Tool 自身开关与会话工具配置判断是否可用。"""
+        """Determine availability by combining the Tool's own switch with the session tool config."""
         tool = self._require(name)
         return tool.enabled and self.session.tool_enabled(name)
 
     def tool_options(self, name: str | None = None) -> dict[str, Any]:
-        """返回会话中该工具（或全局）的选项配置。"""
+        """Return the option config for this tool (or the global one) in the session."""
         return self.session.tool_options(name)
 
     def _require(self, name: str) -> Tool:
@@ -130,7 +130,7 @@ class ToolRegistry:
         return tool
 
     # ------------------------------------------------------------------
-    # 执行
+    # Execution
     # ------------------------------------------------------------------
 
     def _prepare(self, name: str, arguments: dict[str, Any]) -> Tool:
@@ -153,7 +153,7 @@ class ToolRegistry:
             raise ValueError("tool arguments must be an object")
         result = self._prepare(name, arguments).execute(arguments, self.session)
         if inspect.isawaitable(result):
-            raise RuntimeError("同步执行不能调用异步工具")
+            raise RuntimeError("synchronous execution cannot call an asynchronous tool")
         return result if isinstance(result, ToolResult) else ToolResult(str(result), details={"value": result})
 
     async def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:

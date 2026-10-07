@@ -1,9 +1,10 @@
-"""顶层 argparse 构造。
+"""Top-level argparse construction.
 
-本模块只负责**顶层 parser**（``prog`` / 顶层 flags / subparsers 动作）与一个自定义
-``ArgumentParser``；除 ``chat``（默认命令，由 ``subcommands/chat.py`` 构建）外的每个子命令
-parser 都由 ``cli/subcommands/<group>.py`` 提供，``main._build_cli_parser`` 逐个调用
-``build_<group>_parser(subparsers, ...)`` 并注入 handler。
+This module is only responsible for the **top-level parser** (``prog`` / top-level flags / the
+subparsers action) and a custom ``ArgumentParser``; every subcommand parser except ``chat`` (the
+default command, built by ``subcommands/chat.py``) is provided by ``cli/subcommands/<group>.py`` and
+``main._build_cli_parser`` calls ``build_<group>_parser(subparsers, ...)`` one by one and injects the
+handler.
 """
 
 from __future__ import annotations
@@ -14,29 +15,30 @@ import difflib
 from cli import PROG
 from cli.subcommands._shared import add_shared_flags
 
-#: ``linteum --help`` 结尾的用法示例（与注册顺序一起构成用户可见的命令面）。
+#: The usage examples at the end of ``linteum --help`` (together with the registration order, they form the user-visible command surface).
 _EPILOGUE = """\
-示例:
-  linteum                                 进入交互式对话（默认写快照）
-  linteum setup                           初始化 ~/.agent/config.yaml
-  linteum chat -p "总结这个仓库"           单次问答
-  linteum chat --bash -y                  启用 bash 工具并自动授权
-  linteum --use-snapshot                  用快照里保存的工作区启动
-  linteum snapshot show                   查看快照（模型配置 + config + 工作区）
-  linteum sessions list                   列出工作区里的会话
-  linteum status                          查看运行时状态
+Examples:
+  linteum                                 enter interactive conversation (writes snapshot by default)
+  linteum setup                           initialize ~/.agent/config.yaml
+  linteum chat -p "summarize this repo"   single-shot Q&A
+  linteum chat --bash -y                  enable the bash tool and auto-approve
+  linteum --use-snapshot                  start with the workspace saved in the snapshot
+  linteum snapshot show                   view the snapshot (model config + config + workspace)
+  linteum sessions list                   list sessions in the workspace
+  linteum status                          view runtime status
 """
 
 
 class CliArgumentParser(argparse.ArgumentParser):
-    """未知子命令时给出三行错误 + 最近似建议，而不是打印整棵命令树。
+    """Give a three-line error + closest suggestion for an unknown subcommand instead of printing the whole command tree.
 
-    原生 argparse 在首个 positional 不是已注册子命令时，会打印完整 usage + 巨长的
-    ``(choose from '...', ...)``，把唯一有用的信息（这个词不是命令）淹没掉。这里把它改成
-    三行 + ``difflib`` 的 "Did you mean"；其余错误仍沿用 argparse 原生形态。
+    Native argparse, when the first positional is not a registered subcommand, prints the full usage +
+    a very long ``(choose from '...', ...)``, drowning out the only useful information (this word is
+    not a command). Here it is changed to three lines + ``difflib``'s "Did you mean"; other errors keep
+    argparse's native form.
     """
 
-    def _check_value(self, action, value):  # noqa: D401 - 覆写 argparse 钩子
+    def _check_value(self, action, value):  # noqa: D401 - overrides an argparse hook
         if isinstance(action, argparse._SubParsersAction) and value not in action.choices:
             lines = [f"{self.prog}: '{value}' is not a `{self.prog}` command."]
             close = difflib.get_close_matches(str(value), list(action.choices), n=3, cutoff=0.6)
@@ -48,27 +50,27 @@ class CliArgumentParser(argparse.ArgumentParser):
 
 
 def build_top_level_parser() -> tuple[argparse.ArgumentParser, argparse._SubParsersAction]:
-    """构造顶层 parser 与其 ``subparsers`` 动作。
+    """Build the top-level parser and its ``subparsers`` action.
 
-    返回 ``(parser, subparsers)``；调用方负责依次 ``subparsers.add_parser(...)`` 注册子命令，
-    并给叶子 parser ``set_defaults(func=...)``。
+    Returns ``(parser, subparsers)``; the caller is responsible for registering subcommands via
+    ``subparsers.add_parser(...)`` in order and calling ``set_defaults(func=...)`` on leaf parsers.
     """
     parser = CliArgumentParser(
         prog=PROG,
-        description="linteum_agent —— 带工具调用能力的命令行 Agent",
+        description="linteum_agent -- a command-line Agent with tool-calling capability",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_EPILOGUE,
     )
     _add_top_level_flags(parser)
-    # metavar=<command> 让 usage 行保持 ``linteum [...] <command>``，而不是把全部子命令名铺开；
-    # ``linteum --help`` 仍会逐条列出每个命令。
-    subparsers = parser.add_subparsers(dest="command", help="要运行的子命令", metavar="<command>")
+    # metavar=<command> keeps the usage line as ``linteum [...] <command>`` instead of spreading out
+    # all subcommand names; ``linteum --help`` still lists every command individually.
+    subparsers = parser.add_subparsers(dest="command", help="the subcommand to run", metavar="<command>")
     return parser, subparsers
 
 
 def _add_top_level_flags(parser: argparse.ArgumentParser) -> None:
-    """顶层 flags：``--version`` + 与子命令共享的工作区/会话/配置/授权 flag。"""
+    """Top-level flags: ``--version`` + the workspace/session/config/approval flags shared with subcommands."""
     parser.add_argument(
-        "--version", action="store_true", help="打印版本并退出")
-    # 工作区 / 会话 / 配置 / 自动授权：既出现在顶层，也由子命令继承（见 _shared.add_shared_flags）。
+        "--version", action="store_true", help="print the version and exit")
+    # Workspace / session / config / auto-approval: appear at the top level and are also inherited by subcommands (see _shared.add_shared_flags).
     add_shared_flags(parser, inherited=False)

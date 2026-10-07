@@ -1,11 +1,13 @@
-"""当前会话（current session）指针。
+"""The current-session pointer.
 
-`linteum sessions new/switch` 会把选中的会话 ID 写入 ``~/.agent/current_session``；
-`linteum chat` 在未显式给 ``-s/--session`` 时**默认沿用**该会话。
+`linteum sessions new/switch` writes the selected session ID into ``~/.agent/current_session``;
+`linteum chat` **reuses** that session by default when ``-s/--session`` is not explicitly given.
 
-- 默认位置：``~/.agent/current_session``（一个只含会话 ID 的文本文件）；
-- 环境变量 ``linteum_agent_CURRENT_SESSION`` 可覆盖文件路径（测试 / 多项目）；
-- 读写都容忍文件缺失：读不到返回 ``None``（表示「未设置当前会话」），绝不抛异常。
+- Default location: ``~/.agent/current_session`` (a text file containing only the session ID);
+- The environment variable ``linteum_agent_CURRENT_SESSION`` can override the file path (tests /
+  multiple projects);
+- Both reading and writing tolerate a missing file: reading returns ``None`` (meaning "no current
+  session set") and never raises.
 """
 
 from __future__ import annotations
@@ -13,14 +15,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-#: 当前会话文件名（位于用户级 ``~/.agent``）。
+#: Current session file name (located in the user-level ``~/.agent``).
 CURRENT_SESSION_FILENAME = "current_session"
-#: 环境变量：覆盖当前会话文件路径。
+#: Environment variable: overrides the current session file path.
 CURRENT_SESSION_PATH_ENV = "linteum_agent_CURRENT_SESSION"
 
 
 def current_session_path() -> Path:
-    """当前会话文件路径（环境变量 ``linteum_agent_CURRENT_SESSION`` 可覆盖）。"""
+    """The current session file path (the ``linteum_agent_CURRENT_SESSION`` env var can override it)."""
     override = os.getenv(CURRENT_SESSION_PATH_ENV)
     if override and override.strip():
         return Path(override).expanduser()
@@ -30,7 +32,7 @@ def current_session_path() -> Path:
 
 
 def get_current_session() -> str | None:
-    """读取当前会话 ID；未设置 / 文件不可读时返回 ``None``。"""
+    """Read the current session ID; return ``None`` when unset / the file is unreadable."""
     try:
         text = current_session_path().read_text(encoding="utf-8").strip()
     except OSError:
@@ -39,10 +41,10 @@ def get_current_session() -> str | None:
 
 
 def set_current_session(session_id: str) -> Path:
-    """把 ``session_id`` 设为当前会话，返回写入文件路径。"""
+    """Set ``session_id`` as the current session and return the written file path."""
     session_id = str(session_id).strip()
     if not session_id:
-        raise ValueError("session_id 不能为空")
+        raise ValueError("session_id must not be empty")
     path = current_session_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(session_id + "\n", encoding="utf-8")
@@ -50,7 +52,7 @@ def set_current_session(session_id: str) -> Path:
 
 
 def clear_current_session() -> bool:
-    """清除当前会话；返回是否真的删掉了文件。"""
+    """Clear the current session; return whether the file was actually deleted."""
     try:
         current_session_path().unlink()
         return True

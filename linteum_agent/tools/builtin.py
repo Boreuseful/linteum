@@ -13,12 +13,12 @@ def _safe_path(root_dir: str | Path, path: str) -> Path:
     root = Path(root_dir).expanduser().resolve()
     candidate = (root / path).resolve()
     if candidate != root and root not in candidate.parents:
-        raise ValueError(f"文件路径超出工具根目录: {path}")
+        raise ValueError(f"file path escapes the tool root directory: {path}")
     return candidate
 
 
 def read_file(path: str, *, root_dir: str | Path = ".", encoding: str = "utf-8") -> str:
-    """读取根目录内的文本文件。"""
+    """Read a text file within the root directory."""
     return _safe_path(root_dir, path).read_text(encoding=encoding)
 
 
@@ -29,7 +29,7 @@ def write_file(
     root_dir: str | Path = ".",
     encoding: str = "utf-8",
 ) -> dict[str, Any]:
-    """写入根目录内的文本文件，并自动创建父目录。"""
+    """Write a text file within the root directory, creating parent directories automatically."""
     target = _safe_path(root_dir, path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding=encoding)
@@ -43,20 +43,21 @@ def run_bash(
     cwd: str | Path | None = None,
     timeout: float = 30,
 ) -> dict[str, Any]:
-    """在工具根目录内执行 Bash 命令。
+    """Execute a Bash command within the tool root directory.
 
-    命令通过 ``bash -c`` 执行，因此支持管道、重定向和环境变量。调用方应只
-    对可信输入启用此工具；``shell=False`` 仅表示 Python 不再额外嵌套 shell。
+    The command runs via ``bash -c``, so pipes, redirections, and environment variables are supported.
+    Callers should enable this tool only for trusted input; ``shell=False`` only means Python does not
+    additionally nest a shell.
     """
     if not isinstance(command, str) or not command.strip():
-        raise ValueError("bash command 不能为空")
+        raise ValueError("bash command must not be empty")
     if timeout <= 0:
-        raise ValueError("bash timeout 必须大于 0")
+        raise ValueError("bash timeout must be greater than 0")
 
     root = Path(root_dir).expanduser().resolve()
     working_dir = root if cwd is None else _safe_path(root, str(cwd))
     if not working_dir.is_dir():
-        raise NotADirectoryError(f"Bash 工作目录不存在: {working_dir}")
+        raise NotADirectoryError(f"Bash working directory does not exist: {working_dir}")
     try:
         completed = subprocess.run(
             ["bash", "-c", command],
@@ -68,7 +69,7 @@ def run_bash(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise TimeoutError(f"Bash 命令执行超时（{timeout} 秒）") from exc
+        raise TimeoutError(f"Bash command timed out after {timeout} seconds") from exc
     return {
         "returncode": completed.returncode,
         "stdout": completed.stdout,
@@ -78,10 +79,10 @@ def run_bash(
 
 
 def list_files(path: str = ".", *, root_dir: str | Path = ".", recursive: bool = False) -> list[str]:
-    """列出工作区内的文件；返回相对于工作区的 POSIX 路径。"""
+    """List files within the workspace; return POSIX paths relative to the workspace."""
     directory = _safe_path(root_dir, path)
     if not directory.is_dir():
-        raise NotADirectoryError(f"目录不存在: {path}")
+        raise NotADirectoryError(f"directory does not exist: {path}")
     entries = directory.rglob("*") if recursive else directory.iterdir()
     root = Path(root_dir).expanduser().resolve()
     return sorted(str(item.relative_to(root).as_posix()) for item in entries if item.is_file())
@@ -100,7 +101,7 @@ def create_read_tool() -> Tool:
                                         encoding=args.get("encoding", "utf-8")))
         except Exception as exc:
             return ToolResult(str(exc), is_error=True)
-    return Tool("read_file", "读取工作区内的文本文件", {
+    return Tool("read_file", "Read a text file within the workspace", {
         "type": "object", "properties": {
             "path": {"type": "string"}, "encoding": {"type": "string", "default": "utf-8"}},
         "required": ["path"], "additionalProperties": False}, execute)
@@ -114,7 +115,7 @@ def create_list_files_tool() -> Tool:
             return ToolResult("\n".join(value) or "(empty directory)", details={"files": value, "count": len(value)})
         except Exception as exc:
             return ToolResult(str(exc), is_error=True)
-    return Tool("list_files", "列出工作区内的文件", {
+    return Tool("list_files", "List files within the workspace", {
         "type": "object", "properties": {"path": {"type": "string"}, "recursive": {"type": "boolean"}},
         "additionalProperties": False}, execute)
 
@@ -127,7 +128,7 @@ def create_write_file_tool() -> Tool:
             return ToolResult(json.dumps(value, ensure_ascii=False), details=value)
         except Exception as exc:
             return ToolResult(str(exc), is_error=True)
-    return Tool("write_file", "写入工作区内的文本文件", {
+    return Tool("write_file", "Write a text file within the workspace", {
         "type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"},
         "encoding": {"type": "string", "default": "utf-8"}}, "required": ["path", "content"],
         "additionalProperties": False}, execute)
@@ -136,14 +137,14 @@ def create_write_file_tool() -> Tool:
 def create_bash_tool(timeout: float = 30) -> Tool:
     def execute(args: dict[str, Any], context: Session) -> ToolResult:
         try:
-            # 会话可以为该工具单独配置超时：session.tools["options"]["bash"]["timeout"]
+            # The session can configure a per-tool timeout: session.tools["options"]["bash"]["timeout"]
             effective_timeout = float(context.tool_options("bash").get("timeout", timeout))
             value = run_bash(args["command"], root_dir=context.effective_workspace,
                              cwd=args.get("cwd"), timeout=effective_timeout)
             return ToolResult(json.dumps(value, ensure_ascii=False), is_error=value["returncode"] != 0, details=value)
         except Exception as exc:
             return ToolResult(str(exc), is_error=True)
-    return Tool("bash", "在工作区内执行 Bash 命令", {
+    return Tool("bash", "Execute Bash commands within the workspace", {
         "type": "object", "properties": {"command": {"type": "string"}, "cwd": {"type": "string"}},
         "required": ["command"], "additionalProperties": False}, execute, requires_approval=True)
 
@@ -151,14 +152,14 @@ def create_bash_tool(timeout: float = 30) -> Tool:
 def create_builtin_tools(*, include_bash: bool = False, bash_timeout: float = 30,
                          workspace: str | Path = ".", session: Session | None = None,
                          approve: ApproveFn | None = None) -> ToolRegistry:
-    """按目标 Tool 工厂格式创建内置工具。
+    """Create the built-in tools in the target Tool factory format.
 
-    工具配置保存在 ``Session`` 中：``session=`` 可以直接复用调用方会话，
-    否则用 ``workspace`` 创建一个 ``session_id="default"`` 的会话。
+    Tool config is stored in a ``Session``: ``session=`` can directly reuse the caller's session,
+    otherwise a session with ``session_id="default"`` is created from ``workspace``.
 
-    ``approve`` 会传给 ``ToolRegistry``（写入 ``session.approve``）：启用 ``bash``
-    时它是 ``requires_approval=True`` 工具的授权回调，缺省（``None``）则沿用会话里
-    已有的回调。
+    ``approve`` is passed to the ``ToolRegistry`` (written into ``session.approve``): when ``bash`` is
+    enabled it is the approval callback for the ``requires_approval=True`` tool; when omitted
+    (``None``) the callback already in the session is reused.
     """
     session = session or Session(session_id="default", workspace=Path(workspace))
     tools = [create_read_tool(), create_list_files_tool(), create_write_file_tool()]

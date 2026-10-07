@@ -16,7 +16,7 @@ try:
         OpenAICompatibleProvider,
         OpenAIProvider,
     )
-except ImportError:  # 兼容旧的直接导入方式
+except ImportError:  # compatibility with the old direct-import style
     from config import LLMConfig
     from llm import (
         AnthropicProvider,
@@ -40,7 +40,7 @@ def _empty_usage() -> dict[str, int]:
 
 
 class LLMClient:
-    """统一 LLM 门面，并按 session 累计 token usage。"""
+    """A unified LLM facade that also accumulates token usage per session."""
 
     def __init__(self, config: LLMConfig):
         self.config = config
@@ -58,7 +58,7 @@ class LLMClient:
             return AnthropicProvider(config)
         if config.provider in ("deepseek", "deepseek_compatible"):
             return DeepseekCompatibleProvider(config)
-        raise ValueError(f"不支持的 provider: {config.provider}")
+        raise ValueError(f"unsupported provider: {config.provider}")
 
     def _record_usage(self, session_id: str, usage: dict[str, int]) -> None:
         with self._usage_lock:

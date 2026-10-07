@@ -1,4 +1,4 @@
-"""``linteum status`` 子命令 parser。"""
+"""Parser for the ``linteum status`` subcommand."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ from cli.subcommands._shared import add_json_flag, add_shared_flags
 
 
 def build_status_parser(subparsers, *, cmd_status: Callable) -> None:
-    """把 ``status`` 子命令挂到 ``subparsers`` 上。"""
+    """Attach the ``status`` subcommand to ``subparsers``."""
     parser = subparsers.add_parser(
-        "status", help="查看运行时状态",
-        description="打印工作区、配置、会话数量等运行时信息。")
+        "status", help="View runtime status",
+        description="Print runtime information such as workspace, config, and session count.")
     add_shared_flags(parser, inherited=True)
-    add_json_flag(parser, "以 JSON 输出")
+    add_json_flag(parser, "Output as JSON")
     parser.set_defaults(func=cmd_status)

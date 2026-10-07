@@ -18,7 +18,7 @@ try:
         normalize_messages,
         to_dict,
     )
-except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
+except ImportError:  # supports adding /workspace/linteum_agent to sys.path directly
     from context.middleware import ContextMiddleware
     from context.session import Round, Session
     from model.client import LLMClient
@@ -63,13 +63,14 @@ except ImportError:
     from ..evnts import EventBus
 
 class MaxToolRoundsError(RuntimeError):
-    """模型在 ``max_tool_rounds`` 轮内仍未结束工具调用时抛出。
+    """Raised when the model has not finished its tool calls within ``max_tool_rounds`` rounds.
 
-    ``RuntimeError`` 的子类：既保留引擎「超轮次即中断」的契约，也方便宿主（CLI / TUI /
-    Web）按类型识别并做优雅处理，而无需匹配错误文本。
+    A subclass of ``RuntimeError``: it preserves the engine's "exceed rounds = abort" contract while
+    letting hosts (CLI / TUI / Web) identify it by type and handle it gracefully, without matching the
+    error text.
     """
 
-    DEFAULT_MESSAGE = "工具调用超过最大轮次"
+    DEFAULT_MESSAGE = "tool calls exceeded the maximum number of rounds"
 
     def __init__(self, message: str | None = None) -> None:
         super().__init__(message or self.DEFAULT_MESSAGE)
@@ -77,7 +78,7 @@ class MaxToolRoundsError(RuntimeError):
 
 @dataclass
 class AgentContext:
-    """一次 Agent 执行的输入上下文。"""
+    """The input context of one Agent execution."""
 
     prompt: MessageInputs
     context: MessageInputs | None = None
@@ -85,7 +86,7 @@ class AgentContext:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def messages(self) -> list[Message]:
-        """将 context 和 prompt 统一为 provider-neutral 的消息对象。"""
+        """Unify context and prompt into provider-neutral message objects."""
         return normalize_messages(self.context or []) + normalize_messages(self.prompt)
 
     def to_dict(self) -> dict[str, Any]:
@@ -99,7 +100,7 @@ class AgentContext:
 
 @dataclass
 class AgentResult:
-    """LLM 输出重新包装后的 Agent 结果。"""
+    """The Agent result after repackaging the LLM output."""
 
     text: str
     context: list[Message]
@@ -108,7 +109,7 @@ class AgentResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     response: LLMResponse | None = None
-    # 本次执行使用的会话工作区（来自 Session；没有工具注册表时为 None）。
+    # The session workspace used by this execution (from Session; None when there is no tool registry).
     workspace: Path | None = None
 
     @property
@@ -132,19 +133,19 @@ class AgentResult:
 
 @dataclass
 class AgentStreamChunk:
-    """流式 Agent 输出；结束时 ``result`` 包含完整的 AgentResult。"""
+    """Streaming Agent output; at the end ``result`` contains the complete AgentResult."""
 
     delta: str = ""
     done: bool = False
     usage: dict[str, int] = field(default_factory=dict)
     result: AgentResult | None = None
     raw_chunk: LLMStreamChunk | None = None
-    # 本次增量中的思维链文本。
+    # The chain-of-thought text in this delta.
     reasoning_delta: str = ""
 
 
 class AgentEngine:
-    """将输入 context -> LLM -> 输出 context 串联起来的 Agent 引擎。"""
+    """The Agent engine that chains input context -> LLM -> output context."""
 
     def __init__(
         self,
@@ -185,12 +186,14 @@ class AgentEngine:
         session_id: str,
         metadata: dict[str, Any] | None = None,
     ) -> Session | None:
-        """把会话绑定到工具注册表，让工具使用会话的工作区与工具配置。
+        """Bind the session to the tool registry so tools use the session's workspace and tool config.
 
-        - 会话工作区未显式指定时，继承注册表当前会话的工作区（保持旧行为）；
-        - 把注册表中的工具记录进会话（``session.registered_tools()``）；
-        - 本次调用 ``metadata`` 与会话元数据一起交给工具（会话元数据优先）；
-        - 保留注册表原有的 ``approve``/``cancelled`` 回调。
+        - When the session workspace is not explicitly set, inherit the workspace of the registry's
+          current session (preserving old behavior);
+        - Record the registry's tools into the session (``session.registered_tools()``);
+        - Pass this call's ``metadata`` to the tools together with the session metadata (session
+          metadata takes precedence);
+        - Preserve the registry's original ``approve``/``cancelled`` callbacks.
         """
         if registry is None:
             return None
@@ -198,7 +201,7 @@ class AgentEngine:
         previous = getattr(registry, "session", None) or getattr(registry, "context", None)
         if session.workspace is None and previous is not None:
             session.set_workspace(previous.effective_workspace)
-        # 记录本会话注册的工具，再生成会话视图，让视图也能读到 registered 列表。
+        # Record the tools registered for this session, then build the session view so it can also read the registered list.
         session.register_tools(registry.all())
         context_metadata = dict(getattr(previous, "metadata", {}) or {})
         context_metadata.update(metadata or {})
@@ -216,8 +219,9 @@ class AgentEngine:
         context: list[Message] | None = None,
         session: Session | None = None,
     ) -> AgentResult:
-        # middleware 已经把 response 包装成 AssistantMessage 并保存到 session；
-        # 这里返回当前请求输入和本次 assistant 输出组成的结构化 context。
+        # The middleware has already wrapped the response into an AssistantMessage and saved it to the
+        # session; here we return the structured context composed of the current request input and this
+        # assistant output.
         output_context = list(context or request.messages())
         if not response.tool_calls or not output_context or not (
             isinstance(output_context[-1], AssistantMessage)
@@ -246,7 +250,7 @@ class AgentEngine:
         registry: ToolRegistry | None,
         kwargs: dict[str, Any],
     ) -> None:
-        """将注册表转换成 LLM tools；显式 registry 优先于 tools 参数。"""
+        """Convert the registry into LLM tools; an explicit registry takes precedence over the tools argument."""
         if registry is not None:
             kwargs["tools"] = registry.definitions()
 
@@ -262,7 +266,7 @@ class AgentEngine:
                                        "tool_name": call.name, "args": arguments})
             self.events_bus.emit_sync({"type": "tool_execution_update", "tool_call_id": call.id,
                                        "tool_name": call.name, "args": arguments,
-                                       "partial_result": "正在执行工具..."})
+                                       "partial_result": "executing tool..."})
             try:
                 arguments = self._arguments(call)
                 value = registry.execute_sync(call.name, arguments)
@@ -289,7 +293,7 @@ class AgentEngine:
                                         "tool_name": call.name, "args": arguments})
             await self.events_bus.emit({"type": "tool_execution_update", "tool_call_id": call.id,
                                         "tool_name": call.name, "args": arguments,
-                                        "partial_result": "正在执行工具..."})
+                                        "partial_result": "executing tool..."})
             try:
                 value = await registry.execute(call.name, arguments)
                 if isinstance(value, ExecutionToolResult):
@@ -338,11 +342,11 @@ class AgentEngine:
         self.events_bus.emit_sync({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
-        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
-        # 这样会话中禁用的工具不会被提供给 LLM。
+        # Bind the session (workspace + tool config) first, then generate the tool definitions, so that
+        # tools disabled in the session are not offered to the LLM.
         session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
-        # 一轮 = 一次完整 agent-loop：循环开始前打开轮，循环结束（含异常）后定稿。
+        # One round = one complete agent-loop: open the round before the loop starts, finalize it after the loop ends (including on exception).
         self.middleware.begin_round(session_id)
         try:
             response = self.middleware.complete(request.messages(), session_id=session_id, **kwargs)
@@ -385,11 +389,11 @@ class AgentEngine:
         await self.events_bus.emit({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
-        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
-        # 这样会话中禁用的工具不会被提供给 LLM。
+        # Bind the session (workspace + tool config) first, then generate the tool definitions, so that
+        # tools disabled in the session are not offered to the LLM.
         session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
-        # 一轮 = 一次完整 agent-loop：循环开始前打开轮，循环结束（含异常）后定稿。
+        # One round = one complete agent-loop: open the round before the loop starts, finalize it after the loop ends (including on exception).
         self.middleware.begin_round(session_id)
         try:
             response = await self.middleware.acomplete(request.messages(), session_id=session_id, **kwargs)
@@ -423,9 +427,9 @@ class AgentEngine:
         try:
             value = json.loads(call.arguments)
         except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"工具参数不是有效 JSON: {call.name}") from exc
+            raise ValueError(f"tool arguments are not valid JSON: {call.name}") from exc
         if not isinstance(value, dict):
-            raise ValueError(f"工具参数必须是对象: {call.name}")
+            raise ValueError(f"tool arguments must be an object: {call.name}")
         return value
 
     def stream(
@@ -444,12 +448,13 @@ class AgentEngine:
         self.events_bus.emit_sync({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
-        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
-        # 这样会话中禁用的工具不会被提供给 LLM。
+        # Bind the session (workspace + tool config) first, then generate the tool definitions, so that
+        # tools disabled in the session are not offered to the LLM.
         session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
-        # 一轮 = 一次完整 agent-loop：循环开始前打开轮，循环结束（含异常 / 提前关闭）
-        # 后定稿，因此这一轮覆盖「请求 -> 多次 LLM 调用 + 工具执行 -> 最终回答」。
+        # One round = one complete agent-loop: open the round before the loop starts and finalize it after
+        # the loop ends (including on exception / early close), so this round covers
+        # "request -> multiple LLM calls + tool execution -> final answer".
         self.middleware.begin_round(session_id)
         messages: MessageInputs = request.messages()
         execution_context = request.messages()
@@ -527,13 +532,14 @@ class AgentEngine:
         await self.events_bus.emit({"type": "message_start", "message": request.messages()[-1]})
         registry = tool_registry or self.tool_registry
         kwargs.pop("tools", None)
-        # 先绑定会话（工作区 + 工具配置），再生成工具定义，
-        # 这样会话中禁用的工具不会被提供给 LLM。
+        # Bind the session (workspace + tool config) first, then generate the tool definitions, so that
+        # tools disabled in the session are not offered to the LLM.
         session = self._bind_tool_context(registry, session_id, metadata)
         self._tool_definitions(registry, kwargs)
 
-        # 一轮 = 一次完整 agent-loop：循环开始前打开轮，循环结束（含异常 / 提前关闭）
-        # 后定稿，因此这一轮覆盖「请求 -> 多次 LLM 调用 + 工具执行 -> 最终回答」。
+        # One round = one complete agent-loop: open the round before the loop starts and finalize it after
+        # the loop ends (including on exception / early close), so this round covers
+        # "request -> multiple LLM calls + tool execution -> final answer".
         self.middleware.begin_round(session_id)
         messages: MessageInputs = request.messages()
         execution_context = request.messages()
@@ -599,29 +605,29 @@ class AgentEngine:
         return self.middleware.get_context(session_id)
 
     def get_session(self, session_id: str = "default") -> Session | None:
-        """返回会话（工作区 + 上下文表示 + 元数据）；不存在时为 ``None``。"""
+        """Return the session (workspace + context representation + metadata); ``None`` if it does not exist."""
         return self.middleware.get_session(session_id)
 
     def ensure_session(self, session_id: str = "default", *, workspace: str | Path | None = None) -> Session:
-        """获取会话；不存在时创建。"""
+        """Get the session, creating it if it does not exist."""
         return self.middleware.ensure_session(session_id, workspace=workspace)
 
     def get_workspace(self, session_id: str = "default") -> Path:
-        """返回会话生效的工作区。"""
+        """Return the effective workspace of the session."""
         return self.middleware.session_workspace(session_id)
 
     def set_workspace(self, session_id: str, workspace: str | Path | None) -> Session:
-        """设置会话工作区；``None`` 表示恢复为“运行时继承”。"""
+        """Set the session workspace; ``None`` restores "inherited at runtime"."""
         return self.middleware.set_workspace(session_id, workspace)
 
     def get_session_usage(self, session_id: str = "default") -> dict[str, int]:
-        """返回会话累计 token usage（input/output/cache_hit/total）。"""
+        """Return the session's cumulative token usage (input/output/cache_hit/total)."""
         return self.middleware.get_session_usage(session_id)
 
     def reset_session_usage(self, session_id: str = "default") -> Session | None:
-        """把会话累计 token usage 归零；会话不存在时返回 ``None``。"""
+        """Zero the session's cumulative token usage; return ``None`` if the session does not exist."""
         return self.middleware.reset_session_usage(session_id)
 
     def get_session_rounds(self, session_id: str = "default") -> list[Round]:
-        """返回会话的分轮记录：每一轮 ``{context, usage}``（本轮 token 消耗 + 占用空间 + 起止时间）。"""
+        """Return the session's per-round records: each round ``{context, usage}`` (this round's token consumption + occupied space + start/end time)."""
         return self.middleware.get_session_rounds(session_id)

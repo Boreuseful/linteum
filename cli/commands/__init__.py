@@ -1,11 +1,12 @@
-"""``cli/commands/*`` —— 各子命令的**实现**（handler）。
+"""``cli/commands/*`` -- the **implementations** (handlers) of each subcommand.
 
-由 ``main._forward_command`` 在调用时惰性 import（``importlib.import_module``），因此：
+They are lazily imported by ``main._forward_command`` when invoked (``importlib.import_module``), so:
 
-- 启动时不加载这些模块（不构造 AgentRunner / 不 import 重依赖）；
-- ``patch("<module>.<attr>")`` 仍然能拦截真实 handler。
+- These modules are not loaded at startup (no AgentRunner construction / no heavy dependency import);
+- ``patch("<module>.<attr>")`` can still intercept the real handler.
 
-每个模块导出一个 ``run_<group>(args) -> int``：返回 ``int`` 时由 ``main()`` 作为进程退出码。
+Each module exports a ``run_<group>(args) -> int``: when it returns an ``int``, ``main()`` uses it as
+the process exit code.
 """
 
 from __future__ import annotations

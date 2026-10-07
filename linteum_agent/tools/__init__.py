@@ -1,7 +1,7 @@
 """Agent tools: definitions, registry, validation, and built-ins.
 
-工具运行上下文（原来的 ``RuntimeContext``）已经合并进 ``context.Session``：
-``RuntimeContext`` 保留为兼容别名，新代码请直接使用 ``Session``。
+The tool runtime context (the former ``RuntimeContext``) has been merged into ``context.Session``:
+``RuntimeContext`` is kept as a compatibility alias; new code should use ``Session`` directly.
 """
 
 from .builtin import (create_bash_tool, create_builtin_tools,

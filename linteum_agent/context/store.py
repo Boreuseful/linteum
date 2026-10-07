@@ -9,15 +9,15 @@ from typing import Any, Iterable, Mapping
 try:
     from ..messages.agent_message import Message, MessageInput, MessageInputs, normalize_messages
     from .session import Session
-except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
+except ImportError:  # supports adding /workspace/linteum_agent to sys.path directly
     from messages.agent_message import Message, MessageInput, MessageInputs, normalize_messages
     from session import Session
 
 
 class ContextStore:
-    """按 session 保存 ``Session``（工作区 + 上下文表示 + 工具/Skill 配置 + usage），并提供 JSON 持久化。
+    """Store ``Session`` objects by session (workspace + context representation + Tool/Skill config + usage) with JSON persistence.
 
-    持久化格式为::
+    The persistence format is::
 
         {
           "version": 4,
@@ -36,8 +36,8 @@ class ContextStore:
                 {
                   "round": 1,
                   "context": [
-                    {"role": "user", "content": "你好"},
-                    {"role": "assistant", "content": "你好，有什么可以帮助你？"}
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hello, how can I help you?"}
                   ],
                   "usage": {
                     "input_tokens": 12, "output_tokens": 8,
@@ -52,34 +52,36 @@ class ContextStore:
           }
         }
 
-    ``messages`` 是**分轮的列表**：每一轮（= 一次完整 agent-loop）被包装成
-    ``{round, context, usage}``，其中 ``context`` 是这一轮的全部消息（请求 + 每次 LLM
-    调用 + 工具结果），``usage`` 保存这一轮的输入/输出 token 汇总、本轮占用的上下文空间
-    （``context_tokens`` / ``context_chars``）以及本轮起止时间
-    （``created_at`` / ``updated_at``）。
+    ``messages`` is a **list of rounds**: each round (= one complete agent-loop) is wrapped as
+    ``{round, context, usage}``, where ``context`` is all of this round's messages (request + every LLM
+    call + tool results) and ``usage`` stores this round's input/output token summary, the context space
+    this round occupies (``context_tokens`` / ``context_chars``), and this round's start/end time
+    (``created_at`` / ``updated_at``).
 
-    ``tools`` / ``skills`` / ``usage`` 是每个会话的顶层字段，与 ``metadata`` 平级。
+    ``tools`` / ``skills`` / ``usage`` are top-level fields of each session, siblings of ``metadata``.
 
-    向后兼容：
+    Backward compatibility:
 
-    - ``version=3``：``messages`` 是扁平消息列表（``tools`` / ``skills`` / ``usage``
-      已是独立字段），读取时按「以 user 消息开始」切分成多轮；
-    - ``version=2``：``tools`` / ``skills`` / ``usage`` 嵌在 ``metadata`` 中，读取时
-      自动迁移到独立字段；
-    - ``version=1``：``sessions`` 直接是消息列表，加载后会话的 ``workspace`` 取决于
-      store 的 ``default_workspace``（未配置时为 ``None``，运行时继承工具注册表的
-      工作区）。
+    - ``version=3``: ``messages`` is a flat message list (``tools`` / ``skills`` / ``usage`` are already
+      separate fields); on read it is split into rounds "starting at each user message";
+    - ``version=2``: ``tools`` / ``skills`` / ``usage`` are embedded in ``metadata`` and are migrated to
+      separate fields on read;
+    - ``version=1``: ``sessions`` is directly a message list; after loading, the session's ``workspace``
+      depends on the store's ``default_workspace`` (``None`` when unconfigured, inheriting the tool
+      registry's workspace at runtime).
 
-    保存时统一写成最新格式（version 4），因此读取一次旧文件即可完成格式升级。
+    Saving always writes the latest format (version 4), so reading an old file once completes the format
+    upgrade.
 
-    不使用 pickle，生成的内容可以直接检查、迁移或由其他服务读取。
+    It does not use pickle, so the generated content can be inspected, migrated, or read by other
+    services directly.
     """
 
     VERSION = 4
     LEGACY_VERSION = 1
-    # version 2：工具/Skill 配置与 usage 曾嵌在 ``metadata`` 中。
+    # version 2: Tool/Skill config and usage were once embedded in ``metadata``.
     METADATA_VERSION = 2
-    # version 3：``messages`` 是扁平消息列表（尚未按轮包装）。
+    # version 3: ``messages`` is a flat message list (not yet wrapped by round).
     MESSAGES_VERSION = 3
     READABLE_VERSIONS = (VERSION, MESSAGES_VERSION, METADATA_VERSION, LEGACY_VERSION)
 
@@ -91,7 +93,7 @@ class ContextStore:
     ):
         self._sessions: dict[str, Session] = {}
         self._lock = RLock()
-        # 新建会话时使用的默认工作区；None 表示“运行时继承”。
+        # The default workspace used when creating a new session; None means "inherited at runtime".
         self.default_workspace: Path | None = (
             None if workspace is None else Path(workspace).expanduser().resolve()
         )
@@ -99,7 +101,7 @@ class ContextStore:
             self.ensure_session(session_id).replace(messages)
 
     # ------------------------------------------------------------------
-    # Session 级别读写
+    # Session-level read/write
     # ------------------------------------------------------------------
 
     def ensure_session(
@@ -109,10 +111,10 @@ class ContextStore:
         workspace: str | Path | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> Session:
-        """获取会话；不存在时创建。已存在的会话不会被覆盖。
+        """Get the session, creating it if it does not exist. An existing session is not overwritten.
 
-        ``workspace`` 只在会话不存在、或会话尚未指定工作区时生效；修改已有会话的
-        工作区请使用 ``set_workspace()``。
+        ``workspace`` only takes effect when the session does not exist, or when the session has not yet
+        specified a workspace; to modify an existing session's workspace use ``set_workspace()``.
         """
         with self._lock:
             session = self._sessions.get(session_id)
@@ -131,24 +133,24 @@ class ContextStore:
             return session
 
     def get_session(self, session_id: str = "default") -> Session | None:
-        """返回会话对象；不存在时为 ``None``（不会创建会话）。"""
+        """Return the session object; ``None`` if it does not exist (does not create a session)."""
         with self._lock:
             return self._sessions.get(session_id)
 
     def set_workspace(self, session_id: str, workspace: str | Path | None) -> Session:
-        """设置会话工作区；``None`` 表示恢复为“运行时继承”。"""
+        """Set the session workspace; ``None`` restores "inherited at runtime"."""
         with self._lock:
             return self.ensure_session(session_id).set_workspace(workspace)
 
     def workspace(self, session_id: str = "default") -> Path:
-        """返回会话生效的工作区；会话不存在时回退到默认工作区或 ``Path.cwd()``。"""
+        """Return the session's effective workspace; falls back to the default workspace or ``Path.cwd()`` when the session does not exist."""
         session = self.get_session(session_id)
         if session is not None:
             return session.effective_workspace
         return self.default_workspace or Path.cwd()
 
     # ------------------------------------------------------------------
-    # 兼容旧接口：直接读写消息列表（等价于操作 session.context）
+    # Legacy-compatible interface: read/write the message list directly (equivalent to operating on session.context)
     # ------------------------------------------------------------------
 
     def get(self, session_id: str = "default") -> list[Message]:
@@ -177,7 +179,7 @@ class ContextStore:
             return list(self._sessions)
 
     # ------------------------------------------------------------------
-    # 持久化
+    # Persistence
     # ------------------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
@@ -196,23 +198,24 @@ class ContextStore:
     def loads(self, value: str | bytes, *, merge: bool = False) -> None:
         payload = json.loads(value)
         if not isinstance(payload, dict):
-            raise ValueError("上下文 JSON 根节点必须是对象")
+            raise ValueError("the context JSON root must be an object")
         version = payload.get("version", self.LEGACY_VERSION)
         if version not in self.READABLE_VERSIONS:
-            raise ValueError(f"不支持的上下文版本: {version}")
+            raise ValueError(f"unsupported context version: {version}")
         sessions = payload.get("sessions", {})
         if not isinstance(sessions, dict):
-            raise ValueError("上下文 JSON 的 sessions 必须是对象")
+            raise ValueError("the context JSON 'sessions' must be an object")
         if merge:
             self.merge(sessions)
         else:
             self.replace_all(sessions)
 
     def merge(self, sessions: Mapping[str, Any]) -> None:
-        """把快照里的会话**合并**进当前 store：同 id 覆盖，其它会话保留。
+        """**Merge** the sessions from a snapshot into the current store: the same id is overwritten, others are kept.
 
-        与 ``replace_all()`` 的区别：后者会丢弃 store 中已有的会话，前者不会。
-        ``AgentRunner`` 载入某个会话时用本方法，避免把其它会话的记忆一起清掉。
+        Difference from ``replace_all()``: the latter discards existing sessions in the store, the former
+        does not. ``AgentRunner`` uses this method when loading a session, to avoid wiping the memory of
+        other sessions along with it.
         """
         with self._lock:
             for session_id, value in sessions.items():
@@ -220,9 +223,10 @@ class ContextStore:
                 self._sessions[key] = self._coerce_session(key, value)
 
     def replace_all(self, sessions: Mapping[str, Any]) -> None:
-        """原子替换全部会话。
+        """Atomically replace all sessions.
 
-        取值可以是 ``Session``、``to_dict()`` 的会话快照，或旧格式的消息集合。
+        The value may be a ``Session``, a session snapshot from ``to_dict()``, or a legacy-format message
+        collection.
         """
         with self._lock:
             self._sessions = {
@@ -245,16 +249,17 @@ class ContextStore:
         Path(path).write_text(self.dumps(), encoding="utf-8")
 
     def save_session(self, path: str | Path, session_id: str) -> None:
-        """只把 ``session_id`` 这一个会话写入文件（一份文件 = 一个会话）。
+        """Write only the one session ``session_id`` to the file (one file = one session).
 
-        与 ``save()`` 的区别：后者写出 store 中的**全部**会话。按
-        ``.agent/sessions/<session_id>.json`` 的命名约定，调用方通常只需要
-        当前会话，因此不会把其它会话（例如刚构造出来的空会话）带进这个文件。
+        Difference from ``save()``: the latter writes out **all** sessions in the store. Following the
+        ``.agent/sessions/<session_id>.json`` naming convention, the caller usually only needs the current
+        session, so other sessions (such as a just-constructed empty session) are not dragged into this
+        file.
         """
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
-                raise KeyError(f"会话不存在: {session_id}")
+                raise KeyError(f"session does not exist: {session_id}")
             payload = {
                 "version": self.VERSION,
                 "sessions": {session_id: session.to_dict()},
@@ -264,7 +269,7 @@ class ContextStore:
         )
 
     def load(self, path: str | Path, *, merge: bool = False) -> None:
-        """从文件读取会话；``merge=True`` 时保留 store 中已有的其它会话。"""
+        """Read sessions from a file; with ``merge=True`` keep the other sessions already in the store."""
         self.loads(Path(path).read_text(encoding="utf-8"), merge=merge)
 
 

@@ -1,4 +1,4 @@
-"""``linteum chat`` 子命令 parser（也是无子命令时的默认命令）。"""
+"""Parser for the ``linteum chat`` subcommand (also the default command when no subcommand is given)."""
 
 from __future__ import annotations
 
@@ -8,33 +8,33 @@ from cli.subcommands._shared import add_shared_flags
 
 
 def build_chat_parser(subparsers, *, cmd_chat: Callable) -> None:
-    """把 ``chat`` 子命令挂到 ``subparsers`` 上。"""
+    """Attach the ``chat`` subcommand to ``subparsers``."""
     parser = subparsers.add_parser(
         "chat",
-        help="与 Agent 对话（交互式 REPL 或单次问答）",
-        description="启动一次 Agent 会话：省略 --prompt 进入交互式 REPL。",
+        help="Chat with the Agent (interactive REPL or single-shot Q&A)",
+        description="Start an Agent session: omit --prompt to enter the interactive REPL.",
     )
-    # 工作区 / 会话 / 配置 / 自动授权：与顶层同名，用 SUPPRESS 默认值以保留顶层解析结果。
+    # Workspace / session / config / auto-approval: same names as top level, using SUPPRESS defaults to preserve the top-level parse result.
     add_shared_flags(parser, inherited=True)
     parser.add_argument(
         "-p", "--prompt", metavar="TEXT", default=None,
-        help="单次问答的提示词；省略则进入交互式 REPL")
+        help="Prompt for a single-shot Q&A; omit to enter the interactive REPL")
     parser.add_argument(
         "--stream", dest="stream", action="store_true", default=True,
-        help="流式输出（默认开启）")
+        help="Streaming output (enabled by default)")
     parser.add_argument(
         "--no-stream", dest="stream", action="store_false",
-        help="关闭流式输出，等待整段回复")
+        help="Disable streaming output and wait for the whole reply")
     parser.add_argument(
         "--new", action="store_true", default=False,
-        help="强制开始新会话（忽略工作区里已存在的上下文）")
+        help="Force a new session (ignore existing context in the workspace)")
     parser.add_argument(
         "--bash", dest="enable_bash", action="store_true", default=False,
-        help="启用 bash 工具（执行前需授权，除非 --auto-approve）")
+        help="Enable the bash tool (requires approval before execution unless --auto-approve)")
     parser.add_argument(
         "--max-tool-rounds", dest="max_tool_rounds", type=int, default=20, metavar="N",
-        help="单次请求内工具调用的最大轮数（默认 20）")
+        help="Maximum number of tool-call rounds within a single request (default 20)")
     parser.add_argument(
         "--json", action="store_true", default=False,
-        help="以 JSON 输出单次问答的结果（便于脚本消费）")
+        help="Output the single-shot Q&A result as JSON (for script consumption)")
     parser.set_defaults(func=cmd_chat)

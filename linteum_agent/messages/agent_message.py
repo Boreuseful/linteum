@@ -51,8 +51,8 @@ class UserPrompt:
 class AssistantMessage:
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
-    # 思维链内容（DeepSeek reasoning_content）。
-    # 当请求携带 tools 时，需要把历史轮次的 reasoning_content 一并回传。
+    # Chain-of-thought content (DeepSeek reasoning_content).
+    # When a request carries tools, the reasoning_content of previous rounds must be sent back too.
     reasoning_content: str | None = None
     role: Literal["assistant"] = "assistant"
 
@@ -117,19 +117,19 @@ def from_dict(message: dict[str, Any]) -> Message:
             details=message.get("details"),
         )
     if not role:
-        raise ValueError("每条 message 必须包含 role")
+        raise ValueError("every message must contain a role")
     return GenericMessage(role=role, content=content, extra={k: v for k, v in message.items() if k not in {"role", "content"}})
 
 
 def normalize_messages(messages: MessageInputs) -> list[Message]:
-    """将单个消息或消息集合统一为类化消息列表。"""
+    """Normalize a single message or a collection of messages into a list of typed messages."""
     if isinstance(messages, dict) or hasattr(messages, "role"):
         values = [messages]
     else:
         values = list(messages)
     messages = [from_dict(item) if isinstance(item, dict) else item for item in values]
-    # 兼容旧版上下文：旧 JSON 的 tool message 没有保存 tool_name，
-    # 可以从对应的 assistant tool call 中恢复。
+    # Backward compatibility with old context: the tool message in old JSON did not save tool_name,
+    # which can be recovered from the corresponding assistant tool call.
     for index, message in enumerate(messages):
         if not isinstance(message, ToolResult) or message.tool_name:
             continue
@@ -155,8 +155,8 @@ def to_openai_message(message: Message) -> dict[str, Any]:
     if isinstance(message, AssistantMessage):
         result: dict[str, Any] = {"role": "assistant", "content": message.content}
         if message.reasoning_content:
-            # DeepSeek 要求携带 tools 的请求把历史 reasoning_content 回传，
-            # 以便模型续接上一轮思维链。
+            # DeepSeek requires requests carrying tools to send back the historical reasoning_content
+            # so the model can continue the previous round's chain of thought.
             result["reasoning_content"] = message.reasoning_content
         if message.tool_calls:
             result["tool_calls"] = [{"id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.arguments_json()}} for c in message.tool_calls]
@@ -169,12 +169,12 @@ def to_openai_message(message: Message) -> dict[str, Any]:
 
 
 def to_responses_input(message: Message) -> list[dict[str, Any]]:
-    """将消息转换为 OpenAI Responses API 的 input item(s)。"""
+    """Convert the message into OpenAI Responses API input item(s)."""
     if isinstance(message, AssistantMessage):
         items: list[dict[str, Any]] = []
         if message.reasoning_content:
-            # Responses API 下思维链以 reasoning item 回传，
-            # DeepSeek 会把其中的纯文本内容合并进相邻的 assistant 消息。
+            # Under the Responses API the chain of thought is sent back as a reasoning item,
+            # and DeepSeek merges its plain-text content into the adjacent assistant message.
             items.append(
                 {
                     "type": "reasoning",
@@ -223,7 +223,7 @@ def to_anthropic_message(message: Message) -> dict[str, Any] | None:
 
 
 def to_dict(message: Message) -> dict[str, Any]:
-    """将类化消息转换成稳定的、可 JSON 序列化的内部格式。"""
+    """Convert a typed message into a stable, JSON-serializable internal format."""
     if isinstance(message, SystemPrompt):
         return {"role": "system", "content": message.content}
     if isinstance(message, UserPrompt):

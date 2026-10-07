@@ -1,4 +1,4 @@
-"""``linteum config`` 的实现：读写 ``config.yaml``。"""
+"""Implementation of ``linteum config``: read and write ``config.yaml``."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def run_config(args) -> int:
         return _get(args)
     if action == "set":
         return _set(args)
-    print("用法：linteum config {path,show,get,set} ...", file=sys.stderr)
+    print("Usage: linteum config {path,show,get,set} ...", file=sys.stderr)
     return 2
 
 
@@ -51,7 +51,7 @@ def _get(args) -> int:
     config = _store(args).load(create=False)
     value = _dig(config.to_dict(), args.key)
     if value is _MISSING:
-        print(f"没有这个配置项：{args.key}", file=sys.stderr)
+        print(f"No such config key: {args.key}", file=sys.stderr)
         return 1
     if isinstance(value, (dict, list)):
         print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
@@ -65,7 +65,7 @@ def _set(args) -> int:
 
     parts = args.key.split(".")
     if len(parts) != 2 or parts[0] != "llm":
-        print("目前仅支持 config set llm.<field> <value>", file=sys.stderr)
+        print("Currently only config set llm.<field> <value> is supported", file=sys.stderr)
         return 2
 
     field = parts[1]
@@ -73,18 +73,18 @@ def _set(args) -> int:
     config = store.load(create=True)
     data = llm_to_dict(config.llm)
     if field not in data:
-        print(f"未知的 llm 字段：{field}；可选：{', '.join(data)}", file=sys.stderr)
+        print(f"Unknown llm field: {field}; available: {', '.join(data)}", file=sys.stderr)
         return 2
 
     try:
-        data[field] = args.value  # llm_from_dict 会按字段类型规范化 / 校验
+        data[field] = args.value  # llm_from_dict normalizes / validates by field type
         llm = llm_from_dict(data)
     except Exception as exc:
-        print(f"设置失败：{exc}", file=sys.stderr)
+        print(f"Setup failed: {exc}", file=sys.stderr)
         return 2
 
     config.set_llm(llm)
     store.save(config)
-    # 注意：config set 不写快照 —— 快照只由 chat 更新（见 cli/snapshot.py）。
+    # Note: config set does not write the snapshot -- the snapshot is only updated by chat (see cli/snapshot.py).
     print(f"{args.key} = {getattr(llm, field)!r}")
     return 0

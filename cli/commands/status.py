@@ -1,4 +1,4 @@
-"""``linteum status`` 的实现：打印运行时状态（离线，不构造 Agent）。"""
+"""Implementation of ``linteum status``: print runtime status (offline, no Agent construction)."""
 
 from __future__ import annotations
 
@@ -39,12 +39,12 @@ def run_status(args) -> int:
     print(f"workspace    : {payload['workspace']}")
     print(f"project_root : {payload['project_root']}")
     print(f"agent_home   : {payload['agent_home']}")
-    config_note = "" if exists else "（尚未创建）"
+    config_note = "" if exists else " (not created yet)"
     print(f"config       : {payload['config_path']}{config_note}")
     print(f"provider     : {payload['provider']}")
     print(f"model        : {payload['model']}")
-    snap_note = "" if payload["has_snapshot"] else "（尚无快照）"
+    snap_note = "" if payload["has_snapshot"] else " (no snapshot yet)"
     print(f"snapshot     : {payload['snapshot_path']}{snap_note}")
-    print(f"session      : {payload['current_session'] or '(未设置当前会话)'}")
+    print(f"session      : {payload['current_session'] or '(no current session set)'}")
     print(f"sessions     : {payload['session_count']}")
     return 0

@@ -1,4 +1,4 @@
-"""``linteum sessions`` 的实现：列出 / 查看 / 创建 / 切换会话（不构造 Agent）。"""
+"""Implementation of ``linteum sessions``: list / show / create / switch sessions (no Agent construction)."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def run_sessions(args) -> int:
         return _switch(args)
     if action == "current":
         return _current(args)
-    print("用法：linteum sessions {list,show,new,switch,current} ...", file=sys.stderr)
+    print("Usage: linteum sessions {list,show,new,switch,current} ...", file=sys.stderr)
     return 2
 
 
@@ -41,7 +41,7 @@ def _list(args) -> int:
                          default=str))
         return 0
     if not infos:
-        print("（没有找到任何会话）")
+        print("(no sessions found)")
         return 0
     for info in infos:
         workspace = str(info.workspace) if info.workspace is not None else "-"
@@ -54,7 +54,7 @@ def _list(args) -> int:
 
 
 def _resolve_session(workspace: str, needle: str):
-    """按 ID 或唯一前缀解析会话；返回 ``SessionInfo`` / 前缀歧义列表 / ``None``。"""
+    """Resolve a session by ID or unique prefix; return a ``SessionInfo`` / an ambiguous-prefix list / ``None``."""
     from linteum_agent.run_agent import list_sessions
 
     infos = list_sessions(workspace)
@@ -76,10 +76,10 @@ def _show(args) -> int:
     needle = args.session_id
     found = _resolve_session(workspace, needle)
     if found is None:
-        print(f"未找到会话：{needle}", file=sys.stderr)
+        print(f"Session not found: {needle}", file=sys.stderr)
         return 1
     if isinstance(found, list):
-        print(f"前缀 '{needle}' 匹配到多个会话：", file=sys.stderr)
+        print(f"Prefix '{needle}' matched multiple sessions:", file=sys.stderr)
         for info in found:
             print(f"  {info.session_id}", file=sys.stderr)
         return 2
@@ -88,7 +88,7 @@ def _show(args) -> int:
     store.load(found.path, merge=True)
     session = store.get_session(found.session_id)
     if session is None:
-        print(f"无法读取会话：{found.session_id}", file=sys.stderr)
+        print(f"Unable to read session: {found.session_id}", file=sys.stderr)
         return 1
 
     messages = session.messages()
@@ -105,11 +105,11 @@ def _show(args) -> int:
         ))
         return 0
 
-    print(f"会话   : {found.session_id}")
-    print(f"文件   : {found.path}")
-    print(f"工作区 : {found.workspace if found.workspace is not None else '(继承当前工作区)'}")
-    print(f"用量   : {dict(session.usage)}")
-    print(f"消息   : {len(messages)}")
+    print(f"session  : {found.session_id}")
+    print(f"file     : {found.path}")
+    print(f"workspace: {found.workspace if found.workspace is not None else '(inherits current workspace)'}")
+    print(f"usage    : {dict(session.usage)}")
+    print(f"messages : {len(messages)}")
     print("-" * 60)
     for message in messages:
         _print_message(message)
@@ -117,7 +117,7 @@ def _show(args) -> int:
 
 
 def _new(args) -> int:
-    """创建新会话（默认一式两份写入 .agent/sessions），并设为当前会话。"""
+    """Create a new session (writes two copies to .agent/sessions by default) and set it as the current session."""
     from linteum_agent.run_agent import create_context_json, new_session_id
 
     session_id = getattr(args, "session_id", None) or new_session_id()
@@ -135,38 +135,38 @@ def _new(args) -> int:
             {"session_id": session_id, "paths": [str(p) for p in paths], "switched": switched},
             ensure_ascii=False, indent=2, default=str))
         return 0
-    print(f"新会话   : {session_id}")
+    print(f"new session : {session_id}")
     for path in paths:
-        print(f"文件     : {path}")
-    print(f"当前会话 : {'已切换' if switched else '未切换（--no-switch）'}")
+        print(f"file        : {path}")
+    print(f"current     : {'switched' if switched else 'not switched (--no-switch)'}")
     return 0
 
 
 def _switch(args) -> int:
-    """把已存在的会话设为当前会话（支持唯一前缀）。"""
+    """Set an existing session as the current session (a unique prefix is supported)."""
     from cli.session_state import set_current_session
 
     workspace = _workspace(args)
     needle = args.session_id
     found = _resolve_session(workspace, needle)
     if found is None:
-        print(f"未找到会话：{needle}（可先 `linteum sessions new --id {needle}` 创建）",
+        print(f"Session not found: {needle} (create it first with `linteum sessions new --id {needle}`)",
               file=sys.stderr)
         return 1
     if isinstance(found, list):
-        print(f"前缀 '{needle}' 匹配到多个会话：", file=sys.stderr)
+        print(f"Prefix '{needle}' matched multiple sessions:", file=sys.stderr)
         for info in found:
             print(f"  {info.session_id}", file=sys.stderr)
         return 2
 
     set_current_session(found.session_id)
-    print(f"当前会话 : {found.session_id}")
-    print(f"文件     : {found.path}")
+    print(f"current     : {found.session_id}")
+    print(f"file        : {found.path}")
     return 0
 
 
 def _current(args) -> int:
-    """显示当前会话（未设置时给出提示，不算错误）。"""
+    """Show the current session (give a hint when unset; not an error)."""
     from cli.session_state import current_session_path, get_current_session
 
     session_id = get_current_session()
@@ -174,8 +174,8 @@ def _current(args) -> int:
         if getattr(args, "json", False):
             print(json.dumps({"session_id": None}, ensure_ascii=False))
         else:
-            print("（尚未设置当前会话；用 `linteum sessions new` 新建，"
-                  "或 `linteum sessions switch <id>` 切换）")
+            print("(no current session set; create one with `linteum sessions new`, "
+                  "or switch with `linteum sessions switch <id>`)")
         return 0
 
     found = _resolve_session(_workspace(args), session_id)
@@ -186,9 +186,9 @@ def _current(args) -> int:
              "current_session_path": str(current_session_path())},
             ensure_ascii=False, indent=2))
         return 0
-    print(f"当前会话 : {session_id}")
+    print(f"current     : {session_id}")
     if path is not None:
-        print(f"文件     : {path}")
+        print(f"file        : {path}")
     return 0
 
 

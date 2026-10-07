@@ -1,45 +1,54 @@
-"""Agent 运行入口：给 CLI / TUI / Web 等宿主程序提供统一的 Agent 访问方式。
+"""Agent run entry point: provides a uniform Agent access API for hosts such as CLI / TUI / Web.
 
-本模块把「Agent 初始化 + 上下文存储 + Tool/Skill 注册 + 事件响应」收敛成一个门面
-（``AgentRunner``）。宿主程序（命令行、TUI、Web 服务、其他工具）只需构造一次
-``AgentRunner``，然后：
+This module collapses "Agent initialization + context storage + Tool/Skill registration + event
+handling" into a single facade (``AgentRunner``). A host program (command line, TUI, Web service,
+other tools) only needs to construct an ``AgentRunner`` once, then:
 
-- 发送用户消息：``send()`` / ``asend()`` / ``stream()`` / ``astream()``
-- 订阅事件做实时渲染：``on()`` / ``add_listener()``（事件流与宿主类型无关）
-- 读取响应：``response()`` -> ``AgentResponse``（正文 / 思维链 / 工具调用 / usage）
-- 持久化上下文：``save_context()`` / ``load_context()`` / ``close()``
-- 列出全部会话：``list_sessions()`` / ``AgentRunner.list_sessions()`` -> ``SessionInfo`` 摘要
+- Send user messages: ``send()`` / ``asend()`` / ``stream()`` / ``astream()``
+- Subscribe to events for real-time rendering: ``on()`` / ``add_listener()`` (the event stream is
+  independent of the host type)
+- Read responses: ``response()`` -> ``AgentResponse`` (text / reasoning / tool calls / usage)
+- Persist context: ``save_context()`` / ``load_context()`` / ``close()``
+- List all sessions: ``list_sessions()`` / ``AgentRunner.list_sessions()`` -> ``SessionInfo`` summary
 
-会话标识默认使用 UUID（``uuid4``），并把同一份上下文同时保存到**用户主目录**（``~``）与
-**工作区**下的 ``.agent/sessions/<session_id>.json``（两个位置的文件互为副本；用户级那份
-即 ``~/.agent/sessions``，不再写进项目仓库 / 安装目录）。
+The session identifier defaults to a UUID (``uuid4``), and the same context is saved to both the
+**user home directory** (``~``) and the **workspace** at ``.agent/sessions/<session_id>.json``
+(the two files are copies of each other; the user-level one is ``~/.agent/sessions`` and is no
+longer written into the project repository / install directory).
 
-会话生命周期（构造**主动查找**，加载**显式**）：
+Session lifecycle (construction **actively searches**, loading is **explicit**):
 
-- 构造 ``AgentRunner`` **主动查找**会话：先看显式 ``session_id`` / ``context_path``，
-  否则按 ``session_priority``（**默认工作区优先**）查找工作区与用户主目录下已有的上下文，
-  命中即把 ``session_id`` 设为该会话并记入 ``found_context_path``；没命中才用新 ``uuid4``；
-- 工作区里没有、回退到用户主目录时还要比对 JSON 里记录的 ``workspace``：与当前工作区不一致的
-  **不是**本次要查找的上下文（用户级是多个工作区共享的），视为未命中（见
-  ``context_matches_workspace()``）；
-- 但构造**不载入内容、不创建文件**：``loaded_context_paths`` 为空、``get_context()`` 为空，
-  直到显式调用 ``load_session()``（或 ``load_context(path)``）；
-- 查到既有会话却未显式载入时，``send()`` / ``stream()`` / ``save_context()`` 会先报错
-  （``has_unloaded_session``），避免用空历史覆盖既有内容；
-- 开始新对话：显式调用 ``create_context()`` —— 未指定 ``session_id`` 时**每次都生成
-  新的 ``uuid4``**，因此不会覆盖 / 重置其它会话的上下文；
-- 落盘：显式 ``save_context()``，或 ``close()``（仅当本轮确实有改动）。
+- Constructing an ``AgentRunner`` **actively searches** for a session: first an explicit
+  ``session_id`` / ``context_path``, otherwise it searches existing contexts in the workspace and the
+  user home directory according to ``session_priority`` (**workspace first by default**); on a hit it
+  sets ``session_id`` to that session and records ``found_context_path``; only on a miss does it use a
+  new ``uuid4``;
+- When there is nothing in the workspace and it falls back to the user home directory, it also
+  compares the ``workspace`` recorded in the JSON: one that does not match the current workspace is
+  **not** the context being searched for (the user level is shared by multiple workspaces) and is
+  treated as a miss (see ``context_matches_workspace()``);
+- But construction **does not load content or create files**: ``loaded_context_paths`` is empty and
+  ``get_context()`` is empty until ``load_session()`` (or ``load_context(path)``) is explicitly
+  called;
+- When an existing session was found but not explicitly loaded, ``send()`` / ``stream()`` /
+  ``save_context()`` error out first (``has_unloaded_session``) to avoid overwriting existing content
+  with an empty history;
+- To start a new conversation: explicitly call ``create_context()`` -- when ``session_id`` is not
+  specified it generates **a new ``uuid4`` every time**, so it never overwrites / resets the context
+  of other sessions;
+- Persisting: explicitly ``save_context()``, or ``close()`` (only when this round really changed
+  something).
 
 
-组装关系（各层职责）：::
+Composition (responsibilities of each layer): ::
 
     config.yaml  -> ConfigStore -> LLMConfig -> LLMClient
     Session(JSON) -> ContextStore -> Session -> ContextMiddleware
     ToolRegistry  + SkillRegistry -> AgentEngine
     AgentEngine -> EventBus -> ResponseCollector -> AgentResponse
-    create_approve_callback() -> session.approve -> ToolRegistry（bash 等需授权工具）
+    create_approve_callback() -> session.approve -> ToolRegistry (tools requiring approval such as bash)
 
-事件流（``stream()`` 模式）::
+Event stream (``stream()`` mode) ::
 
     agent_start
       -> message_start(user)
@@ -51,12 +60,13 @@
       -> message_update ... -> message_start -> message_end -> turn_end
       -> AgentStreamChunk(done=True)
 
-``run()`` 模式没有 ``message_update`` 增量，最终文本由 ``message_end`` / ``turn_end`` /
-``agent_end`` 事件携带；``ResponseCollector`` 对两种模式都会产出同一份 ``AgentResponse``，
-因此 TUI/Web 等宿主不需要自己区分同步 / 流式（详见 ``/workspace/test/test_run/README.md``）。
+``run()`` mode has no ``message_update`` deltas; the final text is carried by the ``message_end`` /
+``turn_end`` / ``agent_end`` events. ``ResponseCollector`` produces the same ``AgentResponse`` for
+both modes, so hosts such as TUI/Web do not need to distinguish synchronous / streaming themselves
+(see ``/workspace/test/test_run/README.md``).
 
-本模块**不包含 CLI 解析**：命令行、TUI、Web 都应作为宿主程序调用 ``build_agent()`` /
-``AgentRunner``，并自行决定输入输出方式。
+This module **does not include CLI parsing**: command line, TUI, and Web should all be host programs
+that call ``build_agent()`` / ``AgentRunner`` and decide input/output themselves.
 """
 
 from __future__ import annotations
@@ -69,13 +79,14 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable, Iterator, Mapping, TextIO
 
 # ----------------------------------------------------------------------
-# 兼容两种导入方式：
-# 1) ``from linteum_agent.run_agent import ...``（包内相对导入）；
-# 2) 直接把 ``/workspace/linteum_agent`` 加入 sys.path 后 ``import run_agent``。
-# skills 包内部使用 ``from ..tools import ...``，因此后者必须把项目根目录加入
-# sys.path，再以 ``linteum_agent.*`` 绝对导入，避免 "attempted relative import"。
+# Support two import styles:
+# 1) ``from linteum_agent.run_agent import ...`` (intra-package relative import);
+# 2) ``import run_agent`` after adding ``/workspace/linteum_agent`` to sys.path.
+# The skills package uses ``from ..tools import ...`` internally, so the latter must add the
+# project root to sys.path and then import absolutely as ``linteum_agent.*`` to avoid
+# "attempted relative import".
 # ----------------------------------------------------------------------
-try:  # pragma: no cover - 取决于调用方式
+try:  # pragma: no cover - depends on how it is invoked
     from .agent.engine import AgentEngine, AgentResult, AgentStreamChunk
     from .config import ConfigStore, LLMConfig
     from .context.middleware import ContextMiddleware
@@ -94,7 +105,7 @@ try:  # pragma: no cover - 取决于调用方式
     from .prompt import build_system_prompt as _build_default_system_prompt
     from .skills import SkillRegistry
     from .tools import Tool, ToolRegistry, create_builtin_tools
-except ImportError:  # 直接导入 run_agent：补上项目根目录后改用绝对导入
+except ImportError:  # importing run_agent directly: add the project root, then use absolute imports
     _SCRIPT_ROOT = Path(__file__).resolve().parents[1]
     if str(_SCRIPT_ROOT) not in sys.path:
         sys.path.insert(0, str(_SCRIPT_ROOT))
@@ -147,26 +158,29 @@ __all__ = [
     "DEFAULT_SESSION_PRIORITY",
 ]
 
-# 未指定会话时使用的占位标签；真实会话默认使用 ``new_session_id()``（uuid4）。
+# Placeholder label used when no session is specified; real sessions use ``new_session_id()`` (uuid4) by default.
 DEFAULT_SESSION_ID = "default"
 DEFAULT_MAX_TOOL_ROUNDS = 8
 
-# 会话上下文默认存储目录：用户主目录（``~``）与工作区各存一份（``<root>/.agent/sessions``）。
+# Default storage directory for session context: one copy in the user home directory (``~``) and one
+# in the workspace (``<root>/.agent/sessions``).
 DEFAULT_SESSION_DIRNAME = Path(".agent") / "sessions"
 
-# 会话查找优先级：同一会话在两个位置各有一份副本，查找时谁优先。
-# 默认 ``workspace`` = **工作区优先**，即先看当前工作区下的 ``.agent/sessions``，
-# 再看用户主目录（``~/.agent/sessions``）；显式传 ``SESSION_PRIORITY_PROJECT`` 可让用户级优先。
+# Session lookup priority: the same session has a copy in each location; this decides which wins.
+# The default ``workspace`` = **workspace first**, i.e. look at ``.agent/sessions`` under the current
+# workspace first, then the user home directory (``~/.agent/sessions``); pass
+# ``SESSION_PRIORITY_PROJECT`` explicitly to give the user level priority.
 SESSION_PRIORITY_WORKSPACE = "workspace"
 SESSION_PRIORITY_PROJECT = "project"
 DEFAULT_SESSION_PRIORITY = SESSION_PRIORITY_WORKSPACE
 
-# 默认 Skill 搜索目录：系统级在用户目录下，项目级在工作区 ``.agent/skills``。
-# 目录不存在时 SkillRegistry.discover() 会自动跳过。
+# Default Skill search directories: system level under the user directory, project level under the
+# workspace ``.agent/skills``.
+# When a directory does not exist, SkillRegistry.discover() skips it automatically.
 _SYSTEM_SKILL_DIR = Path.home() / ".agent" / "skills"
 _PROJECT_SKILL_DIRNAME = Path(".agent") / "skills"
 
-# 事件类型常量：避免调用方硬编码字符串。
+# Event type constants: avoid callers hard-coding strings.
 EVENT_AGENT_START = "agent_start"
 EVENT_AGENT_END = "agent_end"
 EVENT_TURN_START = "turn_start"
@@ -193,42 +207,43 @@ ALL_EVENTS = (
 
 
 # ----------------------------------------------------------------------
-# 工具授权（approve）：风险提示 + 用户确认
+# Tool approval (approve): risk notice + user confirmation
 # ----------------------------------------------------------------------
-# 高风险工具的风险说明；``create_approve_callback()`` 提示风险时按工具名取用。
+# Risk notes for high-risk tools; ``create_approve_callback()`` looks them up by tool name when
+# showing the risk notice.
 TOOL_RISK_NOTES: dict[str, str] = {
-    "bash": "在工作区内执行任意 Bash 命令：可读写 / 删除文件、访问网络、启动子进程。",
-    "write_file": "写入（覆盖）工作区内的文件。",
+    "bash": "Execute arbitrary Bash commands in the workspace: can read/write / delete files, access the network, and start subprocesses.",
+    "write_file": "Write to (overwrite) files in the workspace.",
 }
 
-# 视为「授权」的回答（大小写不敏感）；其余输入一律视为拒绝。
+# Answers treated as "approval" (case-insensitive); any other input is treated as a rejection.
 _APPROVE_ANSWERS = ("y", "yes")
 
 
 def _stdin_is_interactive() -> bool:
-    """当前进程的标准输入是否可交互（不是管道 / 重定向 / 封闭流）。"""
+    """Whether the current process's stdin is interactive (not a pipe / redirect / closed stream)."""
     try:
         return bool(sys.stdin) and bool(sys.stdin.isatty())
-    except (AttributeError, ValueError):  # pragma: no cover - 封闭的 stdin
+    except (AttributeError, ValueError):  # pragma: no cover - closed stdin
         return False
 
 
 def describe_tool_risk(tool_name: str, arguments: Mapping[str, Any] | None = None) -> str:
-    """渲染一次待授权工具调用的风险提示文本（工具名 + 风险说明 + 调用参数）。
+    """Render the risk notice text for a pending tool call (tool name + risk note + arguments).
 
-    未在 ``TOOL_RISK_NOTES`` 中登记的工具（例如宿主通过 ``extra_tools`` 注册、
-    且 ``requires_approval=True`` 的自定义工具）给出一段通用提示。
+    For tools not registered in ``TOOL_RISK_NOTES`` (for example a custom tool that a host
+    registers via ``extra_tools`` with ``requires_approval=True``) a generic notice is given.
     """
     note = TOOL_RISK_NOTES.get(
-        tool_name, "该工具被标记为需要授权，请确认调用参数是否安全。"
+        tool_name, "This tool is marked as requiring approval; please confirm the arguments are safe."
     )
-    lines = [f"工具 {tool_name} 请求执行。", f"风险提示：{note}"]
+    lines = [f"Tool {tool_name} requested execution.", f"Risk notice: {note}"]
     if arguments:
         try:
             rendered = json.dumps(dict(arguments), ensure_ascii=False, default=str)
-        except (TypeError, ValueError):  # pragma: no cover - 兜底
+        except (TypeError, ValueError):  # pragma: no cover - fallback
             rendered = str(arguments)
-        lines.append(f"调用参数：{rendered}")
+        lines.append(f"Arguments: {rendered}")
     return "\n".join(lines)
 
 
@@ -240,13 +255,16 @@ def confirm_tool_call(
     stream: TextIO | None = None,
     default: bool = False,
 ) -> bool:
-    """把工具调用的风险提示显示给用户并等待确认，返回是否授权。
+    """Show the tool call's risk notice to the user and wait for confirmation; return whether approved.
 
-    - ``input_fn=None``（默认）：使用内置 ``input()``；当 ``stdin`` 不是终端（管道、
-      CI、Web 进程等）时无法交互，直接返回 ``default``，避免卡住调用方；
-    - 仅 ``y`` / ``yes``（大小写不敏感）视为授权，其它输入一律拒绝；
-    - 用户按 Ctrl+C / Ctrl+D 等交互异常同样返回 ``default``；
-    - ``stream`` 是提示输出流，默认 ``sys.stderr``（不污染正常输出，例如流式正文）。
+    - ``input_fn=None`` (default): use the built-in ``input()``; when ``stdin`` is not a terminal
+      (pipe, CI, Web process, etc.) interaction is impossible, so ``default`` is returned directly to
+      avoid blocking the caller;
+    - Only ``y`` / ``yes`` (case-insensitive) count as approval; any other input is treated as a
+      rejection;
+    - Interactive exceptions such as Ctrl+C / Ctrl+D also return ``default``;
+    - ``stream`` is the notice output stream, defaulting to ``sys.stderr`` (so it does not pollute
+      normal output such as the streamed body).
     """
     output = stream if stream is not None else sys.stderr
     print(describe_tool_risk(tool_name, arguments), file=output, flush=True)
@@ -254,9 +272,9 @@ def confirm_tool_call(
     prompt_fn = input_fn
     if prompt_fn is None:
         if not _stdin_is_interactive():
-            verdict = "允许" if default else "拒绝"
+            verdict = "allow" if default else "deny"
             print(
-                f"当前环境无法交互确认，按默认策略处理（{verdict}）：{tool_name}",
+                f"Cannot interactively confirm in the current environment; applying the default policy ({verdict}): {tool_name}",
                 file=output,
                 flush=True,
             )
@@ -264,9 +282,9 @@ def confirm_tool_call(
         prompt_fn = input
 
     try:
-        answer = prompt_fn(f"是否允许执行 {tool_name}？[y/N] ")
+        answer = prompt_fn(f"Allow execution of {tool_name}? [y/N] ")
     except (EOFError, KeyboardInterrupt, OSError):
-        print(f"\n未获得有效确认，视为拒绝：{tool_name}", file=output, flush=True)
+        print(f"\nNo valid confirmation received; treating as denied: {tool_name}", file=output, flush=True)
         return bool(default)
     return str(answer).strip().lower() in _APPROVE_ANSWERS
 
@@ -278,14 +296,17 @@ def create_approve_callback(
     stream: TextIO | None = None,
     default: bool = False,
 ) -> ApproveFn:
-    """生成交给 ``ToolRegistry``（即 ``session.approve``）的工具授权回调。
+    """Create the tool approval callback handed to ``ToolRegistry`` (i.e. ``session.approve``).
 
-    回调签名与 ``Session.approve`` 一致：``(tool_name, arguments) -> bool``。
+    The callback signature matches ``Session.approve``: ``(tool_name, arguments) -> bool``.
 
-    - ``auto_approve=True``：直接返回 ``True`` —— 不提示风险、不询问用户（全部授权）；
-    - ``auto_approve=False``（默认）：打印风险提示并询问用户确认（见 ``confirm_tool_call()``）；
-    - ``input_fn`` / ``stream`` / ``default`` 透传给 ``confirm_tool_call()``，便于 TUI /
-      Web 等宿主接管交互（默认使用 ``input()`` + ``sys.stderr``，且不可交互时拒绝）。
+    - ``auto_approve=True``: return ``True`` directly -- no risk notice, no user prompt (approve
+      everything);
+    - ``auto_approve=False`` (default): print the risk notice and ask the user to confirm (see
+      ``confirm_tool_call()``);
+    - ``input_fn`` / ``stream`` / ``default`` are passed through to ``confirm_tool_call()`` so hosts
+      such as TUI / Web can take over the interaction (by default ``input()`` + ``sys.stderr`` are
+      used, and it denies when interaction is impossible).
     """
     def approve(tool_name: str, arguments: dict[str, Any]) -> bool:
         if auto_approve:
@@ -298,20 +319,21 @@ def create_approve_callback(
 
 
 # ----------------------------------------------------------------------
-# 会话标识与上下文路径
+# Session identity and context paths
 # ----------------------------------------------------------------------
 
 
 def new_session_id() -> str:
-    """生成一个新的会话 ID（``uuid4`` 的规范字符串形式）。"""
+    """Generate a new session ID (the canonical string form of ``uuid4``)."""
     return str(uuid.uuid4())
 
 
 def default_session_root() -> Path:
-    """会话存储的默认根目录：**用户主目录**（``~``）。
+    """The default root directory for session storage: the **user home directory** (``~``).
 
-    其下 ``.agent/sessions``（即 ``~/.agent/sessions``）是用户级共享副本；另一份在工作区
-    ``<workspace>/.agent/sessions``。二者互为副本，因此会话不再写进项目仓库 / 安装目录。
+    Under it, ``.agent/sessions`` (i.e. ``~/.agent/sessions``) is the user-level shared copy; the
+    other copy is under the workspace ``<workspace>/.agent/sessions``. The two are copies of each
+    other, so sessions are no longer written into the project repository / install directory.
     """
     return Path.home()
 
@@ -323,10 +345,11 @@ def session_context_paths(
     project_dir: str | Path | None = None,
     dirname: str | Path = DEFAULT_SESSION_DIRNAME,
 ) -> list[Path]:
-    """返回某个会话的两份上下文存储路径：用户主目录 + 工作区。
+    """Return the two context storage paths for a session: user home directory + workspace.
 
-    路径形如 ``<root>/<dirname>/<session_id>.json``（用户级即 ``~/.agent/sessions``）。
-    用户主目录与工作区恰好相同时会去重，因此最终只返回一份。
+    Paths look like ``<root>/<dirname>/<session_id>.json`` (the user level being
+    ``~/.agent/sessions``). When the user home directory and the workspace are exactly the same,
+    they are de-duplicated, so only one path is returned.
     """
     root = Path(project_dir).expanduser() if project_dir is not None else default_session_root()
     roots = [root, Path(workspace).expanduser()]
@@ -339,15 +362,15 @@ def session_context_paths(
 
 
 def _normalize_session_priority(priority: str | None) -> str:
-    """把优先级归一化为 ``workspace`` / ``project``；非法值抛 ``ValueError``。"""
+    """Normalize the priority to ``workspace`` / ``project``; raise ``ValueError`` on invalid values."""
     if priority is None:
         return DEFAULT_SESSION_PRIORITY
     value = str(priority).strip().lower()
     if value in (SESSION_PRIORITY_WORKSPACE, SESSION_PRIORITY_PROJECT):
         return value
     raise ValueError(
-        f"priority 需要 {SESSION_PRIORITY_WORKSPACE!r} 或 "
-        f"{SESSION_PRIORITY_PROJECT!r}，实际为 {priority!r}"
+        f"priority must be {SESSION_PRIORITY_WORKSPACE!r} or "
+        f"{SESSION_PRIORITY_PROJECT!r}, got {priority!r}"
     )
 
 
@@ -358,9 +381,10 @@ def session_search_dirs(
     dirname: str | Path = DEFAULT_SESSION_DIRNAME,
     priority: str = DEFAULT_SESSION_PRIORITY,
 ) -> list[Path]:
-    """返回会话查找目录，**按优先级排序**（默认为工作区在前、用户主目录在后）。
+    """Return the session search directories, **ordered by priority** (default: workspace first, user home directory second).
 
-    两个根目录恰好相同时自动去重，因此通常只返回一个目录。
+    When the two root directories are exactly the same they are de-duplicated automatically, so
+    usually only one directory is returned.
     """
     root = Path(project_dir).expanduser() if project_dir is not None else default_session_root()
     workspace_dir = Path(workspace).expanduser() / dirname
@@ -383,11 +407,13 @@ def context_json_workspace(
     *,
     session_id: str | None = None,
 ) -> Path | None:
-    """读取上下文 JSON 里记录的会话工作区（只读，不会创建任何文件）。
+    """Read the session workspace recorded in a context JSON (read-only; never creates any file).
 
-    - ``session_id`` 给定时读取该会话的记录；未给定时只在该文件恰好只含一个会话时读取；
-    - 返回 ``None`` 表示「无法确定」：文件读不了 / 不是本模块的 ``ContextStore`` 格式 /
-      该会话尚未记录工作区（version 1 旧格式，运行时继承当前工作区）。
+    - When ``session_id`` is given, read that session's record; otherwise read only when the file
+      contains exactly one session;
+    - Returning ``None`` means "undetermined": the file cannot be read / is not this module's
+      ``ContextStore`` format / the session has not recorded a workspace yet (version 1 old format,
+      inherits the current workspace at runtime).
     """
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -415,14 +441,16 @@ def context_matches_workspace(
     *,
     session_id: str | None = None,
 ) -> bool:
-    """判断上下文 JSON 记录的会话工作区是否与 ``workspace`` 一致。
+    """Determine whether the session workspace recorded in a context JSON matches ``workspace``.
 
-    - 文件里没有记录工作区（旧格式 / 无法读取）：按 ``Session`` 的语义是「运行时继承
-      当前工作区」，因此返回 ``True``；
-    - 记录了工作区：与 ``workspace`` 一起解析为绝对路径后比较，一致才返回 ``True``。
+    - If no workspace is recorded in the file (old format / unreadable): by ``Session`` semantics it
+      "inherits the current workspace at runtime", so ``True`` is returned;
+    - If a workspace is recorded: compare it with ``workspace`` after resolving both to absolute
+      paths; return ``True`` only when they match.
 
-    用户主目录下的会话文件是**多个工作区共享**的（同一 session_id 只写 ``<id>.json``），
-    因此回退到用户级查找时必须用它确认「这份上下文确实属于当前工作区」。
+    Session files under the user home directory are **shared by multiple workspaces** (the same
+    session_id only writes ``<id>.json``), so when falling back to the user-level lookup this is used
+    to confirm "this context really belongs to the current workspace".
     """
     return _same_workspace(context_json_workspace(path, session_id=session_id), workspace)
 
@@ -435,21 +463,26 @@ def find_context_jsons(
     session_id: str | None = None,
     priority: str = DEFAULT_SESSION_PRIORITY,
 ) -> list[Path]:
-    """查找**已存在**的上下文 JSON（只读，不会创建文件或目录）。
+    """Find **existing** context JSONs (read-only; never creates files or directories).
 
-    结果顺序 = 查找优先级（``priority``，默认 ``workspace`` = 工作区优先）：
+    Result order = search priority (``priority``, default ``workspace`` = workspace first):
 
-    - 给定 ``session_id``：只在该会话的两份副本中查找，按优先级返回（存在几个返回几个）；
-    - 未给定：先列出高优先级目录里的 ``*.json``（目录内按 mtime 从新到旧），
-      再列出另一个目录的，同路径去重。
+    - With ``session_id``: search only that session's two copies, returning them by priority
+      (returning as many as exist);
+    - Without it: first list the ``*.json`` files in the higher-priority directory (within the
+      directory, newest to oldest by mtime), then those of the other directory, de-duplicating by
+      path.
 
-    工作区目录（``<workspace>/<dirname>``）下的文件天然属于当前工作区，直接采纳；
-    **用户主目录**下的是多个工作区共享的，必须比对文件里记录的 ``workspace``
-    （``context_matches_workspace()``）：与当前 ``workspace`` 不一致的**不是**本次要
-    查找的上下文，直接跳过 —— 工作区里没有、用户级又不匹配时结果为空列表。
+    Files under the workspace directory (``<workspace>/<dirname>``) naturally belong to the current
+    workspace and are adopted directly; those under the **user home directory** are shared by multiple
+    workspaces, so the ``workspace`` recorded in the file must be compared
+    (``context_matches_workspace()``): one that does not match the current ``workspace`` is **not**
+    the context being searched for and is skipped -- when there is nothing in the workspace and the
+    user level does not match either, the result is an empty list.
 
-    注意与 ``session_context_paths()`` 的区别：后者是**写入/枚举顺序**（用户主目录 ->
-    工作区），本函数是**查找顺序**（默认工作区 -> 用户主目录）。
+    Note the difference from ``session_context_paths()``: the latter is the **write/enumeration
+    order** (user home directory -> workspace), while this function is the **search order** (default
+    workspace -> user home directory).
     """
     directories = session_search_dirs(
         workspace, project_dir=project_dir, dirname=dirname, priority=priority
@@ -457,7 +490,7 @@ def find_context_jsons(
     workspace_dir = Path(workspace).expanduser() / dirname
 
     def usable(candidate: Path) -> bool:
-        """工作区目录里的文件直接采纳；用户级文件必须先比对记录的工作区。"""
+        """Files in the workspace directory are adopted directly; user-level files must first be compared against the recorded workspace."""
         if candidate.parent == workspace_dir:
             return True
         return context_matches_workspace(candidate, workspace, session_id=session_id)
@@ -488,17 +521,21 @@ def find_context_json(
     session_id: str | None = None,
     priority: str = DEFAULT_SESSION_PRIORITY,
 ) -> Path | None:
-    """查找单个上下文 JSON；找到时返回**优先级最高**的那一个，否则返回 ``None``。
+    """Find a single context JSON; return the **highest-priority** one when found, otherwise ``None``.
 
-    这是「查找工作区上下文」的入口：默认**工作区优先**（``priority="workspace"``），
-    工作区里没有才回退到用户主目录；同一目录内取最新修改的那一个。
+    This is the entry point for "finding a workspace context": default **workspace first**
+    (``priority="workspace"``), falling back to the user home directory only when the workspace has
+    none; within the same directory the most recently modified one is taken.
 
-    回退到用户主目录时还会比对文件里记录的 ``workspace``：与当前 ``workspace``
-    不一致的**不是**本次要查找的上下文（用户级是多个工作区共享的），直接返回 ``None``
-    —— 宁可让调用方新建会话，也不把别的工作区的历史当成本次上下文；旧格式没有记录
-    工作区时按「运行时继承」处理，仍然采纳（详见 ``context_matches_workspace()``）。
+    When falling back to the user home directory it also compares the ``workspace`` recorded in the
+    file: one that does not match the current ``workspace`` is **not** the context being searched for
+    (the user level is shared by multiple workspaces) and ``None`` is returned directly -- rather than
+    treating another workspace's history as this context, let the caller create a new session; when the
+    old format has no recorded workspace it is treated as "inherited at runtime" and still adopted (see
+    ``context_matches_workspace()``).
 
-    只读查找，不会创建任何文件；需要继续某个会话时请由调用方**显式**决定。
+    Read-only lookup; never creates any file. When a session needs to be continued, the caller must
+    decide **explicitly**.
     """
     files = find_context_jsons(
         workspace,
@@ -520,14 +557,17 @@ def create_context_json(
     metadata: dict[str, Any] | None = None,
     overwrite: bool = False,
 ) -> list[Path]:
-    """**主动**创建上下文 JSON（一式两份，或只建 ``path`` 指定的一份）。
+    """**Actively** create context JSON (two copies, or only the one specified by ``path``).
 
-    这是「创建上下文」的入口；只有调用了它（或 ``AgentRunner.create_context()``）才会
-    在没有会话文件时新建文件。``AgentRunner`` 的构造过程本身不会创建任何 JSON。
+    This is the entry point for "creating context"; only calling it (or
+    ``AgentRunner.create_context()``) creates a file when no session file exists. The construction of
+    ``AgentRunner`` itself never creates any JSON.
 
-    - 文件已存在且 ``overwrite=False``：保留原内容，仅返回其路径；
-    - ``overwrite=True``：用全新会话覆盖写入；
-    - 返回最终存在的文件路径列表（构造顺序：用户主目录 -> 工作区）。
+    - If the file already exists and ``overwrite=False``: keep the original content, only return its
+      path;
+    - ``overwrite=True``: overwrite with a brand-new session;
+    - Return the list of file paths that finally exist (construction order: user home directory ->
+      workspace).
     """
     resolved_workspace = Path(workspace).expanduser()
     targets = (
@@ -553,37 +593,39 @@ def create_context_json(
 
 
 # ----------------------------------------------------------------------
-# 会话清单：列出全部会话（工作区 + 用户主目录，只读）
+# Session inventory: list all sessions (workspace + user home directory, read-only)
 # ----------------------------------------------------------------------
 
-# ``SessionInfo.scope`` 的取值：会话文件所在位置 / 来源。
+# Values of ``SessionInfo.scope``: the location / source of the session file.
 SESSION_SCOPE_WORKSPACE = "workspace"   # <workspace>/.agent/sessions/<id>.json
-SESSION_SCOPE_PROJECT = "project"       # 用户级 ~/.agent/sessions/<id>.json（历史命名，指用户主目录那份）
-SESSION_SCOPE_CONTEXT = "context"       # 显式 context_path 指定的单个文件
+SESSION_SCOPE_PROJECT = "project"       # user level ~/.agent/sessions/<id>.json (historical name for the user home directory copy)
+SESSION_SCOPE_CONTEXT = "context"       # a single file specified by an explicit context_path
 
 
 @dataclass
 class SessionInfo:
-    """一个会话的**只读摘要**（id / 文件路径 / 位置 / 时间 / 规模 / 用量）。
+    """A **read-only summary** of a session (id / file path / location / time / size / usage).
 
-    由 ``list_sessions()``（模块级）与 ``AgentRunner.list_sessions()`` 产出，供宿主列出
-    「全部会话」；**不含完整消息历史** —— 需要历史时用 ``load_session()`` 载入，再
-    ``get_context()`` 读取。``to_dict()`` / ``to_json()`` 便于直接返回给 Web / TUI。
+    Produced by ``list_sessions()`` (module level) and ``AgentRunner.list_sessions()`` for hosts to
+    list "all sessions"; it **does not contain the full message history** -- when history is needed,
+    load it with ``load_session()`` and read it with ``get_context()``. ``to_dict()`` / ``to_json()``
+    make it easy to return directly to Web / TUI.
 
-    字段：
+    Fields:
 
-    - ``session_id``：会话 ID（文件里 ``sessions`` 的键）；
-    - ``path``：该会话所在的上下文 JSON 文件；
-    - ``scope``：文件位置 —— ``"workspace"`` / ``"project"`` / ``"context"``（显式
-      ``context_path``）；
-    - ``workspace``：文件里记录的工作区；``None`` = 「运行时继承当前工作区」；
-    - ``matches_workspace``：记录的工作区是否与查询用 ``workspace`` 一致
-      （``None`` 视为一致，口径同 ``context_matches_workspace()``）；
-    - ``created_at`` / ``updated_at``：会话创建 / 更新时间（UTC ISO8601）；
-    - ``message_count`` / ``round_count``：消息条数 / 对话轮数；
-    - ``usage``：会话累计 token 用量；
-    - ``metadata`` / ``tools`` / ``skills``：会话元数据与工具 / Skill 配置；
-    - ``size`` / ``mtime``：文件字节数与最后修改时间。
+    - ``session_id``: session ID (the key under ``sessions`` in the file);
+    - ``path``: the context JSON file this session lives in;
+    - ``scope``: file location -- ``"workspace"`` / ``"project"`` / ``"context"`` (an explicit
+      ``context_path``);
+    - ``workspace``: the workspace recorded in the file; ``None`` = "inherits the current workspace
+      at runtime";
+    - ``matches_workspace``: whether the recorded workspace matches the query ``workspace``
+      (``None`` counts as a match, same convention as ``context_matches_workspace()``);
+    - ``created_at`` / ``updated_at``: session creation / update time (UTC ISO8601);
+    - ``message_count`` / ``round_count``: number of messages / conversation rounds;
+    - ``usage``: cumulative token usage of the session;
+    - ``metadata`` / ``tools`` / ``skills``: session metadata and Tool / Skill config;
+    - ``size`` / ``mtime``: file size in bytes and last modification time.
     """
 
     session_id: str
@@ -603,7 +645,7 @@ class SessionInfo:
     mtime: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为可直接 JSON 化的字典（``path`` / ``workspace`` 转为字符串）。"""
+        """Convert to a directly JSON-serializable dict (``path`` / ``workspace`` become strings)."""
         return {
             "session_id": self.session_id,
             "path": str(self.path),
@@ -627,21 +669,22 @@ class SessionInfo:
 
 
 def _same_workspace(recorded: Path | None, workspace: str | Path) -> bool:
-    """``context_matches_workspace()`` 的纯内存版本（``recorded`` 已由 ``Session`` 解析）。
+    """Pure in-memory version of ``context_matches_workspace()`` (``recorded`` already parsed by ``Session``).
 
-    记录为 ``None``（旧格式 / 未指定）→ 按「运行时继承当前工作区」返回 ``True``。
+    A record of ``None`` (old format / unspecified) -> return ``True`` per "inherits the current
+    workspace at runtime".
     """
     if recorded is None:
         return True
     try:
         current = Path(workspace).expanduser().resolve()
-    except OSError:  # pragma: no cover - 兜底（例如坏掉的符号链接）
+    except OSError:  # pragma: no cover - fallback (e.g. a broken symlink)
         current = Path(workspace).expanduser()
     return Path(recorded) == current
 
 
 def _file_stat(path: Path) -> tuple[int, float]:
-    """返回 ``(size, mtime)``；文件读不到时返回 ``(0, 0.0)``（不抛异常）。"""
+    """Return ``(size, mtime)``; return ``(0, 0.0)`` when the file cannot be read (never raises)."""
     try:
         stat = path.stat()
     except OSError:
@@ -650,7 +693,7 @@ def _file_stat(path: Path) -> tuple[int, float]:
 
 
 def _sessions_in_file(path: str | Path) -> list[Session]:
-    """读出一个上下文文件里的全部 ``Session``（只读；坏文件 / 非法数据返回空列表）。"""
+    """Read all ``Session`` objects in one context file (read-only; returns an empty list on a bad file / invalid data)."""
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -662,7 +705,7 @@ def _sessions_in_file(path: str | Path) -> list[Session]:
     parsed: list[Session] = []
     for session_id, value in sessions.items():
         if isinstance(value, dict) and "role" in value:
-            continue  # 单项消息，不是会话快照
+            continue  # a single message item, not a session snapshot
         try:
             parsed.append(Session.from_dict(str(session_id), value))
         except (TypeError, ValueError):
@@ -677,7 +720,7 @@ def _session_info(
     *,
     workspace: str | Path,
 ) -> SessionInfo:
-    """把 ``Session`` 与其所在文件整理成 ``SessionInfo``。"""
+    """Assemble a ``Session`` and its file into a ``SessionInfo``."""
     size, mtime = _file_stat(path)
     return SessionInfo(
         session_id=session.session_id,
@@ -699,7 +742,7 @@ def _session_info(
 
 
 def _sort_infos(infos: list[SessionInfo]) -> list[SessionInfo]:
-    """按 ``updated_at`` 从新到旧排序（其次 ``session_id``），返回同一个列表。"""
+    """Sort by ``updated_at`` newest to oldest (then ``session_id``); return the same list."""
     infos.sort(key=lambda info: (info.updated_at, info.session_id), reverse=True)
     return infos
 
@@ -714,22 +757,26 @@ def list_sessions(
     dedupe: bool = True,
     priority: str = DEFAULT_SESSION_PRIORITY,
 ) -> list[SessionInfo]:
-    """列出**全部会话**的只读摘要（不载入内容、不创建任何文件）。
+    """List a read-only summary of **all sessions** (does not load content, does not create any file).
 
-    扫描 ``priority`` 顺序下的会话目录（默认工作区在前、用户主目录在后）里的 ``*.json``，
-    把每个文件里的每个会话整理成一个 ``SessionInfo``：
+    Scan the ``*.json`` files in the session directories ordered by ``priority`` (default workspace
+    first, user home directory second), assembling every session in every file into a ``SessionInfo``:
 
-    - ``include_project=False``：只列工作区目录；``True``（默认）额外列用户主目录；
-    - ``only_current_workspace=True``：只保留 ``matches_workspace`` 为真的会话（口径与
-      ``find_context()`` 的用户级回退比对一致，即不把别的工作区的会话算进来）；
-    - ``dedupe=True``（默认）：同一个 ``session_id`` 在工作区 / 用户主目录各有一份副本时，
-      只保留优先级高的那一份（默认工作区副本，见 ``scope``）；``False`` 时两份都返回；
-    - 排序：``updated_at`` 从新到旧，其次 ``session_id``；
-    - 容错：文件损坏 / 不是 ``ContextStore`` 格式 / 单个会话数据非法 → 跳过该条，不抛异常；
-    - 需要「仅仅是文件路径」（不解析内容）时用 ``find_context_jsons()``；
-    - ``SessionInfo.to_dict()`` / ``to_json()`` 可直接交给 Web / TUI 渲染。
+    - ``include_project=False``: list only the workspace directory; ``True`` (default) additionally
+      lists the user home directory;
+    - ``only_current_workspace=True``: keep only sessions whose ``matches_workspace`` is true (the
+      same convention as the user-level fallback comparison of ``find_context()``, i.e. sessions from
+      other workspaces are not counted);
+    - ``dedupe=True`` (default): when the same ``session_id`` has a copy in both the workspace / user
+      home directory, keep only the higher-priority one (the workspace copy by default, see
+      ``scope``); with ``False`` both are returned;
+    - Sorting: ``updated_at`` newest to oldest, then ``session_id``;
+    - Fault tolerance: corrupted file / not ``ContextStore`` format / invalid single session data ->
+      skip that entry, never raise;
+    - When "just the file paths" are needed (without parsing content), use ``find_context_jsons()``;
+    - ``SessionInfo.to_dict()`` / ``to_json()`` can be handed directly to Web / TUI for rendering.
 
-    只读操作，不会创建目录或文件。
+    Read-only operation; never creates directories or files.
     """
     workspace_dir = Path(workspace).expanduser() / dirname
     directories = session_search_dirs(
@@ -761,17 +808,17 @@ def list_sessions(
 
 
 # ----------------------------------------------------------------------
-# 事件聚合：把 AgentEvent 还原成「用户能看到、能继续处理的响应」
+# Event aggregation: turn AgentEvent back into "a response the user can see and keep handling"
 # ----------------------------------------------------------------------
 
 
 @dataclass
 class AgentResponse:
-    """``ResponseCollector`` 从事件流里聚合出的 Agent 响应。
+    """The Agent response that ``ResponseCollector`` aggregates from the event stream.
 
-    ``text`` / ``reasoning`` 取「最后一次完成的 turn」的正文与思维链（也就是最终回答）；
-    需要完整流式文本时用 ``streamed_text``。``tool_calls`` / ``tool_results`` 汇总本次
-    请求内所有工具轮次。
+    ``text`` / ``reasoning`` take the text and reasoning of "the last completed turn" (that is, the
+    final answer); use ``streamed_text`` when the full streamed text is needed. ``tool_calls`` /
+    ``tool_results`` aggregate all tool rounds within this request.
     """
 
     text: str = ""
@@ -786,7 +833,7 @@ class AgentResponse:
 
     @property
     def ok(self) -> bool:
-        """是否拿到结构化的 ``AgentResult``（事件正常走完时为 ``True``）。"""
+        """Whether a structured ``AgentResult`` was obtained (``True`` when events complete normally)."""
         return self.result is not None
 
     def to_dict(self, *, include_events: bool = False) -> dict[str, Any]:
@@ -812,25 +859,26 @@ def _assistant_from(message: Any) -> AssistantMessage | None:
 
 
 class ResponseCollector(AgentEventListener):
-    """订阅 ``EventBus`` 的全部事件，聚合成 ``AgentResponse``。
+    """Subscribe to all ``EventBus`` events and aggregate them into an ``AgentResponse``.
 
-    为什么是同步回调：``AgentEngine.run()`` / ``stream()`` 通过 ``EventBus.emit_sync()``
-    派发事件，同步回调会被立即执行；异步回调在存在运行中的事件循环时只会被
-    ``create_task`` 而不会被等待，聚合结果因此不可靠。``EventBus.emit()``（异步引擎）
-    同样兼容同步回调，所以本监听器对四种入口都有效。
+    Why a synchronous callback: ``AgentEngine.run()`` / ``stream()`` dispatch events through
+    ``EventBus.emit_sync()``, so synchronous callbacks run immediately; an asynchronous callback would
+    merely be ``create_task``-ed (not awaited) when there is a running event loop, making the
+    aggregation result unreliable. ``EventBus.emit()`` (the async engine) also supports synchronous
+    callbacks, so this listener works for all four entry points.
 
-    事件到响应的映射：
+    Event-to-response mapping:
 
     ============================  =================================================
-    事件                            聚合内容
+    Event                         Aggregated content
     ============================  =================================================
-    ``message_update``             text_delta -> 正文增量；reasoning_delta -> 思维链
-    ``tool_execution_start``       记录一次工具调用（id / name / args）
-    ``tool_execution_update``      记录工具执行中的 partial_result
-    ``tool_execution_end``         记录工具结果与 is_error
-    ``message_end``                兜底记录最终 assistant 消息（run 模式无增量）
-    ``turn_end``                   结束当前 turn，并把该 turn 的正文定为最终回答
-    ``agent_end``                  兜底：从 messages 里取最后一个 assistant 文本
+    ``message_update``             text_delta -> text delta; reasoning_delta -> reasoning
+    ``tool_execution_start``       record one tool call (id / name / args)
+    ``tool_execution_update``      record the partial_result during tool execution
+    ``tool_execution_end``         record the tool result and is_error
+    ``message_end``                fallback record of the final assistant message (no delta in run mode)
+    ``turn_end``                   end the current turn and set that turn's text as the final answer
+    ``agent_end``                  fallback: take the last assistant text from messages
     ============================  =================================================
     """
 
@@ -841,11 +889,11 @@ class ResponseCollector(AgentEventListener):
         self.reset()
 
     # ------------------------------------------------------------------
-    # 生命周期
+    # Lifecycle
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        """清空一次请求的聚合状态（每次 ``send()`` 前调用）。"""
+        """Clear the aggregation state of one request (called before each ``send()``)."""
         self._turn_text: list[str] = []
         self._turn_reasoning: list[str] = []
         self._streamed_text: list[str] = []
@@ -857,7 +905,7 @@ class ResponseCollector(AgentEventListener):
         self.result = None
 
     def attach(self, bus: EventBus) -> list[Callable[[], None]]:
-        """注册为总线监听器，返回可用于取消订阅的回调列表。"""
+        """Register as a bus listener; return the list of callbacks usable to unsubscribe."""
         self.detach()
         self._unsubscribe.append(bus.add_listener(self))
         return list(self._unsubscribe)
@@ -868,7 +916,7 @@ class ResponseCollector(AgentEventListener):
         self._unsubscribe.clear()
 
     # ------------------------------------------------------------------
-    # 结果读取
+    # Reading results
     # ------------------------------------------------------------------
 
     @property
@@ -908,7 +956,7 @@ class ResponseCollector(AgentEventListener):
         usage: dict[str, int] | None = None,
         result: AgentResult | None = None,
     ) -> AgentResponse:
-        """生成不可变的响应快照，供调用方读取或序列化。"""
+        """Produce an immutable response snapshot for the caller to read or serialize."""
         collected = result if result is not None else self.result
         resolved_usage = dict(usage or (collected.usage if collected is not None else {}))
         return AgentResponse(
@@ -925,11 +973,11 @@ class ResponseCollector(AgentEventListener):
 
 
     # ------------------------------------------------------------------
-    # AgentEventListener 接口
+    # AgentEventListener interface
     # ------------------------------------------------------------------
 
     def on_event(self, event: AgentEvent) -> None:  # type: ignore[override]
-        """同步接收全部事件；分派规则见类文档字符串。"""
+        """Receive all events synchronously; see the class docstring for the dispatch rules."""
         event_type = event.get("type") if isinstance(event, dict) else None
 
         if self.keep_events:
@@ -954,7 +1002,7 @@ class ResponseCollector(AgentEventListener):
             self._on_tool_end(event)
 
     # ------------------------------------------------------------------
-    # 事件处理细节
+    # Event handling details
     # ------------------------------------------------------------------
 
     def _on_message_update(self, event: AgentEvent) -> None:
@@ -968,7 +1016,7 @@ class ResponseCollector(AgentEventListener):
             self._turn_text.append(text)
             self._streamed_text.append(text)
         else:
-            # 兜底：没有 assistant_message_event 时从 message 里解析增量。
+            # Fallback: parse the delta from message when there is no assistant_message_event.
             message = _assistant_from(event.get("message"))
             if message is not None and message.reasoning_content:
                 self._turn_reasoning.append(message.reasoning_content)
@@ -977,12 +1025,12 @@ class ResponseCollector(AgentEventListener):
                 self._streamed_text.append(message.content)
 
     def _on_turn_end(self, event: AgentEvent) -> None:
-        # 该 turn 有流式增量时，以增量拼出的文本作为最终回答。
+        # When this turn has streaming deltas, use the text assembled from the deltas as the final answer.
         if self._turn_text:
             self._final_text = "".join(self._turn_text)
         if self._turn_reasoning:
             self._final_reasoning = "".join(self._turn_reasoning)
-        # 没有增量（run 模式）时，用 turn_end 携带的 assistant 消息兜底。
+        # When there are no deltas (run mode), fall back to the assistant message carried by turn_end.
         self._capture_final(event.get("message"))
         self._record_message_tool_results(event.get("tool_results") or [])
         self._turn_text.clear()
@@ -998,7 +1046,7 @@ class ResponseCollector(AgentEventListener):
             self._final_reasoning = assistant.reasoning_content
 
     def _on_agent_end(self, event: AgentEvent) -> None:
-        # 兜底：messages 是完整执行上下文，最后一个 assistant 文本即最终回答。
+        # Fallback: messages is the full execution context; the last assistant text is the final answer.
         for message in reversed(event.get("messages") or []):
             assistant = _assistant_from(message)
             if assistant is not None and assistant.content:
@@ -1049,58 +1097,70 @@ class ResponseCollector(AgentEventListener):
 
 
 # ----------------------------------------------------------------------
-# Agent 门面：初始化 / 注册 / 用户消息入口 / 事件响应
+# Agent facade: initialization / registration / user message entry / event handling
 # ----------------------------------------------------------------------
 
 
 class AgentRunner:
-    """CLI / TUI / Web 等宿主程序访问 Agent 的统一入口。
+    """The uniform entry point for hosts such as CLI / TUI / Web to access the Agent.
 
-    构造时一次性完成四件事：
+    Construction does four things at once:
 
-    1. **Agent 初始化**：``config.yaml`` -> ``ConfigStore`` -> ``LLMConfig`` -> ``LLMClient``；
-       也可以直接注入 ``client`` / ``llm_config``（便于测试或宿主程序复用连接）。
-    2. **上下文存储**：``ContextStore`` 保存 ``Session``（消息 + 工作区 + 工具/Skill 配置 +
-       token 用量）。**构造过程主动查找会话，但不载入内容、不创建文件**：
+    1. **Agent initialization**: ``config.yaml`` -> ``ConfigStore`` -> ``LLMConfig`` ->
+       ``LLMClient``; you can also inject ``client`` / ``llm_config`` directly (convenient for tests
+       or for a host to reuse a connection).
+    2. **Context storage**: ``ContextStore`` holds a ``Session`` (messages + workspace + Tool/Skill
+       config + token usage). **Construction actively searches for a session but does not load
+       content or create files**:
 
-       - 查找优先级：显式 ``session_id`` / ``context_path`` > 按 ``session_priority``
-         查找（**默认工作区优先**，工作区里没有才回退用户主目录；回退时比对文件里记录的
-         ``workspace``，不是当前工作区的会话视为未命中）> 新的 ``uuid4``；命中的文件记入
-         ``found_context_path``；
-       - 继续已有会话要**显式**调用 ``load_session()``（或 ``load_context(path)``）；
-         ``has_unloaded_session`` 为真时发送 / 落盘会先报错，避免覆盖既有历史；
-       - 开始新对话要**显式**调用 ``create_context()``：未指定 ``session_id`` 时每次都会
-         生成新的 ``uuid4``，因此不会覆盖 / 重置其它会话；
-       - 落盘通过 ``save_context()``，或 ``close()``（仅当本次确实有改动时）完成，一式两份
-         写入用户主目录与工作区下的 ``.agent/sessions/<session_id>.json``。
-       - 列出全部会话用 ``list_sessions()``：只读摘要（``SessionInfo``：id / 文件路径 /
-         位置 / 时间 / 消息数 / 轮数 / usage / 元数据），不载入内容、不创建文件。
+       - Search priority: explicit ``session_id`` / ``context_path`` > search by
+         ``session_priority`` (**workspace first by default**; only when the workspace has none does
+         it fall back to the user home directory, comparing the ``workspace`` recorded in the file
+         and treating a session from another workspace as a miss) > a new ``uuid4``; a hit is
+         recorded in ``found_context_path``;
+       - Continuing an existing session requires **explicitly** calling ``load_session()`` (or
+         ``load_context(path)``); while ``has_unloaded_session`` is true, sending / persisting errors
+         out first to avoid overwriting existing history;
+       - Starting a new conversation requires **explicitly** calling ``create_context()``: when
+         ``session_id`` is not specified it generates a new ``uuid4`` every time, so it never
+         overwrites / resets other sessions;
+       - Persisting happens via ``save_context()``, or ``close()`` (only when this round really
+         changed something), writing two copies to the user home directory and the workspace at
+         ``.agent/sessions/<session_id>.json``.
+       - Listing all sessions uses ``list_sessions()``: read-only summaries (``SessionInfo``: id /
+         file path / location / time / message count / round count / usage / metadata) without
+         loading content or creating files.
 
-    3. **Tool 注册**：内置 ``read_file`` / ``list_files`` / ``write_file``（可选 ``bash``）
-       注册进 ``ToolRegistry``，并通过 ``extra_tools`` 扩展；``requires_approval=True``
-       的工具（``bash``）在 ``ToolRegistry`` 里通过会话的 ``approve`` 回调授权 ——
-       本类总会传入一个回调（``create_approve_callback()``），``auto_approve=True`` 时
-       回调直接返回 ``True``（不提示、不询问），否则提示风险并询问用户确认。
-    4. **Skill 注册**：``SkillRegistry`` 发现 SKILL.md -> 写入 ``session.skills`` ->
-       注册 ``load_skill`` / ``load_reference`` 工具 -> 索引注入 system prompt。
-    5. **默认系统提示词**：``use_default_system_prompt=True`` 时用 ``linteum_agent.prompt``
-       的默认模板渲染系统提示词（预填充工具清单 / Skill 清单 / 用户系统环境）并注入；
-       此时不再重复注入 Skill 索引（模板里已含 Skill 清单）。
+    3. **Tool registration**: the built-in ``read_file`` / ``list_files`` / ``write_file``
+       (optionally ``bash``) are registered into the ``ToolRegistry`` and extended via
+       ``extra_tools``; tools with ``requires_approval=True`` (``bash``) are approved in the
+       ``ToolRegistry`` through the session's ``approve`` callback -- this class always passes a
+       callback (``create_approve_callback()``); when ``auto_approve=True`` the callback returns
+       ``True`` directly (no notice, no prompt), otherwise it shows the risk and asks the user to
+       confirm.
+    4. **Skill registration**: ``SkillRegistry`` discovers SKILL.md -> writes to ``session.skills``
+       -> registers the ``load_skill`` / ``load_reference`` tools -> injects the index into the
+       system prompt.
+    5. **Default system prompt**: when ``use_default_system_prompt=True`` the default template of
+       ``linteum_agent.prompt`` renders the system prompt (pre-filled with the tool list / Skill
+       list / user system environment) and injects it; the Skill index is then no longer injected
+       separately (the template already contains the Skill list).
 
-    随后用 ``send()`` / ``asend()`` 发送用户消息，用 ``stream()`` / ``astream()`` 流式消费；
-    响应内容由 ``ResponseCollector`` 从 ``EventBus`` 事件里聚合，读取 ``response.text`` 即可。
-    输入输出完全由宿主决定，本类不做任何 CLI 假设。
+    Afterwards send user messages with ``send()`` / ``asend()`` and consume them in a streaming way
+    with ``stream()`` / ``astream()``; the response is aggregated by ``ResponseCollector`` from the
+    ``EventBus`` events, so just read ``response.text``. Input and output are entirely up to the
+    host; this class makes no CLI assumptions.
     """
 
     def __init__(
         self,
         *,
-        # --- Agent 初始化 ---
+        # --- Agent initialization ---
         client: Any | None = None,
         llm_config: LLMConfig | None = None,
         config_store: ConfigStore | None = None,
         config_path: str | Path | None = None,
-        # --- 会话 / 上下文存储 ---
+        # --- session / context storage ---
         session_id: str | None = None,
         workspace: str | Path | None = None,
         store: ContextStore | None = None,
@@ -1110,26 +1170,26 @@ class AgentRunner:
         project_dir: str | Path | None = None,
         session_dirname: str | Path = DEFAULT_SESSION_DIRNAME,
         context_path: str | Path | None = None,
-        # --- system prompt / 额外上下文 ---
+        # --- system prompt / extra context ---
         system_prompt: MessageInputs | str | None = None,
         context: MessageInputs | None = None,
-        # 启用后用默认模板（预填充工具清单 / Skill 清单 / 用户环境）作为系统提示词。
+        # When enabled, use the default template (pre-filled tool list / Skill list / user environment) as the system prompt.
         use_default_system_prompt: bool = True,
-        # --- Tool 注册 ---
+        # --- Tool registration ---
         include_builtin_tools: bool = True,
         enable_bash: bool = False,
         bash_timeout: float = 30.0,
         extra_tools: Iterable[Tool] = (),
         tool_enabled: Iterable[str] | None = None,
         tool_disabled: Iterable[str] | None = None,
-        # --- 工具授权（requires_approval，例如 bash）---
+        # --- tool approval (requires_approval, e.g. bash) ---
         auto_approve: bool = False,
-        # --- Skill 注册 ---
+        # --- Skill registration ---
         enable_skills: bool = True,
         skill_tools: bool = True,
         system_skill_dirs: Iterable[str | Path] | None = None,
         project_skill_dirs: Iterable[str | Path] | None = None,
-        # --- 引擎 / 事件 ---
+        # --- engine / events ---
         max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
         events_bus: EventBus | None = None,
         keep_events: bool = True,
@@ -1141,38 +1201,40 @@ class AgentRunner:
         )
         self.persist = persist
         self.reuse_existing = reuse_existing
-        # 会话查找优先级：默认工作区优先（workspace -> project）。
+        # Session lookup priority: workspace first by default (workspace -> project).
         self.session_priority = _normalize_session_priority(session_priority)
         self.project_dir = (
             Path(project_dir).expanduser() if project_dir is not None else default_session_root()
         )
         self.session_dirname = Path(session_dirname)
-        # 显式单文件路径：给定后只读写这一份，不再一式两份。
+        # Explicit single-file path: once given, only this one is read/written instead of two copies.
         self.context_path = (
             Path(context_path).expanduser() if context_path is not None else None
         )
         self.save_on_close = save_on_close
         self.loaded_context_paths: list[Path] = []
         self.saved_context_paths: list[Path] = []
-        # 是否有未落盘的改动（决定 close() 是否写文件）。
+        # Whether there are unsaved changes (decides whether close() writes files).
         self._dirty = False
-        # 构造阶段主动查找到的上下文文件（None = 没有查到，按新会话处理）。
+        # The context file actively found during construction (None = nothing found, treat as a new session).
         self.found_context_path: Path | None = None
-        # 「已绑定到磁盘上的既有会话、但尚未显式载入」时记录其路径：此时发送 / 落盘会
-        # 覆盖既有历史，因此由 _begin_turn() / save_context() 兜底拦截。
+        # Records the path when "bound to an existing session on disk but not yet explicitly loaded":
+        # in that case sending / persisting would overwrite existing history, so _begin_turn() /
+        # save_context() guard against it.
         self._unloaded_session_file: Path | None = None
-        # 本实例的会话 ID：显式传入则沿用；否则先放 uuid4，随后由 _lookup_session() 决定
-        # （查找到工作区既有会话时会改写成该会话的 ID）。
+        # This instance's session ID: use the explicitly passed one; otherwise start with a uuid4 and
+        # let _lookup_session() decide (it is rewritten to the found workspace session's ID).
         self.session_id = str(session_id) if session_id is not None else new_session_id()
 
-        # 工具授权回调：requires_approval=True 的工具（如 bash）执行前会经它确认。
-        # auto_approve=True 时回调直接返回 True（不提示风险、不询问用户）；否则提示风险
-        # 并询问用户确认。无论哪种模式都会把回调绑定到会话（ToolRegistry 读取
-        # session.approve），因此不会留空导致 PermissionError。
+        # Tool approval callback: tools with requires_approval=True (such as bash) go through it before
+        # execution. When auto_approve=True the callback returns True directly (no risk notice, no user
+        # prompt); otherwise it shows the risk and asks the user to confirm. Either way the callback is
+        # bound to the session (ToolRegistry reads session.approve), so it never stays empty and causes
+        # a PermissionError.
         self.auto_approve = bool(auto_approve)
         self.approve: ApproveFn = create_approve_callback(auto_approve=self.auto_approve)
 
-        # 1) Agent 初始化：注入的 client 优先，其次显式 llm_config，最后读配置文件。
+        # 1) Agent initialization: an injected client wins, then an explicit llm_config, finally the config file.
         self.config_store = config_store
         self.llm_config = llm_config
         if client is not None:
@@ -1186,32 +1248,33 @@ class AgentRunner:
                 self.llm_config = self.config_store.load(create=False).llm
             self.client = LLMClient(self.llm_config)
 
-        # 2) 会话 / 上下文存储：构造阶段**主动查找**会话（决定 session_id 与文件位置），
-        #    但**不载入内容、不创建文件**；载入必须显式调用 load_session()。
+        # 2) Session / context storage: construction **actively searches** for a session (deciding the
+        #    session_id and file location) but does **not load content or create files**; loading
+        #    requires an explicit call to load_session().
         self.store = store or ContextStore(workspace=self.workspace)
         if self.store.default_workspace is None:
             self.store.default_workspace = self.workspace
         self._lookup_session(session_id)
         self.session = self.store.ensure_session(self.session_id, workspace=self.workspace)
-        # 把授权回调绑定到会话：ToolRegistry 通过 session.approve 读取它。
+        # Bind the approval callback to the session: ToolRegistry reads it through session.approve.
         self.session.approve = self.approve
         if tool_enabled is not None or tool_disabled is not None:
             self.session.configure_tools(enabled=tool_enabled, disabled=tool_disabled)
         self.saved_context_paths = list(self.loaded_context_paths)
 
-        # 3) 事件：先建总线并挂上聚合监听器，后续注册动作也可被监听。
+        # 3) Events: build the bus first and attach the aggregating listener; later registration actions can also be observed.
         self.events_bus = events_bus or EventBus()
         self.collector = ResponseCollector(keep_events=keep_events)
         self.collector.attach(self.events_bus)
 
-        # 4) Skill 注册 -> 得到可注入 system prompt 的索引。
+        # 4) Skill registration -> get the index injectable into the system prompt.
         self.skill_index = self._register_skills(
             enable_skills=enable_skills,
             system_skill_dirs=system_skill_dirs,
             project_skill_dirs=project_skill_dirs,
         )
 
-        # 5) Tool 注册（含 Skill 工具）；授权回调同样传给 ToolRegistry。
+        # 5) Tool registration (including Skill tools); the approval callback is likewise passed to ToolRegistry.
         self.registry = self._register_tools(
             include_builtin_tools=include_builtin_tools,
             enable_bash=enable_bash,
@@ -1221,13 +1284,13 @@ class AgentRunner:
             approve=self.approve,
         )
 
-        # 6) 默认系统提示词（可选）：用默认模板预填充工具 / Skill / 用户环境。
+        # 6) Default system prompt (optional): pre-fill tools / Skills / user environment with the default template.
         self.use_default_system_prompt = use_default_system_prompt
         self.default_system_prompt = (
             self.build_default_system_prompt() if use_default_system_prompt else ""
         )
 
-        # 7) 中间件 + 引擎。
+        # 7) Middleware + engine.
         self.middleware = ContextMiddleware(
             self.client,
             self.store,
@@ -1247,27 +1310,32 @@ class AgentRunner:
         self._last_result: AgentResult | None = None
 
     # ------------------------------------------------------------------
-    # 会话查找（构造时主动调用）与载入（显式）
+    # Session lookup (called actively during construction) and loading (explicit)
     # ------------------------------------------------------------------
 
     def _lookup_session(self, session_id: str | None) -> None:
-        """**主动查找**会话：决定 ``session_id`` 并记录 ``found_context_path``。
+        """**Actively search** for a session: decide ``session_id`` and record ``found_context_path``.
 
-        只做只读查找（最多读一次既有 JSON 以确认其中的会话 ID），
-        **不会把内容载入 store，也不会创建任何文件**。解析顺序：
+        Only a read-only search is performed (at most one read of an existing JSON to confirm the
+        session ID inside it); it **never loads content into the store, nor creates any file**.
+        Resolution order:
 
-        1. 显式 ``session_id``：直接使用，并记录它已存在的副本（若有）；
-        2. ``persist=False``：完全不碰磁盘，使用新的 uuid4；
-        3. 显式 ``context_path``：存在则用该文件里的会话 ID，否则新建 uuid4；
-        4. 注入的 ``store`` 里已有会话：用第一个（内容已在内存里）；
-        5. ``reuse_existing=False``：不查找，直接用新的 uuid4；
-        6. 否则按 ``session_priority`` 查找（**默认工作区优先**；回退用户级时比对文件里记录的
-           工作区，不是当前工作区的会话视为未命中），命中则用其中的会话；
-        7. 都没命中：使用新的 uuid4。
+        1. Explicit ``session_id``: use it directly and record its existing copies (if any);
+        2. ``persist=False``: never touch the disk, use a new uuid4;
+        3. Explicit ``context_path``: if it exists use the session ID in that file, otherwise create
+           a new uuid4;
+        4. The injected ``store`` already has sessions: use the first one (content is already in
+           memory);
+        5. ``reuse_existing=False``: do not search, use a new uuid4 directly;
+        6. Otherwise search by ``session_priority`` (**workspace first by default**; when falling back
+           to the user level, compare the workspace recorded in the file and treat a session from
+           another workspace as a miss); on a hit use that session;
+        7. On no hit: use a new uuid4.
 
-        第 1/3/6 种情况命中的文件会记到 ``_unloaded_session_file``：此时 runner 已绑定该
-        会话但内容还没载入，必须先 ``load_session()``（继续）或 ``create_context()``
-        （新建）再发送消息，避免覆盖既有历史。
+        A hit in case 1/3/6 is recorded in ``_unloaded_session_file``: the runner is then bound to
+        that session but the content is not loaded yet, so ``load_session()`` (continue) or
+        ``create_context()`` (start fresh) must be called before sending messages, to avoid
+        overwriting existing history.
         """
         if session_id is not None:
             self.session_id = str(session_id)
@@ -1288,7 +1356,7 @@ class AgentRunner:
 
         existing = self.store.sessions()
         if existing:
-            # 注入的 store 里已有会话：内容已在内存中，不需要再"载入"。
+            # The injected store already has sessions: content is already in memory, no need to "load".
             self.session_id = str(existing[0])
             return
 
@@ -1305,15 +1373,15 @@ class AgentRunner:
         self._bind_found(found)
 
     def _bind_found(self, path: Path | None) -> None:
-        """记录「查找到的上下文文件」，并标记其内容尚未载入。"""
+        """Record "the found context file" and mark its content as not yet loaded."""
         self.found_context_path = path
         self._unloaded_session_file = path
 
     def _find_session_path(self, session_id: str) -> Path | None:
-        """返回该会话已存在的上下文文件（按 ``session_priority``：默认工作区优先）。
+        """Return the existing context file of this session (by ``session_priority``: workspace first by default).
 
-        回退到用户主目录时会比对文件里记录的 ``workspace``（见
-        ``context_matches_workspace()``）：不是当前工作区的会话不返回。
+        When falling back to the user home directory it compares the ``workspace`` recorded in the
+        file (see ``context_matches_workspace()``): a session from another workspace is not returned.
         """
         if self.context_path is not None:
             return self.context_path if self.context_path.is_file() else None
@@ -1328,12 +1396,12 @@ class AgentRunner:
 
     @property
     def has_unloaded_session(self) -> bool:
-        """是否「已绑定到既有会话文件、但其内容尚未显式载入」。
+        """Whether it is "bound to an existing session file but its content is not explicitly loaded yet".
 
-        为 ``True`` 时发送消息或落盘都会覆盖该会话的既有历史，因此
-        ``send()`` / ``stream()`` / ``save_context()`` 会先抛出 ``RuntimeError``，
-        要求调用方显式选择：``load_session()``（继续该会话）或 ``create_context()``
-        （开始新对话）。
+        When ``True``, sending a message or persisting would overwrite that session's existing
+        history, so ``send()`` / ``stream()`` / ``save_context()`` raise ``RuntimeError`` first,
+        requiring the caller to choose explicitly: ``load_session()`` (continue that session) or
+        ``create_context()`` (start a new conversation).
         """
         return self._unloaded_session_file is not None
 
@@ -1347,22 +1415,26 @@ class AgentRunner:
         path: str | Path | None = None,
         reuse_existing: bool | None = None,
     ) -> list[Path]:
-        """**显式**载入会话并切换过去（构造时只查找、不调用本方法）。
+        """**Explicitly** load a session and switch to it (construction only searches, never calls this method).
 
-        解析顺序：
+        Resolution order:
 
-        1. ``path``：只载入该文件；文件不存在时返回 ``[]``（不创建文件）；
-        2. ``session_id``：在该会话的两份副本中按 ``session_priority`` 载入**优先级最高**
-           的那一份（默认工作区副本）；没有副本时返回 ``[]``，但仍把 runner 切到该会话
-           （保持空历史，绝不写盘）；
-        3. 都不给：``reuse_existing``（默认取构造参数）为 ``True`` 时，优先载入构造时
-           查到的会话（``found_context_path``）；没有则按 ``session_priority`` 查找一份
-           并载入（可能切换会话）；为 ``False`` 时不做任何查找。
+        1. ``path``: load only that file; return ``[]`` when the file does not exist (does not create
+           a file);
+        2. ``session_id``: among the session's two copies, load the **highest-priority** one by
+           ``session_priority`` (the workspace copy by default); when there is no copy, return ``[]``
+           but still switch the runner to that session (keeping an empty history, never writing to
+           disk);
+        3. Neither given: when ``reuse_existing`` (defaulting to the construction argument) is
+           ``True``, prefer loading the session found during construction (``found_context_path``);
+           otherwise search and load one by ``session_priority`` (which may switch sessions); when
+           ``False``, do no searching.
 
-        - ``persist=False`` 时不做磁盘载入，直接返回 ``[]``；
-        - 载入成功后清除 ``has_unloaded_session``；
-        - 载入后会把工具注册表重新绑定到载入的 ``Session``（``store.load`` 会重建会话）；
-        - 返回实际载入的文件路径列表（``[]`` 表示没有载入任何文件）。
+        - When ``persist=False``, do no disk loading and return ``[]`` directly;
+        - After a successful load, clear ``has_unloaded_session``;
+        - After loading, rebind the tool registry to the loaded ``Session`` (``store.load`` rebuilds
+          the session);
+        - Return the list of file paths actually loaded (``[]`` means no file was loaded).
         """
         if not self.persist:
             return []
@@ -1385,12 +1457,12 @@ class AgentRunner:
             self.session_id = str(session_id)
             target = self._find_session_path(self.session_id)
             if target is None:
-                # 没有副本：切到该会话但保持空历史，绝不写盘。
+                # No copy: switch to that session but keep an empty history, never write to disk.
                 self.loaded_context_paths = []
                 self._clear_unloaded_session()
                 self._rebind_session()
                 return []
-            # 优先级最高的一份（默认工作区副本），而不是单纯按 mtime 取最新。
+            # The highest-priority copy (the workspace copy by default), not simply the newest by mtime.
             self.store.load(target, merge=True)
             self.found_context_path = target
             self.loaded_context_paths = [target]
@@ -1401,7 +1473,7 @@ class AgentRunner:
         if not reuse:
             return []
 
-        # 构造时已查到某个会话：优先载入它（“继续构造时发现的会话”），不切换到别的会话。
+        # A session was already found during construction: prefer loading it ("continue the session found during construction"), without switching to another session.
         pinned = self.found_context_path
         if pinned is not None and pinned.is_file():
             self.store.load(pinned, merge=True)
@@ -1424,7 +1496,7 @@ class AgentRunner:
 
     @staticmethod
     def _session_ids_in(path: Path) -> list[str]:
-        """读上下文文件里的会话 ID 列表（只读；文件损坏 / 旧格式时返回空列表）。"""
+        """Read the list of session IDs in a context file (read-only; returns an empty list on a corrupt file / old format)."""
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1435,10 +1507,11 @@ class AgentRunner:
         return []
 
     def _loaded_session_id(self, path: Path) -> str:
-        """决定刚载入文件对应的会话 ID。
+        """Decide the session ID corresponding to the just-loaded file.
 
-        约定 ``<session_id>.json`` 的文件名即会话 ID；文件名不是会话 ID 时（例如
-        显式传入的 ``context.json``）取文件里的第一个会话，最后才回退到文件名。
+        By convention the file name ``<session_id>.json`` is the session ID; when the file name is
+        not a session ID (for example an explicitly passed ``context.json``), take the first session
+        in the file, and only fall back to the file name last.
         """
         ids = self._session_ids_in(path)
         stem = Path(path).stem
@@ -1447,12 +1520,13 @@ class AgentRunner:
         return ids[0] if ids else stem
 
     def _rebind_session(self) -> None:
-        """把当前会话对象与工具注册表重新绑定。
+        """Rebind the current session object and the tool registry.
 
-        ``store.load()`` 会重建 ``Session`` 对象，因此每次载入 / 创建上下文后都要
-        重新取一次 ``ensure_session()`` 并 ``bind_session()``，否则工具仍指向旧会话。
-        重建的会话还要重新绑定授权回调（``session.approve``），否则 ``bash`` 等
-        ``requires_approval`` 工具会因缺少 ``approve`` 而报 ``PermissionError``。
+        ``store.load()`` rebuilds the ``Session`` object, so after every context load / create you
+        must call ``ensure_session()`` and ``bind_session()`` again, otherwise the tools still point
+        to the old session. The rebuilt session must also rebind the approval callback
+        (``session.approve``), otherwise ``requires_approval`` tools such as ``bash`` raise
+        ``PermissionError`` due to the missing ``approve``.
         """
         self.session = self.store.ensure_session(self.session_id, workspace=self.workspace)
         self.session.approve = self.approve
@@ -1462,7 +1536,7 @@ class AgentRunner:
 
 
     # ------------------------------------------------------------------
-    # 注册实现
+    # Registration implementation
     # ------------------------------------------------------------------
 
     def _register_skills(
@@ -1472,11 +1546,12 @@ class AgentRunner:
         system_skill_dirs: Iterable[str | Path] | None,
         project_skill_dirs: Iterable[str | Path] | None,
     ) -> str:
-        """发现并注册 Skill，返回可注入 system prompt 的 Skill 索引。
+        """Discover and register Skills; return the Skill index injectable into the system prompt.
 
-        - 默认系统目录：``~/.agent/skills``；
-        - 默认项目目录：``<workspace>/.agent/skills``；
-        - 目录不存在时 ``discover()`` 会跳过，因此没有 Skill 也不会报错。
+        - Default system directory: ``~/.agent/skills``;
+        - Default project directory: ``<workspace>/.agent/skills``;
+        - When a directory does not exist, ``discover()`` skips it, so no error occurs when there are
+          no Skills.
         """
         self.skill_registry: SkillRegistry | None = None
         if not enable_skills:
@@ -1513,10 +1588,10 @@ class AgentRunner:
         skill_tools: bool,
         approve: ApproveFn | None = None,
     ) -> ToolRegistry:
-        """把内置工具、Skill 工具与扩展工具统一注册到 ``ToolRegistry``。
+        """Register the built-in tools, Skill tools, and extra tools uniformly into the ``ToolRegistry``.
 
-        ``approve`` 一并传给 ``ToolRegistry``（写入 ``session.approve``），
-        ``requires_approval=True`` 的工具执行前会调用它做授权确认。
+        ``approve`` is passed to the ``ToolRegistry`` as well (written into ``session.approve``);
+        tools with ``requires_approval=True`` call it for approval confirmation before execution.
         """
         if include_builtin_tools:
             registry = create_builtin_tools(
@@ -1536,17 +1611,18 @@ class AgentRunner:
 
         for tool in extra_tools or ():
             if registry.get(tool.name) is not None:
-                raise ValueError(f"重复注册工具: {tool.name}")
+                raise ValueError(f"duplicate tool registration: {tool.name}")
             registry.register(tool)
 
         self.session.register_tools(registry.all())
         return registry
 
     def build_default_system_prompt(self) -> str:
-        """用默认模板渲染系统提示词（工具清单 + Skill 清单 + 用户系统环境）。
+        """Render the system prompt with the default template (tool list + Skill list + user system environment).
 
-        与构造参数 ``use_default_system_prompt`` 配合：启用时构造阶段即渲染一份并注入
-        （见 ``self.default_system_prompt``）；未启用时也可调用本方法按需预览。
+        Works with the construction argument ``use_default_system_prompt``: when enabled, one is
+        rendered and injected during construction (see ``self.default_system_prompt``); when disabled
+        this method can still be called to preview on demand.
         """
         return _build_default_system_prompt(tools=self.registry, skills=self.skill_registry)
 
@@ -1557,13 +1633,14 @@ class AgentRunner:
         skill_index: str,
         default_system_prompt: str = "",
     ) -> list[MessageInput]:
-        """组装注入到 ``ContextMiddleware`` 的静态上下文。
+        """Assemble the static context injected into ``ContextMiddleware``.
 
-        顺序：默认系统提示词 -> system prompt -> Skill 索引 -> 调用方额外上下文。中间件
-        会把它放在「持久化历史」之后、「当前请求」之前（见 ``ContextMiddleware._messages``）。
+        Order: default system prompt -> system prompt -> Skill index -> caller's extra context. The
+        middleware places it after "persisted history" and before "the current request" (see
+        ``ContextMiddleware._messages``).
 
-        ``default_system_prompt`` 非空（``use_default_system_prompt=True``）时它已包含
-        Skill 清单，因此不再单独注入 ``skill_index``，避免重复。
+        When ``default_system_prompt`` is non-empty (``use_default_system_prompt=True``) it already
+        contains the Skill list, so ``skill_index`` is not injected separately, avoiding duplication.
         """
         items: list[MessageInput] = []
         if default_system_prompt:
@@ -1581,14 +1658,14 @@ class AgentRunner:
 
     @staticmethod
     def _as_prompt(message: MessageInputs | str) -> MessageInputs:
-        """字符串直接视为用户消息，其余类型原样交给引擎。"""
+        """A string is treated directly as a user message; other types are handed to the engine as is."""
         if isinstance(message, str):
             return UserPrompt(content=message)
         return message
 
 
     # ------------------------------------------------------------------
-    # 用户消息入口
+    # User message entry
     # ------------------------------------------------------------------
 
     def send(
@@ -1602,10 +1679,10 @@ class AgentRunner:
         max_tool_rounds: int | None = None,
         **kwargs: Any,
     ) -> AgentResponse:
-        """同步发送一条用户消息，返回事件聚合出的 ``AgentResponse``。
+        """Send a user message synchronously; return the ``AgentResponse`` aggregated from events.
 
-        ``message`` 可以是字符串（自动包成 ``UserPrompt``），也可以是任意
-        ``MessageInputs``；``kwargs`` 会透传给 ``AgentEngine.run()``（例如 ``tools``）。
+        ``message`` can be a string (automatically wrapped into a ``UserPrompt``) or any
+        ``MessageInputs``; ``kwargs`` are passed through to ``AgentEngine.run()`` (such as ``tools``).
         """
         resolved_session = session_id or self.session_id
         self._begin_turn()
@@ -1632,7 +1709,7 @@ class AgentRunner:
         max_tool_rounds: int | None = None,
         **kwargs: Any,
     ) -> AgentResponse:
-        """``send()`` 的异步版本（可执行异步工具）。"""
+        """Asynchronous version of ``send()`` (can execute asynchronous tools)."""
         resolved_session = session_id or self.session_id
         self._begin_turn()
         self._last_result = None
@@ -1659,10 +1736,10 @@ class AgentRunner:
         on_chunk: Callable[[AgentStreamChunk], None] | None = None,
         **kwargs: Any,
     ) -> Iterator[AgentStreamChunk]:
-        """流式发送用户消息；结束后用 ``response()`` 读取聚合结果。
+        """Send a user message in a streaming way; afterwards read the aggregated result with ``response()``.
 
-        ``message_update`` 事件会在迭代过程中通过 ``events_bus`` 派发；调用方既可以
-        监听事件做实时输出，也可以消费 ``AgentStreamChunk``。
+        ``message_update`` events are dispatched through ``events_bus`` during iteration; the caller
+        can either listen to events for real-time output or consume ``AgentStreamChunk``.
         """
         resolved_session = session_id or self.session_id
         self._begin_turn()
@@ -1694,7 +1771,7 @@ class AgentRunner:
         on_chunk: Callable[[AgentStreamChunk], None] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[AgentStreamChunk]:
-        """``stream()`` 的异步版本。"""
+        """Asynchronous version of ``stream()``."""
         resolved_session = session_id or self.session_id
         self._begin_turn()
         self._last_result = None
@@ -1719,23 +1796,25 @@ class AgentRunner:
         *,
         result: AgentResult | None = None,
     ) -> AgentResponse:
-        """读取最近一次请求的事件聚合结果。"""
+        """Read the event aggregation result of the most recent request."""
         return self._finish(session_id or self.session_id, result or self._last_result)
 
     def _begin_turn(self) -> None:
-        """开始一次用户请求：清空事件聚合，并标记「有改动」以便 ``close()`` 落盘。
+        """Begin a user request: clear the event aggregation and mark it "changed" so ``close()`` persists.
 
-        ``_dirty`` 是「是否需要在 ``close()`` 时写文件」的开关：仅构造 AgentRunner
-        不会把它置位，因此不会产生空的上下文 JSON。
+        ``_dirty`` is the switch for "whether ``close()`` needs to write files": merely constructing an
+        AgentRunner does not set it, so no empty context JSON is produced.
 
-        若构造时**查找到**了既有会话却还没显式载入（``has_unloaded_session``），这里会
-        先报错：直接发送会让模型在"空历史"上回答，并在落盘时覆盖该会话的既有内容。
+        If an existing session was **found** during construction but not yet explicitly loaded
+        (``has_unloaded_session``), this errors out first: sending directly would make the model answer
+        on an "empty history" and overwrite the session's existing content when persisting.
         """
         if self.has_unloaded_session:
             raise RuntimeError(
-                f"会话 {self.session_id} 在磁盘上已有上下文（{self._unloaded_session_file}）"
-                "但尚未载入：请先 load_session() 继续该会话，或 create_context() 开始新对话，"
-                "再发送消息（否则会覆盖既有历史）。"
+                f"Session {self.session_id} already has context on disk ({self._unloaded_session_file}) "
+                "but it is not loaded yet: call load_session() to continue that session, or "
+                "create_context() to start a new conversation, before sending messages (otherwise the "
+                "existing history would be overwritten)."
             )
         self.collector.reset()
         self._last_result = None
@@ -1753,27 +1832,27 @@ class AgentRunner:
 
 
     # ------------------------------------------------------------------
-    # 上下文 / 事件 / 生命周期
+    # Context / events / lifecycle
     # ------------------------------------------------------------------
 
     def get_context(self, session_id: str | None = None) -> list[Any]:
-        """返回会话消息历史（provider-neutral 的 ``Message`` 列表）。"""
+        """Return the session message history (a provider-neutral list of ``Message``)."""
         return self.engine.get_context(session_id or self.session_id)
 
     def get_session(self, session_id: str | None = None) -> Session | None:
-        """返回 ``Session``（工作区 + 消息 + 工具/Skill 配置 + usage）。"""
+        """Return the ``Session`` (workspace + messages + Tool/Skill config + usage)."""
         return self.engine.get_session(session_id or self.session_id)
 
     def get_session_usage(self, session_id: str | None = None) -> dict[str, int]:
-        """返回会话累计 token 用量。"""
+        """Return the session's cumulative token usage."""
         return self.engine.get_session_usage(session_id or self.session_id)
 
     def context_paths(self, session_id: str | None = None) -> list[Path]:
-        """返回该会话的上下文存储路径列表。
+        """Return the list of context storage paths of this session.
 
-        - 构造时给了 ``context_path``：只返回这一个文件；
-        - 否则：用户主目录 + 工作区两份 ``.agent/sessions/<session_id>.json``
-          （两个根目录相同时自动去重）。
+        - When ``context_path`` was given at construction: return only that one file;
+        - Otherwise: the user home directory + workspace copies of ``.agent/sessions/<session_id>.json``
+          (de-duplicated automatically when the two root directories are the same).
         """
         if self.context_path is not None:
             return [self.context_path]
@@ -1785,20 +1864,22 @@ class AgentRunner:
         )
 
     def save_context(self, path: str | Path | None = None) -> list[Path]:
-        """把上下文写入 JSON，返回实际写入的路径列表。
+        """Write the context to JSON; return the list of paths actually written.
 
-        默认一式两份（用户主目录 + 工作区，文件名即 UUID）；传入 ``path`` 时只写这一份。
-        某个位置不可写（例如只读仓库目录）时会跳过它，只要还有一份成功就返回成功列表；
-        全部失败才抛出异常。
+        By default two copies are written (user home directory + workspace, the file name being the
+        UUID); when ``path`` is passed only that one is written. A location that is not writable (for
+        example a read-only repository directory) is skipped, and the success list is returned as long
+        as one copy succeeds; only when all fail is an exception raised.
 
-        若构造时查找到的既有会话**尚未显式载入**（``has_unloaded_session``），这里会先
-        报错，避免用空历史覆盖该会话的既有内容（先 ``load_session()`` 或
-        ``create_context()``）。
+        If the existing session found during construction is **not yet explicitly loaded**
+        (``has_unloaded_session``), this errors out first to avoid overwriting that session's existing
+        content with an empty history (call ``load_session()`` or ``create_context()`` first).
         """
         if self.has_unloaded_session:
             raise RuntimeError(
-                f"会话 {self.session_id} 的既有上下文（{self._unloaded_session_file}）尚未载入："
-                "请先 load_session() 继续该会话，或 create_context() 开始新对话，再落盘。"
+                f"The existing context of session {self.session_id} ({self._unloaded_session_file}) is not loaded yet: "
+                "call load_session() to continue that session, or create_context() to start a new "
+                "conversation, before persisting."
             )
         targets = (
             [Path(path).expanduser()] if path is not None else self.context_paths()
@@ -1817,13 +1898,15 @@ class AgentRunner:
         return written
 
     def load_context(self, path: str | Path | None = None) -> list[Path]:
-        """从 JSON 载入上下文，返回实际载入的路径列表。
+        """Load the context from JSON; return the list of paths actually loaded.
 
-        - 传入 ``path``：只尝试该文件；
-        - 指定了 ``context_path``：只尝试那一份；
-        - 否则：在当前会话的两份副本中选**优先级最高**的一份（默认工作区副本）；
-        - 缺失则返回空列表（不会创建文件）；
-        - 载入成功后清除 ``has_unloaded_session``（内容已进内存，可安全落盘）。
+        - With ``path``: try only that file;
+        - With ``context_path`` specified: try only that copy;
+        - Otherwise: among the current session's two copies, choose the **highest-priority** one (the
+          workspace copy by default);
+        - If missing, return an empty list (does not create a file);
+        - After a successful load, clear ``has_unloaded_session`` (the content is now in memory and can
+          be persisted safely).
         """
         if path is not None:
             target = Path(path).expanduser()
@@ -1857,17 +1940,21 @@ class AgentRunner:
         *,
         priority: str | None = None,
     ) -> Path | None:
-        """查找已存在的上下文 JSON（只读，不创建任何文件）。
+        """Find an existing context JSON (read-only; does not create any file).
 
-        - ``session_id`` 给定时：只找该会话的两份副本，按 ``priority`` 返回优先级最高的；
-        - ``context_path`` 给定时：只检查该文件；
-        - 否则：**先扫工作区**，工作区里没有才回退用户主目录，返回优先级最高（默认工作区）、
-          其次最新的一份；
-        - 回退到用户主目录时比对文件里记录的 ``workspace``：与 ``self.workspace`` 不一致的
-          **不是**本次要查找的上下文（用户级是多个工作区共享的），直接返回 ``None``；
-        - 找不到返回 ``None``。
+        - With ``session_id``: find only that session's two copies and return the highest-priority one
+          by ``priority``;
+        - With ``context_path``: check only that file;
+        - Otherwise: **scan the workspace first**, falling back to the user home directory only when
+          the workspace has none, returning the highest-priority (default workspace) and then newest
+          copy;
+        - When falling back to the user home directory it compares the ``workspace`` recorded in the
+          file: one that does not match ``self.workspace`` is **not** the context being searched for
+          (the user level is shared by multiple workspaces), and ``None`` is returned directly;
+        - Return ``None`` when nothing is found.
 
-        ``priority`` 省略时使用构造参数 ``session_priority``（默认 ``"workspace"``）。
+        When ``priority`` is omitted, the construction argument ``session_priority`` (default
+        ``"workspace"``) is used.
         """
         resolved_priority = self.session_priority if priority is None else priority
         if session_id is not None:
@@ -1895,15 +1982,18 @@ class AgentRunner:
         dedupe: bool = True,
         priority: str | None = None,
     ) -> list[SessionInfo]:
-        """列出**全部会话**的只读摘要（模块级 ``list_sessions()`` 的便捷入口）。
+        """List a read-only summary of **all sessions** (a convenience entry point for module-level ``list_sessions()``).
 
-        列出工作区（默认还含用户主目录）下的每个会话：id / 文件路径 / 位置 / 时间 / 消息数 /
-        轮数 / usage / 元数据等（``SessionInfo``）。**只读**：不载入内容、不创建文件。
+        List every session under the workspace (by default including the user home directory): id /
+        file path / location / time / message count / round count / usage / metadata, etc.
+        (``SessionInfo``). **Read-only**: does not load content, does not create files.
 
-        - ``persist=False``：纯内存模式不读盘，直接返回 ``[]``；
-        - 构造时给了 ``context_path``：只列出该文件里的会话（``scope="context"``）；
-        - ``include_project`` / ``only_current_workspace`` / ``dedupe`` 语义见模块级
-          ``list_sessions()``；``priority`` 省略时用构造参数 ``session_priority``。
+        - ``persist=False``: pure in-memory mode does not read the disk and returns ``[]`` directly;
+        - When ``context_path`` was given at construction: list only the sessions in that file
+          (``scope="context"``);
+        - For the semantics of ``include_project`` / ``only_current_workspace`` / ``dedupe`` see the
+          module-level ``list_sessions()``; when ``priority`` is omitted the construction argument
+          ``session_priority`` is used.
         """
         if not self.persist:
             return []
@@ -1936,15 +2026,17 @@ class AgentRunner:
         metadata: dict[str, Any] | None = None,
         overwrite: bool = False,
     ) -> list[Path]:
-        """**主动**创建一份新的上下文 JSON 并切换过去，返回写入的路径列表。
+        """**Actively** create a new context JSON and switch to it; return the list of written paths.
 
-        这是「创建上下文 / 开始一段新对话」的唯一入口，构造 ``AgentRunner`` 不会创建文件。
+        This is the sole entry point for "creating context / starting a new conversation"; constructing
+        an ``AgentRunner`` never creates a file.
 
-        - ``session_id is None``（默认）：生成**新的** ``uuid4`` —— 每次调用都是一段全新
-          对话，绝不会复用 / 覆盖其它会话的 ``session_id``；
-        - 显式传入 ``session_id``：只创建（或写回）该会话的副本；``overwrite=False`` 时
-          已存在的文件保持原内容；
-        - 默认一式两份（用户主目录 + 工作区）；构造时给了 ``context_path`` 则只创建那一份。
+        - ``session_id is None`` (default): generate a **new** ``uuid4`` -- every call is a brand-new
+          conversation, never reusing / overwriting another session's ``session_id``;
+        - Explicitly passing ``session_id``: only create (or write back) that session's copy; with
+          ``overwrite=False`` an existing file keeps its original content;
+        - By default two copies (user home directory + workspace); when ``context_path`` was given at
+          construction only that one is created.
         """
         target_session = str(session_id) if session_id is not None else new_session_id()
         paths = create_context_json(
@@ -1966,31 +2058,31 @@ class AgentRunner:
         return paths
 
     def clear_context(self, session_id: str | None = None) -> None:
-        """清空会话历史（工具/Skill 配置与 usage 会随会话一起重建）。"""
+        """Clear the session history (Tool/Skill config and usage are rebuilt along with the session)."""
         self.middleware.clear_context(session_id or self.session_id)
 
     def on(self, event_type: str, handler: Callable[[AgentEvent], Any]) -> Callable[[], None]:
-        """订阅指定事件类型，返回取消订阅回调（转发到 ``EventBus.on``）。"""
+        """Subscribe to a specific event type; return an unsubscribe callback (forwarded to ``EventBus.on``)."""
         return self.events_bus.on(event_type, handler)
 
     def add_listener(self, listener: AgentEventListener) -> Callable[[], None]:
-        """订阅全部事件（转发到 ``EventBus.add_listener``）。"""
+        """Subscribe to all events (forwarded to ``EventBus.add_listener``)."""
         return self.events_bus.add_listener(listener)
 
     def tool_definitions(self) -> list[Any]:
-        """返回提供给 LLM 的工具定义（受会话 enable/disable 配置影响）。"""
+        """Return the tool definitions provided to the LLM (affected by the session's enable/disable config)."""
         return self.registry.definitions()
 
     def skill_names(self) -> list[str]:
-        """返回本会话生效的 Skill 名称。"""
+        """Return the names of the Skills in effect for this session."""
         return self.skill_registry.names() if self.skill_registry is not None else []
 
     def close(self) -> None:
-        """取消事件监听；仅在「本次有改动」时按配置落盘上下文，可重复调用。
+        """Cancel event listening; persist the context per config only when "this run changed something"; safe to call repeatedly.
 
-        落盘条件：``save_on_close=True`` + ``persist=True`` + ``self.dirty=True``
-        （发送过消息，或调用过 ``create_context()``）。因此只构造 AgentRunner 然后
-        ``close()`` 不会生成任何上下文 JSON。
+        Persist conditions: ``save_on_close=True`` + ``persist=True`` + ``self.dirty=True`` (a message
+        was sent, or ``create_context()`` was called). So merely constructing an AgentRunner and then
+        calling ``close()`` produces no context JSON.
         """
         if self.save_on_close and self.persist and self._dirty:
             self.saved_context_paths = self.save_context()
@@ -1999,7 +2091,7 @@ class AgentRunner:
 
     @property
     def dirty(self) -> bool:
-        """本次运行是否有未落盘的改动（决定 ``close()`` 是否写文件）。"""
+        """Whether this run has unsaved changes (decides whether ``close()`` writes files)."""
         return self._dirty
 
     def __enter__(self) -> "AgentRunner":
@@ -2010,15 +2102,15 @@ class AgentRunner:
 
 
 # ----------------------------------------------------------------------
-# 便捷入口
+# Convenience entry points
 # ----------------------------------------------------------------------
 
 
 def build_agent(**kwargs: Any) -> AgentRunner:
-    """``AgentRunner`` 的工厂函数（供 CLI / TUI / Web 等宿主复用）。
+    """Factory function for ``AgentRunner`` (for hosts such as CLI / TUI / Web to reuse).
 
-    等价于 ``AgentRunner(**kwargs)``；单独提供是为了让入口语义更清晰，也方便后续
-    在不改变调用方代码的前提下替换实现。
+    Equivalent to ``AgentRunner(**kwargs)``; provided separately both to make the entry point clearer
+    and to make it easy to swap the implementation later without changing caller code.
     """
     return AgentRunner(**kwargs)
 
@@ -2033,14 +2125,16 @@ def run_agent(
     load: bool = False,
     **kwargs: Any,
 ) -> AgentResponse:
-    """一次性入口：构造 Agent -> 发送消息 -> 返回事件聚合响应。
+    """One-shot entry point: build the Agent -> send a message -> return the event-aggregated response.
 
-    ``stream=True`` 时用流式引擎，并通过 ``on_delta`` 逐段回调正文增量；
-    ``close=True`` 时会调用 ``AgentRunner.close()``（按配置落盘上下文）。
+    With ``stream=True`` the streaming engine is used and ``on_delta`` is called back with the text
+    delta piece by piece; with ``close=True`` ``AgentRunner.close()`` is called (persisting the
+    context per config).
 
-    ``load=True`` 时在发送前**显式**载入会话：``session_id`` 给定时载入该会话，
-    否则按 ``reuse_existing`` / ``session_priority`` 查找已有上下文
-    （默认 ``load=False``：每次都是全新会话，不查找、不加载）。
+    With ``load=True`` the session is **explicitly** loaded before sending: when ``session_id`` is
+    given it loads that session, otherwise it searches for an existing context by
+    ``reuse_existing`` / ``session_priority`` (the default ``load=False`` means a brand-new session
+    every time, with no searching and no loading).
     """
     kwargs.setdefault("reuse_existing", load)
     runner = AgentRunner(session_id=session_id, **kwargs)

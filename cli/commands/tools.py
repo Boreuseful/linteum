@@ -1,4 +1,4 @@
-"""``linteum tools`` 的实现：列出内置工具（离线，不构造 Agent）。"""
+"""Implementation of ``linteum tools``: list built-in tools (offline, no Agent construction)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 def run_tools(args) -> int:
     if getattr(args, "tools_action", None) != "list":
-        print("用法：linteum tools list ...", file=sys.stderr)
+        print("Usage: linteum tools list ...", file=sys.stderr)
         return 2
 
     from linteum_agent.tools.builtin import create_builtin_tools
@@ -25,10 +25,10 @@ def run_tools(args) -> int:
         print(json.dumps(infos, ensure_ascii=False, indent=2, default=str))
         return 0
     if not infos:
-        print("（没有可用工具）")
+        print("(no tools available)")
         return 0
     for info in infos:
         state = "enabled " if info.get("enabled") else "disabled"
-        approval = " (需授权)" if info.get("requires_approval") else ""
+        approval = " (requires approval)" if info.get("requires_approval") else ""
         print(f"{info['name']:<16} {state}{approval}  {info.get('description', '')}")
     return 0

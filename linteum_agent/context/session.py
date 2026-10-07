@@ -1,101 +1,105 @@
-"""会话状态：对话的工作区、上下文表示、扩展元数据、工具/Skill 配置和 token 用量。
+"""Session state: the conversation's workspace, context representation, extra metadata, Tool/Skill config, and token usage.
 
-Context 层用 ``Session`` 表示一次会话的全部状态：
+The Context layer uses ``Session`` to represent the full state of one session:
 
 ```text
 Session
-├── session_id      会话 ID
-├── workspace       会话工作区（工具执行的根目录）
-├── context         上下文表示（provider-neutral 的消息列表）
-├── metadata        会话级扩展信息（业务自定义，不存放下面的保留配置）
-├── tools           工具配置：本会话注册了哪些工具 + 启用/禁用/选项
-├── skills          Skill 配置：本会话注册了哪些 Skill + 启用/禁用/选项
-├── usage           token 累计用量：input/output/cache_hit/total
-├── approve         工具授权回调
-└── cancelled       取消检查回调
+├── session_id      session ID
+├── workspace       session workspace (the root directory for tool execution)
+├── context         context representation (a provider-neutral message list)
+├── metadata        session-level extra info (business-defined; does not hold the reserved config below)
+├── tools           tool config: which tools this session registered + enable/disable/options
+├── skills          Skill config: which Skills this session registered + enable/disable/options
+├── usage           cumulative token usage: input/output/cache_hit/total
+├── approve         tool approval callback
+└── cancelled       cancellation check callback
 ```
 
-``tools`` / ``skills`` / ``usage`` 是**独立字段**（不再嵌在 ``metadata`` 中），
-``tools`` / ``skills`` 结构一致::
+``tools`` / ``skills`` / ``usage`` are **separate fields** (no longer embedded in ``metadata``);
+``tools`` / ``skills`` share the same structure::
 
     session.tools = {
-        "registered": ["read_file", "bash"],       # 本会话注册（可用）的工具
-        "enabled": ["read_file"],                  # 白名单（非空时生效）
-        "disabled": ["bash"],                      # 黑名单（优先级更高）
-        "options": {"bash": {"timeout": 60}},      # 每个工具的专属选项
-        "timeout": 30,                             # 其余键为全局选项
+        "registered": ["read_file", "bash"],       # tools registered (available) for this session
+        "enabled": ["read_file"],                  # allowlist (takes effect when non-empty)
+        "disabled": ["bash"],                      # denylist (higher precedence)
+        "options": {"bash": {"timeout": 60}},      # per-tool options
+        "timeout": 30,                             # other keys are global options
     }
     session.skills = {
-        "registered": ["python-code-review"],      # 本会话注册（可用）的 Skill
+        "registered": ["python-code-review"],      # Skills registered (available) for this session
         "enabled": [...],
         "disabled": [...],
         "options": {...},
     }
 
-``registered`` 只记录“这个会话有哪些工具/Skill”，与 ``enabled`` / ``disabled``
-（是否允许使用）解耦：``ToolRegistry`` 注册工具时会自动写入，
-``SkillRegistry.bind_session()`` 会写入发现的 Skill；调用方也可以直接用
-``Session.register_tools()`` / ``Session.register_skills()`` 登记。
+``registered`` only records "which tools/Skills this session has", decoupled from ``enabled`` /
+``disabled`` (whether they may be used): ``ToolRegistry`` writes it automatically when registering
+tools, ``SkillRegistry.bind_session()`` writes the discovered Skills; callers can also register
+directly via ``Session.register_tools()`` / ``Session.register_skills()``.
 
-会话还会累计每次 LLM 调用的 token 用量::
+The session also accumulates the token usage of each LLM call::
 
     session.usage = {
-        "input_tokens": 150,        # 累计输入 token
-        "output_tokens": 30,        # 累计输出 token
-        "cache_hit_tokens": 45,     # 累计命中的缓存 token
+        "input_tokens": 150,        # cumulative input tokens
+        "output_tokens": 30,        # cumulative output tokens
+        "cache_hit_tokens": 45,     # cumulative cache-hit tokens
         "total_tokens": 180,        # input + output
     }
 
-``ContextMiddleware`` 每完成一轮 LLM 调用都会调用 ``Session.record_usage()``，
-因此 ``session.usage`` 可以直接读取本会话的累计用量，并且随会话 JSON 一起持久化。
+``ContextMiddleware`` calls ``Session.record_usage()`` after each completed LLM call, so
+``session.usage`` directly reads this session's cumulative usage and is persisted along with the
+session JSON.
 
-除累计用量外，**一次完整 agent-loop 会被包装成一个 ``Round``**（``session.rounds``）：
-``Round.context`` 是这一轮的全部消息（请求 + 每次 LLM 调用 + 工具结果），
-``Round.usage`` 是这一轮的 token 汇总与占用的上下文空间。``to_dict()`` 因此把
-``messages`` 序列化为**轮列表**::
+Besides the cumulative usage, **one complete agent-loop is wrapped as a ``Round``**
+(``session.rounds``): ``Round.context`` is all of this round's messages (request + each LLM call +
+tool results), and ``Round.usage`` is this round's token summary and occupied context space.
+``to_dict()`` therefore serializes ``messages`` as a **list of rounds**::
 
     "messages": [
         {
             "round": 1,
             "context": [
-                {"role": "user", "content": "你好"},
-                {"role": "assistant", "content": "你好，有什么可以帮助你？"},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hello, how can I help you?"},
             ],
             "usage": {
-                "input_tokens": 12,       # 本轮输入 token
-                "output_tokens": 8,       # 本轮输出 token
-                "cache_hit_tokens": 0,    # 本轮命中的缓存 token
+                "input_tokens": 12,       # this round's input tokens
+                "output_tokens": 8,       # this round's output tokens
+                "cache_hit_tokens": 0,    # this round's cache-hit tokens
                 "total_tokens": 20,       # input + output
-                "context_tokens": 20,     # 本轮占用的上下文空间（估算 token 数）
-                "context_chars": 42,      # 本轮占用的上下文空间（字符数）
-                "created_at": "2026-01-01T00:00:00+00:00",   # 本轮开始时间
-                "updated_at": "2026-01-01T00:00:05+00:00",   # 本轮结束时间
+                "context_tokens": 20,     # context space occupied by this round (estimated token count)
+                "context_chars": 42,      # context space occupied by this round (character count)
+                "created_at": "2026-01-01T00:00:00+00:00",   # this round's start time
+                "updated_at": "2026-01-01T00:00:05+00:00",   # this round's end time
             },
         },
     ]
 
-一轮的生命周期是 ``begin_round()`` -> 多次 ``record_round()`` -> ``end_round()``：
+A round's lifecycle is ``begin_round()`` -> multiple ``record_round()`` -> ``end_round()``:
 
-- ``AgentEngine``（``run`` / ``arun`` / ``stream`` / ``astream``）在工具循环开始前
-  ``begin_round()``、循环结束后（含异常、超轮次中断）``end_round()``，因此一次用户
-  请求「多次 LLM 调用 + 工具执行 + 最终回答」只占**一轮**；
-- 单独使用 ``ContextMiddleware`` 时没有 loop，一次 ``complete()`` / ``stream()``
-  自然就是一轮（``record_round()`` 会立即定稿）；
-- ``record_round()`` 把消息追加到 ``context``、把 token 累加到 ``session.usage`` 与
-  当前轮的 ``usage``；``Session.record_usage()`` 仍可单独更新累计用量；
-- 进行中的轮尚未 ``end_round()`` 时也会被 ``to_dict()`` 按当前进度输出，因此中途落盘
-  不会丢消息。
+- ``AgentEngine`` (``run`` / ``arun`` / ``stream`` / ``astream``) calls ``begin_round()`` before the
+  tool loop starts and ``end_round()`` after the loop ends (including on exception or a max-rounds
+  abort), so one user request "multiple LLM calls + tool execution + final answer" occupies only
+  **one round**;
+- When using ``ContextMiddleware`` standalone there is no loop, so a single ``complete()`` /
+  ``stream()`` is naturally one round (``record_round()`` finalizes it immediately);
+- ``record_round()`` appends messages to ``context`` and accumulates tokens into ``session.usage``
+  and the current round's ``usage``; ``Session.record_usage()`` can still update the cumulative usage
+  separately;
+- An in-progress round that has not yet ``end_round()``-ed is also output by ``to_dict()`` at its
+  current progress, so persisting mid-way never loses messages.
 
-读取旧格式（扁平消息列表）时会自动按轮切分/包装。
+Reading the old format (a flat message list) automatically splits/wraps it by round.
 
-兼容旧格式：``tools`` / ``skills`` / ``usage`` 曾嵌在 ``metadata`` 中，构造
-``Session`` 或 ``Session.from_dict()`` 读取时会自动迁移到独立字段。
+Backward compatibility: ``tools`` / ``skills`` / ``usage`` were once embedded in ``metadata``; when
+constructing a ``Session`` or reading via ``Session.from_dict()`` they are automatically migrated to
+separate fields.
 
-工具执行上下文（原来的 ``linteum_agent.tools.RuntimeContext``）已经合并进
-``Session``：``workspace`` / ``metadata`` / ``approve`` / ``cancelled`` /
-``log()`` / ``is_cancelled()`` 全部由 Session 提供，``ToolRegistry`` 直接读取
-Session 中的工具配置。``tools.RuntimeContext`` 名字仍然可用，但它只是
-``Session`` 的兼容别名。
+The tool execution context (the former ``linteum_agent.tools.RuntimeContext``) has been merged into
+``Session``: ``workspace`` / ``metadata`` / ``approve`` / ``cancelled`` / ``log()`` /
+``is_cancelled()`` are all provided by Session, and ``ToolRegistry`` reads the tool config in the
+Session directly. The ``tools.RuntimeContext`` name is still available, but it is only a
+compatibility alias for ``Session``.
 """
 
 from __future__ import annotations
@@ -114,7 +118,7 @@ try:
         normalize_messages,
         to_dict as message_to_dict,
     )
-except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
+except ImportError:  # supports adding /workspace/linteum_agent to sys.path directly
     from messages.agent_message import (
         Message,
         MessageInput,
@@ -126,51 +130,51 @@ except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
 ApproveFn = Callable[[str, dict[str, Any]], bool]
 CancelFn = Callable[[], bool]
 
-# 工具配置的字段名 / JSON 键 / 旧 metadata 键：session.tools。
+# Field name / JSON key / old metadata key for tool config: session.tools.
 TOOL_CONFIG_KEY = "tools"
-# Skill 配置的字段名 / JSON 键 / 旧 metadata 键：session.skills。
+# Field name / JSON key / old metadata key for Skill config: session.skills.
 SKILL_CONFIG_KEY = "skills"
-# 每种能力配置中记录“本会话注册了哪些工具/Skill”的键。
+# The key in each capability config that records "which tools/Skills this session registered".
 REGISTERED_KEY = "registered"
 
-# token 用量的字段名 / JSON 键 / 旧 metadata 键：session.usage。
+# Field name / JSON key / old metadata key for token usage: session.usage.
 USAGE_KEY = "usage"
-# 会话累计的 token 指标；total_tokens 按 input + output 计算，与 LLMClient 一致。
+# The session's cumulative token metrics; total_tokens is computed as input + output, consistent with LLMClient.
 USAGE_METRICS = ("input_tokens", "output_tokens", "cache_hit_tokens", "total_tokens")
 
-# 分轮（round）持久化字段：``messages`` 中的每一项都是一个 Round。
-# 轮序号键（"round_1" 中的 1）、本轮消息键、以及本轮占用的上下文空间指标。
+# Round persistence fields: each item in ``messages`` is a Round.
+# The round-index key (the 1 in "round_1"), this round's message key, and this round's occupied context-space metrics.
 ROUND_INDEX_KEY = "round"
 ROUND_CONTEXT_KEY = "context"
-# 本轮占用的上下文空间：估算 token 数与字符数。
+# Context space occupied by this round: estimated token count and character count.
 CONTEXT_TOKENS_KEY = "context_tokens"
 CONTEXT_CHARS_KEY = "context_chars"
-# 一轮对话 usage 中除 token 指标外的字段：占用的上下文空间 + 本轮起止时间。
+# Fields in a round's usage besides the token metrics: occupied context space + this round's start/end time.
 ROUND_SPACE_METRICS = (CONTEXT_TOKENS_KEY, CONTEXT_CHARS_KEY)
 ROUND_TIME_KEYS = ("created_at", "updated_at")
 
-# 需要从 metadata 独立出去的保留字段（兼容旧格式时用于迁移）。
+# Reserved fields to move out of metadata (used when migrating old formats).
 RESERVED_KEYS = (TOOL_CONFIG_KEY, SKILL_CONFIG_KEY, USAGE_KEY)
 
-# 不参与“全局选项”合并的保留键：registered / enabled / disabled / options。
+# Reserved keys not participating in "global option" merging: registered / enabled / disabled / options.
 _RESERVED_CONFIG_KEYS = frozenset({REGISTERED_KEY, "enabled", "disabled", "options"})
 
 
 def _capability_map(value: Any) -> dict[str, Any]:
-    """把工具/Skill 配置归一化成 dict；非 Mapping 时视为空配置。"""
+    """Normalize the tool/Skill config into a dict; treat a non-Mapping as an empty config."""
     return dict(value) if isinstance(value, Mapping) else {}
 
 
 def empty_usage() -> dict[str, int]:
-    """返回全 0 的 token usage，字段与 ``LLMClient`` / ``normalize_usage()`` 一致。"""
+    """Return an all-zero token usage whose fields match ``LLMClient`` / ``normalize_usage()``."""
     return {metric: 0 for metric in USAGE_METRICS}
 
 
 def _coerce_usage(value: Any) -> dict[str, int]:
-    """把任意 usage 归一化成包含全部指标的 dict（缺失的按 0 处理）。
+    """Normalize any usage into a dict containing all metrics (missing ones treated as 0).
 
-    ``total_tokens`` 缺失（或为 0）但存在 input/output 时，按 ``input + output``
-    补全，与 ``LLMClient`` / ``normalize_usage()`` 保持一致。
+    When ``total_tokens`` is missing (or 0) but input/output exist, fill it in as ``input + output``,
+    consistent with ``LLMClient`` / ``normalize_usage()``.
     """
     usage = empty_usage()
     if isinstance(value, Mapping):
@@ -182,7 +186,7 @@ def _coerce_usage(value: Any) -> dict[str, int]:
 
 
 def _usage_delta(usage: Mapping[str, Any] | None) -> dict[str, int]:
-    """把一次 LLM 响应的 usage 归一化为可累加的增量。"""
+    """Normalize one LLM response's usage into an accumulable delta."""
     if not isinstance(usage, Mapping):
         return empty_usage()
     input_tokens = int(usage.get("input_tokens", 0) or 0)
@@ -192,28 +196,29 @@ def _usage_delta(usage: Mapping[str, Any] | None) -> dict[str, int]:
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cache_hit_tokens": cache_hit_tokens,
-        # 与 LLMClient / normalize_usage 保持一致：total = input + output。
+        # Consistent with LLMClient / normalize_usage: total = input + output.
         "total_tokens": input_tokens + output_tokens,
     }
 
 
 def _is_cjk(char: str) -> bool:
-    """判断字符是否按“一字 ≈ 一 token”估算（中日韩、全角符号等）。"""
+    """Determine whether a character is estimated as "one char ~= one token" (CJK, full-width symbols, etc.)."""
     code = ord(char)
     return (
-        0x3000 <= code <= 0x303F      # CJK 标点
-        or 0x2E80 <= code <= 0x9FFF   # CJK 部首 / 汉字 / 假名
-        or 0xAC00 <= code <= 0xD7AF   # 谚文
-        or 0xF900 <= code <= 0xFAFF   # CJK 兼容汉字
-        or 0xFF00 <= code <= 0xFFEF   # 全角字符
+        0x3000 <= code <= 0x303F      # CJK punctuation
+        or 0x2E80 <= code <= 0x9FFF   # CJK radicals / Han characters / kana
+        or 0xAC00 <= code <= 0xD7AF   # Hangul
+        or 0xF900 <= code <= 0xFAFF   # CJK compatibility ideographs
+        or 0xFF00 <= code <= 0xFFEF   # full-width characters
     )
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略估算文本的 token 数：CJK 按 1 字 1 token、其余按 4 字符 1 token。
+    """Roughly estimate the token count of text: 1 token per CJK char, 1 token per 4 other chars.
 
-    这里没有引入 tokenizer 依赖（不同 provider 的分词器不同），只用于记录“这一轮
-    对话占用的上下文空间”这一可比较的近似值。
+    No tokenizer dependency is introduced here (different providers use different tokenizers); it is
+    only used to record a comparable approximation of "the context space occupied by this round of
+    conversation".
     """
     if not text:
         return 0
@@ -223,10 +228,10 @@ def estimate_tokens(text: str) -> int:
 
 
 def measure_context(messages: MessageInputs) -> tuple[int, int]:
-    """测量一批消息占用的上下文空间，返回 ``(token 数, 字符数)``。
+    """Measure the context space occupied by a batch of messages; return ``(token count, char count)``.
 
-    以 ``to_dict()`` 的内部格式（JSON 文本）作为度量口径，因此包含 role /
-    tool_calls 等结构开销，不同轮之间可比。
+    The measurement uses the internal format of ``to_dict()`` (JSON text), so it includes structural
+    overhead such as role / tool_calls and is comparable across rounds.
     """
     text = "".join(
         json.dumps(message_to_dict(message), ensure_ascii=False)
@@ -236,7 +241,7 @@ def measure_context(messages: MessageInputs) -> tuple[int, int]:
 
 
 def _coerce_round_usage(value: Any) -> dict[str, Any]:
-    """归一化一轮对话的 usage：token 消耗 + 占用的上下文空间 + 起止时间。"""
+    """Normalize a round's usage: token consumption + occupied context space + start/end time."""
     raw: Mapping[str, Any] = value if isinstance(value, Mapping) else {}
     delta = _usage_delta(raw)
     usage: dict[str, Any] = {metric: delta[metric] for metric in USAGE_METRICS}
@@ -248,7 +253,7 @@ def _coerce_round_usage(value: Any) -> dict[str, Any]:
 
 
 def _is_round_payload(value: Any) -> bool:
-    """判断 ``messages`` 中的一项是不是 round（普通消息没有 ``context`` 字段）。"""
+    """Determine whether an item in ``messages`` is a round (a normal message has no ``context`` field)."""
     return (
         isinstance(value, Mapping)
         and "role" not in value
@@ -257,7 +262,7 @@ def _is_round_payload(value: Any) -> bool:
 
 
 def _message_role(value: Any) -> str | None:
-    """读取消息的 role（消息对象或字典都可以）。"""
+    """Read the role of a message (either a message object or a dict)."""
     role = getattr(value, "role", None)
     if role is None and isinstance(value, Mapping):
         role = value.get("role")
@@ -270,7 +275,7 @@ def _flat_round(
     created_at: str | None,
     updated_at: str | None,
 ) -> Round:
-    """把一段扁平消息包装成一轮（旧格式迁移用）；token 用量未知，按 0 记录。"""
+    """Wrap a segment of flat messages as one round (for old-format migration); token usage is unknown, recorded as 0."""
     tokens, chars = measure_context(messages)
     return Round(
         round=round,
@@ -291,7 +296,7 @@ def _rounds_from_flat(
     created_at: str | None = None,
     updated_at: str | None = None,
 ) -> list[Round]:
-    """把旧格式的扁平消息列表按「以 user 消息开始」切分成多轮。"""
+    """Split a legacy flat message list into rounds "starting at each user message"."""
     rounds: list[Round] = []
     current: list[Any] = []
     for item in messages:
@@ -310,10 +315,11 @@ def _split_rounds(
     created_at: str | None = None,
     updated_at: str | None = None,
 ) -> tuple[list[Message], list["Round"]]:
-    """拆分会话快照的 ``messages``：新格式是轮列表，旧格式是扁平消息列表。
+    """Split a session snapshot's ``messages``: the new format is a round list, the old format is a flat message list.
 
-    返回 ``(上下文消息, rounds)``。旧格式（version 1 / 2 / 3）会按「以 user 消息
-    开始」切分成多轮，token 用量未知时记 0（占用空间仍会测量）。
+    Return ``(context messages, rounds)``. Old formats (version 1 / 2 / 3) are split into rounds
+    "starting at each user message"; when token usage is unknown it is recorded as 0 (occupied space is
+    still measured).
     """
     items = list(messages) if isinstance(messages, (list, tuple)) else []
     if not any(_is_round_payload(item) for item in items):
@@ -325,13 +331,13 @@ def _split_rounds(
             round = Round.from_dict(item, round=index + 1)
             rounds.append(round)
             context.extend(round.context)
-        else:  # 混排兜底：扁平消息仍然保留在上下文中
+        else:  # mixed-layout fallback: flat messages are kept in the context
             context.append(item)
     return context, rounds
 
 
 def _normalize_rounds(value: Any) -> list["Round"]:
-    """把任意输入归一化成 ``list[Round]``（已实例化或字典都可以）。"""
+    """Normalize any input into ``list[Round]`` (either instantiated or dicts)."""
     rounds: list[Round] = []
     for index, item in enumerate(value if isinstance(value, (list, tuple)) else []):
         if isinstance(item, Round):
@@ -343,11 +349,12 @@ def _normalize_rounds(value: Any) -> list["Round"]:
 
 @dataclass
 class Round:
-    """一轮完整对话（一次 agent-loop）：本轮全部消息（``context``）+ 本轮汇总 usage。
+    """One complete round of conversation (one agent-loop): all of this round's messages (``context``) + this round's aggregated usage.
 
-    ``usage`` 记录这一轮的输入/输出 token 汇总（loop 内各次 LLM 调用之和）、本轮占用
-    的上下文空间（``context_tokens`` / ``context_chars``）以及本轮的开始/结束时间
-    （``created_at`` / ``updated_at``）。序列化后对应 ``messages`` 中的一项::
+    ``usage`` records this round's input/output token summary (the sum of the LLM calls within the
+    loop), the context space this round occupies (``context_tokens`` / ``context_chars``), and this
+    round's start/end time (``created_at`` / ``updated_at``). After serialization it corresponds to an
+    item in ``messages``::
 
         {"round": 1, "context": [...], "usage": {...}}
     """
@@ -362,7 +369,7 @@ class Round:
         self.usage = _coerce_round_usage(self.usage)
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为可 JSON 序列化的轮快照。"""
+        """Convert to a JSON-serializable round snapshot."""
         return {
             ROUND_INDEX_KEY: self.round,
             ROUND_CONTEXT_KEY: [message_to_dict(message) for message in self.context],
@@ -371,7 +378,7 @@ class Round:
 
     @classmethod
     def from_dict(cls, payload: Any, *, round: int = 1) -> "Round":
-        """从 ``to_dict()`` 结果恢复；``payload`` 不是对象时视为空轮。"""
+        """Restore from a ``to_dict()`` result; treat a non-object ``payload`` as an empty round."""
         if isinstance(payload, Round):
             return payload
         value: Mapping[str, Any] = payload if isinstance(payload, Mapping) else {}
@@ -383,10 +390,11 @@ class Round:
 
 
 def _normalize_names(values: Any) -> list[str]:
-    """把 ``Tool`` / ``SkillMetadata`` / 名称字符串统一成去重后的名称列表。
+    """Unify ``Tool`` / ``SkillMetadata`` / name strings into a de-duplicated list of names.
 
-    支持传入单个对象、单个名称或它们的任意可迭代集合；返回值保留首次出现的顺序，
-    因此也可以用来读取已注册列表。无法解析出名称时抛出 ``ValueError``。
+    Supports passing a single object, a single name, or any iterable collection of them; the return
+    value preserves first-occurrence order, so it can also be used to read a registered list. Raises
+    ``ValueError`` when a name cannot be resolved.
     """
     if values is None:
         return []
@@ -399,7 +407,7 @@ def _normalize_names(values: Any) -> list[str]:
             name = value
         if not name:
             raise ValueError(
-                f"无法解析名称: {value!r}（需要 Tool/SkillMetadata 或名称字符串）"
+                f"cannot resolve name: {value!r} (expected Tool/SkillMetadata or a name string)"
             )
         name = str(name)
         if name not in names:
@@ -408,53 +416,55 @@ def _normalize_names(values: Any) -> list[str]:
 
 
 def utc_now() -> str:
-    """返回 UTC ISO8601 时间戳，用于会话创建/更新时间。"""
+    """Return a UTC ISO8601 timestamp, used for the session's creation/update time."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 @dataclass
 class Session:
-    """一次会话的完整状态：工作区 + 上下文表示 + 元数据 + 工具/Skill 配置 + token 用量。
+    """The full state of one session: workspace + context representation + metadata + Tool/Skill config + token usage.
 
-    它同时就是工具运行上下文（原 ``tools.RuntimeContext`` 已合并到这里）：
-    ``workspace`` 为 ``None`` 表示“尚未显式指定”，运行时可以继承工具注册表的
-    工作区，``effective_workspace`` 给出实际生效的目录；``metadata`` /
-    ``approve`` / ``cancelled`` / ``log()`` / ``is_cancelled()`` 供
-    ``ToolRegistry`` 和工具使用。
+    It is also the tool execution context (the former ``tools.RuntimeContext`` has been merged here): a
+    ``workspace`` of ``None`` means "not yet explicitly specified", so at runtime it can inherit the
+    tool registry's workspace, and ``effective_workspace`` gives the directory actually in effect;
+    ``metadata`` / ``approve`` / ``cancelled`` / ``log()`` / ``is_cancelled()`` are for ``ToolRegistry``
+    and tools to use.
 
-    工具/Skill 配置与 token 用量是独立字段（不放 ``metadata``）：
+    Tool/Skill config and token usage are separate fields (not stored in ``metadata``):
 
-    - ``tools`` / ``skills``：本会话注册了哪些工具/Skill（``registered``）、
-      启用/禁用列表以及每个工具/Skill 的专属选项；常用入口是
-      ``register_tools()`` / ``register_skills()``、``configure_tools()`` /
-      ``configure_skills()``、``registered_tools()`` / ``registered_skills()``
-      与 ``registrations()``。
-    - ``usage``：本会话累计的 token 用量（input / output / cache_hit / total），
-      由 ``record_usage()`` 累加、``reset_usage()`` 归零，并随会话 JSON 持久化。
-    - ``rounds``：分轮记录，每一轮对话包装成 ``Round``（本轮 ``context`` + 本轮
-      ``usage``：input/output token、占用的上下文空间、起止时间）。**一轮 = 一次
-      完整 agent-loop**：``begin_round()`` 打开、``record_round()`` 并入、``end_round()``
-      定稿，因此一次用户请求（多次 LLM 调用 + 工具执行 + 最终回答）只占一轮；
-      ``to_dict()`` 据此把 ``messages`` 序列化为轮列表。
+    - ``tools`` / ``skills``: which tools/Skills this session registered (``registered``), the
+      enable/disable lists, and the per-tool/Skill options; the common entry points are
+      ``register_tools()`` / ``register_skills()``, ``configure_tools()`` / ``configure_skills()``,
+      ``registered_tools()`` / ``registered_skills()``, and ``registrations()``.
+    - ``usage``: this session's cumulative token usage (input / output / cache_hit / total),
+      accumulated by ``record_usage()``, zeroed by ``reset_usage()``, and persisted with the session
+      JSON.
+    - ``rounds``: per-round records, where each round of conversation is wrapped as a ``Round`` (this
+      round's ``context`` + this round's ``usage``: input/output tokens, occupied context space,
+      start/end time). **One round = one complete agent-loop**: ``begin_round()`` opens it,
+      ``record_round()`` merges into it, ``end_round()`` finalizes it, so one user request (multiple
+      LLM calls + tool execution + final answer) occupies only one round; ``to_dict()`` accordingly
+      serializes ``messages`` as a round list.
 
-    为兼容旧数据，若 ``metadata`` 中仍带 ``tools`` / ``skills`` / ``usage``，
-    构造时会自动迁移到上述字段，并从 ``metadata`` 中移除。
+    For backward compatibility with old data, if ``metadata`` still carries ``tools`` / ``skills`` /
+    ``usage``, they are automatically migrated to the above fields on construction and removed from
+    ``metadata``.
     """
 
     session_id: str = "default"
     workspace: Path | None = None
     context: list[Message] = field(default_factory=list)
-    # 分轮记录：每一轮对话的包装（本轮消息 + 本轮 usage）。上下文 = 各轮 context 的拼接。
+    # Per-round records: the wrapper for each round of conversation (this round's messages + usage). Context = the concatenation of each round's context.
     rounds: list[Round] = field(default_factory=list)
-    # 进行中的轮（begin_round() 打开、end_round() 定稿前）；不是持久化字段。
+    # The in-progress round (opened by begin_round(), before end_round() finalizes it); not a persistence field.
     _open_round: Round | None = field(default=None, init=False, repr=False, compare=False)
-    # 会话级扩展信息（业务自定义；工具/Skill 配置与 usage 使用下面的独立字段）。
+    # Session-level extra info (business-defined; Tool/Skill config and usage use the separate fields below).
     metadata: dict[str, Any] = field(default_factory=dict)
-    # 工具配置：registered / enabled / disabled / options 及全局选项。
+    # Tool config: registered / enabled / disabled / options and global options.
     tools: dict[str, Any] = field(default_factory=dict)
-    # Skill 配置：registered / enabled / disabled / options 及全局选项。
+    # Skill config: registered / enabled / disabled / options and global options.
     skills: dict[str, Any] = field(default_factory=dict)
-    # token 累计用量：input_tokens / output_tokens / cache_hit_tokens / total_tokens。
+    # Cumulative token usage: input_tokens / output_tokens / cache_hit_tokens / total_tokens.
     usage: dict[str, int] = field(default_factory=empty_usage)
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -471,14 +481,14 @@ class Session:
         self.tools = _capability_map(self.tools)
         self.skills = _capability_map(self.skills)
         self.usage = _coerce_usage(self.usage)
-        # 兼容旧格式：把 metadata 中的保留键迁移到独立字段。
+        # Backward compatibility: migrate the reserved keys in metadata to separate fields.
         self._absorb_reserved(self.metadata)
 
     def _absorb_reserved(self, values: Mapping[str, Any]) -> None:
-        """把保留键（tools/skills/usage）从 ``values`` 取出并写入独立字段。
+        """Take the reserved keys (tools/skills/usage) out of ``values`` and write them into separate fields.
 
-        ``values`` 会被就地修改（保留键被移除）。工具/Skill 配置按浅合并写入，
-        因此旧数据（完整配置）与局部更新都能正确落地。
+        ``values`` is modified in place (the reserved keys are removed). Tool/Skill config is written via
+        a shallow merge, so both old data (a complete config) and partial updates land correctly.
         """
         tools = values.pop(TOOL_CONFIG_KEY, None)
         if tools is not None:
@@ -495,18 +505,19 @@ class Session:
             self.usage = _coerce_usage(usage)
 
     # ------------------------------------------------------------------
-    # 上下文表示
+    # Context representation
     # ------------------------------------------------------------------
 
     def messages(self) -> list[Message]:
-        """返回上下文表示的副本，修改返回值不会影响 Session。"""
+        """Return a copy of the context representation; modifying the return value does not affect the Session."""
         return list(self.context)
 
     def append(self, messages: MessageInput | Iterable[MessageInput]) -> "Session":
-        """追加消息（消息对象、字典或它们的集合）。
+        """Append messages (message objects, dicts, or collections of them).
 
-        追加到 ``context``；若当前有进行中的轮（``begin_round()`` 打开），消息同时并入
-        该轮。需要单独记录本轮 usage 时使用 ``record_round()``。
+        Appended to ``context``; if there is an in-progress round (opened by ``begin_round()``), the
+        messages are also merged into that round. Use ``record_round()`` when this round's usage needs to
+        be recorded separately.
         """
         items = normalize_messages(messages)
         self.context.extend(items)
@@ -515,35 +526,35 @@ class Session:
         return self.touch()
 
     def replace(self, messages: MessageInputs) -> "Session":
-        """整体替换上下文表示（同时清空分轮记录与进行中的轮，保持两者一致）。"""
+        """Replace the whole context representation (also clears the per-round records and the in-progress round, keeping the two consistent)."""
         self.context = normalize_messages(messages)
         self.rounds = []
         self._open_round = None
         return self.touch()
 
     def clear(self) -> "Session":
-        """清空上下文表示与分轮记录（保留工作区和元数据）。"""
+        """Clear the context representation and per-round records (keeping the workspace and metadata)."""
         self.context = []
         self.rounds = []
         self._open_round = None
         return self.touch()
 
     # ------------------------------------------------------------------
-    # 分轮（round）包装：一轮 = 一次完整 agent-loop
-    # 轮 = context（本轮全部消息：请求 + 每轮回复 + 工具结果）+ usage（本轮汇总用量）
+    # Round wrapping: one round = one complete agent-loop
+    # Round = context (this round's messages: request + each reply + tool results) + usage (this round's aggregated usage)
     # ------------------------------------------------------------------
 
     @property
     def open_round(self) -> Round | None:
-        """返回进行中的轮（``begin_round()`` 打开、``end_round()`` 定稿前）。"""
+        """Return the in-progress round (opened by ``begin_round()``, before ``end_round()`` finalizes it)."""
         return self._open_round
 
     def begin_round(self, *, created_at: str | None = None) -> Round:
-        """开始一轮完整对话（AgentEngine 用它把一次 agent-loop 收进一轮）。
+        """Start one complete conversation round (AgentEngine uses it to collect one agent-loop into one round).
 
-        已有进行中的轮时直接返回它（幂等）。在 ``end_round()`` 之前，``append()`` /
-        ``record_round()`` 写入的消息与 usage 都会并入这一轮，因此一轮覆盖「一次用户
-        请求 -> 多次 LLM 调用 + 工具执行 -> 最终回答」。
+        If there is already an in-progress round, return it directly (idempotent). Before ``end_round()``,
+        the messages and usage written by ``append()`` / ``record_round()`` are merged into this round, so
+        one round covers "one user request -> multiple LLM calls + tool execution -> final answer".
         """
         if self._open_round is None:
             round = Round(round=len(self.rounds) + 1)
@@ -556,10 +567,11 @@ class Session:
         return self._open_round
 
     def end_round(self, *, updated_at: str | None = None) -> Round | None:
-        """结束进行中的轮（一次完整对话结束）：定稿本轮消息与 usage 到 ``rounds``。
+        """End the in-progress round (one complete conversation ends): finalize this round's messages and usage into ``rounds``.
 
-        结束时会用本轮的全部消息重新测量占用的上下文空间，并刷新本轮结束时间。
-        没有进行中的轮、或本轮还没有任何消息时返回 ``None``（不产生空轮）。
+        On end, it re-measures the context space occupied using all of this round's messages and refreshes
+        this round's end time. Returns ``None`` when there is no in-progress round, or when this round has
+        no messages yet (no empty round is produced).
         """
         round = self._open_round
         if round is None:
@@ -580,15 +592,16 @@ class Session:
         created_at: str | None = None,
         updated_at: str | None = None,
     ) -> "Session":
-        """把一轮对话的消息与 usage 写入会话。
+        """Write one round's messages and usage into the session.
 
-        - 有进行中的轮（``begin_round()``，例如 AgentEngine 正在跑的完整 agent-loop）
-          时，本轮消息与 usage **并入**该轮（``created_at`` / ``updated_at`` 沿用该轮）；
-        - 否则这一轮**立即定稿**为独立的一轮（单独使用 ``ContextMiddleware`` 时，
-          一次 ``complete()`` / ``stream()`` 就是一轮）。
+        - When there is an in-progress round (``begin_round()``, e.g. the complete agent-loop AgentEngine
+          is running), this round's messages and usage are **merged** into it (``created_at`` /
+          ``updated_at`` follow that round);
+        - Otherwise this round is **finalized immediately** as a standalone round (when using
+          ``ContextMiddleware`` standalone, a single ``complete()`` / ``stream()`` is one round).
 
-        ``messages`` 追加到 ``context``，``usage`` 的本轮 token 同时累加到
-        ``session.usage``。返回 ``self``，便于链式调用。
+        ``messages`` is appended to ``context``, and ``usage``'s this-round tokens are also accumulated
+        into ``session.usage``. Returns ``self`` for chaining.
         """
         items = normalize_messages(messages)
         delta = _usage_delta(usage)
@@ -612,14 +625,14 @@ class Session:
         return self.touch()
 
     def _add_session_usage(self, delta: Mapping[str, int]) -> None:
-        """把一次调用的 token 增量累加到会话级 ``usage``。"""
+        """Accumulate one call's token delta into the session-level ``usage``."""
         current = _coerce_usage(self.usage)
         for metric in USAGE_METRICS:
             current[metric] += delta[metric]
         self.usage = current
 
     def _merge_round_usage(self, round: Round, delta: Mapping[str, int]) -> None:
-        """把一次调用的 token 增量并入某一轮的 usage，并刷新占用空间/结束时间。"""
+        """Merge one call's token delta into a round's usage and refresh the occupied space / end time."""
         usage = _coerce_round_usage(round.usage)
         for metric in USAGE_METRICS:
             usage[metric] += delta[metric]
@@ -629,13 +642,13 @@ class Session:
 
     @staticmethod
     def _refresh_usage_space(usage: dict[str, Any], messages: MessageInputs) -> None:
-        """重新测量一批消息占用的上下文空间，写回 usage。"""
+        """Re-measure the context space occupied by a batch of messages and write it back to usage."""
         tokens, chars = measure_context(messages)
         usage[CONTEXT_TOKENS_KEY] = tokens
         usage[CONTEXT_CHARS_KEY] = chars
 
     def _refresh_round(self, round: Round, *, updated_at: str | None = None) -> Round:
-        """按本轮现有消息刷新 usage（占用空间 + 结束时间）后返回该轮。"""
+        """Refresh usage (occupied space + end time) based on this round's current messages, then return the round."""
         usage = _coerce_round_usage(round.usage)
         self._refresh_usage_space(usage, round.context)
         usage["updated_at"] = updated_at or utc_now()
@@ -650,7 +663,7 @@ class Session:
         created_at: str | None = None,
         updated_at: str | None = None,
     ) -> dict[str, Any]:
-        """构造一轮对话的 usage：token 消耗 + 占用的上下文空间 + 起止时间。"""
+        """Build one round's usage: token consumption + occupied context space + start/end time."""
         counters = _usage_delta(None) if delta is None else dict(delta)
         tokens, chars = measure_context(messages)
         return {
@@ -662,21 +675,22 @@ class Session:
         }
 
     def round_messages(self) -> list[Message]:
-        """按轮展开所有已定稿 ``Round`` 的消息（副本；不含进行中的轮）。"""
+        """Expand the messages of all finalized ``Round`` objects by round (a copy; excludes the in-progress round)."""
         messages: list[Message] = []
         for round in self.rounds:
             messages.extend(round.context)
         return messages
 
     def round_payloads(self) -> list[dict[str, Any]]:
-        """把上下文序列化为分轮的 ``messages`` 列表。
+        """Serialize the context into a per-round ``messages`` list.
 
-        - 已定稿的轮（``self.rounds``）直接输出；
-        - 进行中的轮（``begin_round()`` 打开、尚未 ``end_round()``）按当前进度输出
-          （重新测量占用空间），保证在 agent-loop 中途落盘也不丢消息；
-        - 其余未被任何轮覆盖的消息补成一轮。
+        - Finalized rounds (``self.rounds``) are output directly;
+        - The in-progress round (opened by ``begin_round()``, not yet ``end_round()``) is output at its
+          current progress (re-measuring the occupied space), ensuring that persisting mid-way through an
+          agent-loop does not lose messages;
+        - Any remaining messages not covered by a round are filled into one round.
 
-        因此任何消息都不会在持久化时丢失。
+        So no message is ever lost on persistence.
         """
         payloads = [round.to_dict() for round in self.rounds]
         covered = sum(len(item.context) for item in self.rounds)
@@ -697,29 +711,30 @@ class Session:
         return payloads
 
     # ------------------------------------------------------------------
-    # 会话信息
+    # Session info
     # ------------------------------------------------------------------
 
     def touch(self) -> "Session":
-        """刷新 ``updated_at``。"""
+        """Refresh ``updated_at``."""
         self.updated_at = utc_now()
         return self
 
     def set_workspace(self, workspace: str | Path | None) -> "Session":
-        """设置会话工作区；``None`` 表示恢复为“运行时继承”。"""
+        """Set the session workspace; ``None`` restores "inherited at runtime"."""
         self.workspace = None if workspace is None else Path(workspace).expanduser().resolve()
         return self.touch()
 
     @property
     def effective_workspace(self) -> Path:
-        """实际生效的工作区；未显式指定时回退到当前进程工作目录。"""
+        """The workspace actually in effect; falls back to the current process working directory when not explicitly specified."""
         return self.workspace or Path.cwd()
 
     def update_metadata(self, metadata: Mapping[str, Any] | None = None, **values: Any) -> "Session":
-        """合并会话元数据。
+        """Merge session metadata.
 
-        保留键（``tools`` / ``skills`` / ``usage``）不会留在 ``metadata`` 中，
-        而是写入对应独立字段（工具/Skill 配置浅合并），以兼容旧调用方式。
+        Reserved keys (``tools`` / ``skills`` / ``usage``) are not left in ``metadata``; instead they are
+        written to the corresponding separate fields (Tool/Skill config via a shallow merge), for
+        compatibility with the old calling style.
         """
         merged = dict(metadata or {})
         merged.update(values)
@@ -728,69 +743,69 @@ class Session:
         return self.touch()
 
     # ------------------------------------------------------------------
-    # 工具执行环境（原 tools.RuntimeContext 的能力）
+    # Tool execution environment (the capabilities of the former tools.RuntimeContext)
     # ------------------------------------------------------------------
 
     @classmethod
     def cwd(cls, session_id: str = "default") -> "Session":
-        """以当前进程工作目录作为会话工作区。"""
+        """Use the current process working directory as the session workspace."""
         return cls(session_id=session_id, workspace=Path.cwd())
 
     def log(self, message: str) -> None:
-        """调用 ``metadata["log"]`` 回调（工具输出通道）。"""
+        """Call the ``metadata["log"]`` callback (the tool output channel)."""
         callback = self.metadata.get("log")
         if callable(callback):
             callback(message)
 
     def is_cancelled(self) -> bool:
-        """``cancelled`` 回调为真时表示会话已请求取消。"""
+        """When the ``cancelled`` callback is truthy, the session has requested cancellation."""
         return bool(self.cancelled and self.cancelled())
 
     # ------------------------------------------------------------------
-    # 工具配置（session.tools）
+    # Tool config (session.tools)
     # ------------------------------------------------------------------
 
     def tool_config(self) -> dict[str, Any]:
-        """返回 ``session.tools`` 工具配置（副本）。"""
+        """Return the ``session.tools`` tool config (a copy)."""
         return self._capability_config(TOOL_CONFIG_KEY)
 
     def registered_tools(self) -> list[str]:
-        """返回本会话注册（可用）的工具名称，顺序即注册顺序。"""
+        """Return the names of tools registered (available) for this session, in registration order."""
         return _normalize_names(self.tool_config().get(REGISTERED_KEY))
 
     def register_tools(self, tools: Any) -> "Session":
-        """记录本会话注册的工具。
+        """Record the tools registered for this session.
 
-        ``tools`` 可以是 ``Tool`` 对象、工具名，或它们的可迭代集合；重复注册
-        不会重复记录，也不会改变 ``enabled`` / ``disabled`` / ``options``。
+        ``tools`` may be ``Tool`` objects, tool names, or an iterable collection of them; re-registering
+        does not record duplicates and does not change ``enabled`` / ``disabled`` / ``options``.
         """
         return self._register_capabilities(TOOL_CONFIG_KEY, tools)
 
     def unregister_tools(self, tools: Any) -> "Session":
-        """从本会话的已注册工具中移除（接受 ``Tool`` 对象或工具名）。"""
+        """Remove from this session's registered tools (accepts ``Tool`` objects or tool names)."""
         return self._unregister_capabilities(TOOL_CONFIG_KEY, tools)
 
     def clear_registered_tools(self) -> "Session":
-        """清空已注册工具列表（保留 ``enabled`` / ``disabled`` / ``options``）。"""
+        """Clear the registered tools list (keeping ``enabled`` / ``disabled`` / ``options``)."""
         return self._clear_registered(TOOL_CONFIG_KEY)
 
     def tool_options(self, tool_name: str | None = None) -> dict[str, Any]:
-        """返回工具选项；传入工具名时合并该工具的专属配置。
+        """Return the tool options; when a tool name is passed, merge that tool's specific config.
 
-        配置结构::
+        Config structure::
 
             session.tools = {
-                "registered": ["read_file"],       # 本会话注册的工具
-                "enabled": ["read_file"],          # 白名单（非空时生效）
-                "disabled": ["bash"],              # 黑名单
-                "timeout": 30,                     # 全局选项
-                "options": {"bash": {"timeout": 60}},  # 每个工具的选项
+                "registered": ["read_file"],       # tools registered for this session
+                "enabled": ["read_file"],          # allowlist (effective when non-empty)
+                "disabled": ["bash"],              # denylist
+                "timeout": 30,                     # global option
+                "options": {"bash": {"timeout": 60}},  # per-tool option
             }
         """
         return self._capability_options(TOOL_CONFIG_KEY, tool_name)
 
     def tool_enabled(self, tool_name: str) -> bool:
-        """按会话工具配置判断工具是否启用。"""
+        """Determine whether a tool is enabled according to the session tool config."""
         return self._capability_enabled(TOOL_CONFIG_KEY, tool_name)
 
     def configure_tools(
@@ -802,9 +817,10 @@ class Session:
         options: Mapping[str, Mapping[str, Any]] | None = None,
         **values: Any,
     ) -> "Session":
-        """写入会话级工具配置（合并到 ``session.tools``）。
+        """Write the session-level tool config (merged into ``session.tools``).
 
-        ``registered`` 覆盖“本会话注册了哪些工具”，其余参数语义不变。
+        ``registered`` overrides "which tools this session registered"; the other parameters keep their
+        meaning.
         """
         return self._configure_capabilities(
             TOOL_CONFIG_KEY,
@@ -816,39 +832,39 @@ class Session:
         )
 
     # ------------------------------------------------------------------
-    # Skill 配置（session.skills）
+    # Skill config (session.skills)
     # ------------------------------------------------------------------
 
     def skill_config(self) -> dict[str, Any]:
-        """返回 ``session.skills`` Skill 配置（副本）。"""
+        """Return the ``session.skills`` Skill config (a copy)."""
         return self._capability_config(SKILL_CONFIG_KEY)
 
     def registered_skills(self) -> list[str]:
-        """返回本会话注册（可用）的 Skill 名称，顺序即注册顺序。"""
+        """Return the names of Skills registered (available) for this session, in registration order."""
         return _normalize_names(self.skill_config().get(REGISTERED_KEY))
 
     def register_skills(self, skills: Any) -> "Session":
-        """记录本会话注册的 Skill。
+        """Record the Skills registered for this session.
 
-        ``skills`` 可以是 ``SkillMetadata``、Skill 名称，或它们的可迭代集合；
-        重复注册不会重复记录。
+        ``skills`` may be ``SkillMetadata``, Skill names, or an iterable collection of them;
+        re-registering does not record duplicates.
         """
         return self._register_capabilities(SKILL_CONFIG_KEY, skills)
 
     def unregister_skills(self, skills: Any) -> "Session":
-        """从本会话的已注册 Skill 中移除（接受 ``SkillMetadata`` 或名称）。"""
+        """Remove from this session's registered Skills (accepts ``SkillMetadata`` or names)."""
         return self._unregister_capabilities(SKILL_CONFIG_KEY, skills)
 
     def clear_registered_skills(self) -> "Session":
-        """清空已注册 Skill 列表（保留 ``enabled`` / ``disabled`` / ``options``）。"""
+        """Clear the registered Skills list (keeping ``enabled`` / ``disabled`` / ``options``)."""
         return self._clear_registered(SKILL_CONFIG_KEY)
 
     def skill_options(self, skill_name: str | None = None) -> dict[str, Any]:
-        """返回 Skill 选项；传入名称时合并该 Skill 的专属配置。"""
+        """Return the Skill options; when a name is passed, merge that Skill's specific config."""
         return self._capability_options(SKILL_CONFIG_KEY, skill_name)
 
     def skill_enabled(self, skill_name: str) -> bool:
-        """按会话 Skill 配置判断 Skill 是否启用。"""
+        """Determine whether a Skill is enabled according to the session Skill config."""
         return self._capability_enabled(SKILL_CONFIG_KEY, skill_name)
 
     def configure_skills(
@@ -860,7 +876,7 @@ class Session:
         options: Mapping[str, Mapping[str, Any]] | None = None,
         **values: Any,
     ) -> "Session":
-        """写入会话级 Skill 配置（合并到 ``session.skills``）。"""
+        """Write the session-level Skill config (merged into ``session.skills``)."""
         return self._configure_capabilities(
             SKILL_CONFIG_KEY,
             registered=registered,
@@ -875,45 +891,46 @@ class Session:
     # ------------------------------------------------------------------
 
     def record_usage(self, usage: Mapping[str, Any] | None) -> "Session":
-        """累加一次 LLM 调用的 token 用量到本会话（``session.usage``）。
+        """Accumulate one LLM call's token usage into this session (``session.usage``).
 
-        ``input_tokens`` / ``output_tokens`` / ``cache_hit_tokens`` 逐次累加，
-        ``total_tokens`` 按 ``input + output`` 累加（与 ``LLMClient`` 一致）。
-        传入 ``None`` 或空 usage 不会改变累计值。
+        ``input_tokens`` / ``output_tokens`` / ``cache_hit_tokens`` are accumulated per call, and
+        ``total_tokens`` is accumulated as ``input + output`` (consistent with ``LLMClient``). Passing
+        ``None`` or empty usage does not change the cumulative value.
 
-        只更新会话累计值；需要同时记录到某一轮（分轮 usage）时用 ``record_round()``。
+        Only the session cumulative value is updated; use ``record_round()`` when it must also be recorded
+        into a round (per-round usage).
         """
         self._add_session_usage(_usage_delta(usage))
         return self.touch()
 
     def reset_usage(self) -> "Session":
-        """把本会话累计的 token 用量归零（``session.usage``）。"""
+        """Zero this session's cumulative token usage (``session.usage``)."""
         self.usage = empty_usage()
         return self.touch()
 
     # ------------------------------------------------------------------
-    # 注册总览
+    # Registration overview
     # ------------------------------------------------------------------
 
     def registrations(self) -> dict[str, list[str]]:
-        """返回本会话注册的工具与 Skill：``{"tools": [...], "skills": [...]}``。"""
+        """Return the tools and Skills registered for this session: ``{"tools": [...], "skills": [...]}``."""
         return {"tools": self.registered_tools(), "skills": self.registered_skills()}
 
     # ------------------------------------------------------------------
-    # 工具/Skill 配置的通用实现
+    # Shared implementation for Tool/Skill config
     # ------------------------------------------------------------------
 
     def _capability_config(self, config_key: str) -> dict[str, Any]:
-        """读取工具/Skill 配置字段（副本）；非 Mapping 时视为空配置。"""
+        """Read the Tool/Skill config field (a copy); treat a non-Mapping as an empty config."""
         return _capability_map(getattr(self, config_key, None))
 
     def _set_capability_config(self, config_key: str, config: Mapping[str, Any]) -> "Session":
-        """写入 ``session.tools`` / ``session.skills`` 字段并刷新 ``updated_at``。"""
+        """Write the ``session.tools`` / ``session.skills`` field and refresh ``updated_at``."""
         setattr(self, config_key, dict(config))
         return self.touch()
 
     def _capability_enabled(self, config_key: str, name: str) -> bool:
-        """黑名单优先，其次是白名单（非空时生效），否则默认启用。"""
+        """Denylist first, then the allowlist (effective when non-empty), otherwise enabled by default."""
         config = self._capability_config(config_key)
         disabled = config.get("disabled")
         if isinstance(disabled, (list, tuple, set, frozenset)) and name in disabled:
@@ -924,7 +941,7 @@ class Session:
         return True
 
     def _capability_options(self, config_key: str, name: str | None = None) -> dict[str, Any]:
-        """合并全局选项与某个工具/Skill 的专属选项。"""
+        """Merge the global options with a specific tool's/Skill's options."""
         config = self._capability_config(config_key)
         options = {
             key: value
@@ -949,7 +966,7 @@ class Session:
         options: Mapping[str, Mapping[str, Any]] | None = None,
         **values: Any,
     ) -> "Session":
-        """合并写入 ``session.tools`` / ``session.skills`` 的注册/启用/禁用/选项配置。"""
+        """Merge-write the register/enable/disable/options config into ``session.tools`` / ``session.skills``."""
         config = self._capability_config(config_key)
         if registered is not None:
             config[REGISTERED_KEY] = _normalize_names(registered)
@@ -968,7 +985,7 @@ class Session:
         return self._set_capability_config(config_key, config)
 
     def _register_capabilities(self, config_key: str, values: Any) -> "Session":
-        """把名称追加进 ``registered``（保序、去重）。"""
+        """Append names into ``registered`` (order-preserving, de-duplicated)."""
         names = _normalize_names(values)
         if not names:
             return self
@@ -981,7 +998,7 @@ class Session:
         return self._set_capability_config(config_key, config)
 
     def _unregister_capabilities(self, config_key: str, values: Any) -> "Session":
-        """从 ``registered`` 中移除名称（保序）。"""
+        """Remove names from ``registered`` (order-preserving)."""
         names = set(_normalize_names(values))
         if not names:
             return self
@@ -992,7 +1009,7 @@ class Session:
         return self._set_capability_config(config_key, config)
 
     def _clear_registered(self, config_key: str) -> "Session":
-        """清空 ``registered``，保留同一配置中的其它键。"""
+        """Clear ``registered``, keeping the other keys in the same config."""
         config = self._capability_config(config_key)
         config[REGISTERED_KEY] = []
         return self._set_capability_config(config_key, config)
@@ -1004,13 +1021,13 @@ class Session:
         approve: ApproveFn | None = None,
         cancelled: CancelFn | None = None,
     ) -> "Session":
-        """返回本次工具执行的会话视图。
+        """Return the session view for this tool execution.
 
-        视图与源会话共享 ``session_id``、工作区、工具/Skill 配置和回调，并把调用方
-        ``metadata``（例如引擎本次调用的元数据）合并进会话元数据后交给工具使用；
-        会话元数据优先，并且始终写入当前 ``session_id``。保留键
-        （``tools`` / ``skills`` / ``usage``）不再通过 ``metadata`` 传递，避免覆盖
-        会话自身的配置。
+        The view shares ``session_id``, workspace, Tool/Skill config, and callbacks with the source
+        session, and merges the caller's ``metadata`` (such as the engine's metadata for this call) into
+        the session metadata before handing it to the tools; the session metadata takes precedence, and
+        the current ``session_id`` is always written. Reserved keys (``tools`` / ``skills`` / ``usage``)
+        are no longer passed through ``metadata``, to avoid overwriting the session's own config.
         """
         merged = dict(metadata or {})
         merged.update(self.metadata)
@@ -1026,19 +1043,19 @@ class Session:
         )
 
     def runtime_context(self, **kwargs: Any) -> "Session":
-        """兼容旧命名：等价于 ``tool_context()``。"""
+        """Compatibility with the old naming: equivalent to ``tool_context()``."""
         return self.tool_context(**kwargs)
 
     # ------------------------------------------------------------------
-    # 序列化
+    # Serialization
     # ------------------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为可 JSON 序列化的会话快照。
+        """Convert to a JSON-serializable session snapshot.
 
-        ``tools`` / ``skills`` / ``usage`` 是会话快照的顶层字段，不再嵌在
-        ``metadata`` 中（version 3 格式）；``messages`` 是**分轮的列表**
-        （version 4 格式），每一项形如::
+        ``tools`` / ``skills`` / ``usage`` are top-level fields of the session snapshot and are no longer
+        embedded in ``metadata`` (version 3 format); ``messages`` is a **list of rounds** (version 4
+        format), each item shaped like::
 
             {"round": 1, "context": [...], "usage": {...}}
         """
@@ -1056,26 +1073,27 @@ class Session:
 
     @classmethod
     def from_dict(cls, session_id: str, payload: Any) -> "Session":
-        """从 ``to_dict()`` 结果恢复会话。
+        """Restore a session from a ``to_dict()`` result.
 
-        同时兼容旧格式：
+        Also compatible with old formats:
 
-        - version 1：``payload`` 直接是消息列表，``workspace`` 为 ``None``
-          （运行时继承工具注册表的工作区）；
-        - version 2：``tools`` / ``skills`` / ``usage`` 嵌在 ``metadata`` 中，
-          读取时自动迁移到独立字段；
-        - version 3：``messages`` 是扁平消息列表，读取时按「以 user 消息开始」
-          切分成多轮（旧数据没有分轮 token，按 0 记录，占用的上下文空间仍会测量）。
+        - version 1: ``payload`` is directly a message list, and ``workspace`` is ``None`` (inherits the
+          tool registry's workspace at runtime);
+        - version 2: ``tools`` / ``skills`` / ``usage`` are embedded in ``metadata`` and are automatically
+          migrated to separate fields on read;
+        - version 3: ``messages`` is a flat message list, split into rounds "starting at each user
+          message" on read (old data has no per-round tokens, recorded as 0; occupied context space is
+          still measured).
         """
         if isinstance(payload, Session):
             return payload if payload.session_id == session_id else replace(payload, session_id=session_id)
         if isinstance(payload, (list, tuple)):
             return cls(session_id=session_id, context=list(payload))
         if not isinstance(payload, dict):
-            raise ValueError(f"会话数据必须是对象或消息列表: {type(payload).__name__}")
+            raise ValueError(f"session data must be an object or a message list: {type(payload).__name__}")
         workspace = payload.get("workspace")
         metadata = dict(payload.get("metadata") or {})
-        # 顶层独立字段优先；metadata 中的旧键留给 __post_init__ 迁移。
+        # Top-level separate fields take precedence; old keys in metadata are left for __post_init__ to migrate.
         for key in RESERVED_KEYS:
             if payload.get(key) is not None:
                 metadata.pop(key, None)

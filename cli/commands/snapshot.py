@@ -1,4 +1,4 @@
-"""``linteum snapshot`` 的实现：查看 / 写入 / 清除 / 定位快照。"""
+"""Implementation of ``linteum snapshot``: view / write / clear / locate the snapshot."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ def run_snapshot(args) -> int:
         return _save(args)
     if action == "clear":
         return _clear(args)
-    print("用法：linteum snapshot {show,save,clear,path} ...", file=sys.stderr)
+    print("Usage: linteum snapshot {show,save,clear,path} ...", file=sys.stderr)
     return 2
 
 
@@ -28,16 +28,16 @@ def _show(args) -> int:
 
     data = load_snapshot()
     if data is None:
-        print(f"（没有快照：{snapshot_path()}）")
+        print(f"(no snapshot: {snapshot_path()})")
         return 0
     if getattr(args, "json", False):
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
         return 0
     model = data.get("model") or {}
-    print(f"快照     : {snapshot_path()}")
-    print(f"更新时间 : {data.get('updated_at')}")
-    print(f"工作区   : {data.get('workspace')}")
-    print(f"模型     : {model.get('provider')} / {model.get('model')}")
+    print(f"snapshot : {snapshot_path()}")
+    print(f"updated  : {data.get('updated_at')}")
+    print(f"workspace: {data.get('workspace')}")
+    print(f"model    : {model.get('provider')} / {model.get('model')}")
     return 0
 
 
@@ -45,12 +45,12 @@ def _save(args) -> int:
     from cli.snapshot import resolve_workspace, save_snapshot
 
     path = save_snapshot(resolve_workspace(args), config_path=getattr(args, "config", None))
-    print(f"已写入快照：{path}")
+    print(f"Snapshot written: {path}")
     return 0
 
 
 def _clear(args) -> int:
     from cli.snapshot import clear_snapshot
 
-    print("已删除快照" if clear_snapshot() else "（没有快照可删除）")
+    print("Snapshot deleted" if clear_snapshot() else "(no snapshot to delete)")
     return 0

@@ -1,4 +1,4 @@
-"""``linteum model`` 的实现：查看 / 切换默认模型（写回 ``config.yaml``）。"""
+"""Implementation of ``linteum model``: view / switch the default model (written back to ``config.yaml``)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def run_model(args) -> int:
         return _show(args)
     if action == "set":
         return _set(args)
-    print("用法：linteum model {show,set} ...", file=sys.stderr)
+    print("Usage: linteum model {show,set} ...", file=sys.stderr)
     return 2
 
 
@@ -41,12 +41,12 @@ def _set(args) -> int:
     try:
         llm = llm_from_dict(data)
     except Exception as exc:
-        print(f"设置失败：{exc}", file=sys.stderr)
+        print(f"Setup failed: {exc}", file=sys.stderr)
         return 2
 
     config.set_llm(llm)
     store.save(config)
-    # 注意：model set 不写快照 —— 快照只由 chat 更新（见 cli/snapshot.py）。
+    # Note: model set does not write the snapshot -- the snapshot is only updated by chat (see cli/snapshot.py).
     print(f"provider = {llm.provider}")
     print(f"model    = {llm.model}")
     return 0

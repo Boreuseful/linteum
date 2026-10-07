@@ -19,7 +19,7 @@ try:
     )
     from .store import ContextStore
     from .session import Round, Session, empty_usage, utc_now
-except ImportError:  # 支持直接将 /workspace/linteum_agent 加入 sys.path
+except ImportError:  # supports adding /workspace/linteum_agent to sys.path directly
     from model.client import LLMClient
     from model.llm import LLMResponse, LLMStreamChunk
     from messages.agent_message import (
@@ -39,18 +39,20 @@ ContextInjector = Callable[[str, list[Message]], Iterable[MessageInput]]
 
 
 class ContextMiddleware:
-    """在 LLM 请求前注入上下文，在响应后自动保存对话消息。
+    """Inject context before the LLM request and automatically save conversation messages after the response.
 
-    注入顺序：静态注入内容 -> 动态 injector 内容 -> 持久化历史 -> 当前请求。
-    注入内容（system prompt 等）放在历史**之前**，保证「assistant 的 tool_call」与
-    「当前请求里的 tool 结果」始终相邻：Responses API 要求 ``function_call`` 紧跟
-    ``function_call_output``，中间不能插入其它消息，否则会报
-    ``No tool output found for tool call ...``。
+    Injection order: static injected content -> dynamic injector content -> persisted history ->
+    current request. The injected content (system prompt, etc.) is placed **before** the history so
+    that "the assistant's tool_call" and "the tool result in the current request" always stay adjacent:
+    the Responses API requires ``function_call`` to be immediately followed by ``function_call_output``,
+    with no other message inserted in between, otherwise it raises
+    ``No tool output found for tool call ...``.
 
-    ``store`` 中保存的是 ``Session``（工作区 + 上下文表示 + 元数据），而不是
-    provider 专用 JSON；每个会话的消息即 ``Session.context``。写入的消息与 usage 会
-    并入当前进行中的轮（``begin_round()`` / ``end_round()``，**一轮 = 一次完整
-    agent-loop**）；没有进行中的轮时，一次 ``complete()`` / ``stream()`` 就是一轮。
+    What ``store`` holds is a ``Session`` (workspace + context representation + metadata), not
+    provider-specific JSON; each session's messages are ``Session.context``. Written messages and usage
+    are merged into the currently ongoing round (``begin_round()`` / ``end_round()``; **one round = one
+    complete agent-loop**); when there is no ongoing round, a single ``complete()`` / ``stream()`` is
+    one round.
     """
 
     def __init__(
@@ -77,9 +79,10 @@ class ContextMiddleware:
         injected = list(self.context)
         if self.injector:
             injected.extend(normalize_messages(self.injector(session_id, history)))
-        # 注入内容放在历史之前：这样「assistant 的 tool_call（在历史末尾）」与
-        # 「当前请求里的 tool 结果」不会被注入的 system 消息隔开——Responses API
-        # 要求 function_call 紧跟 function_call_output。
+        # Injected content goes before the history: this way "the assistant's tool_call (at the end of
+        # the history)" and "the tool result in the current request" are not separated by injected system
+        # messages -- the Responses API requires function_call to be immediately followed by
+        # function_call_output.
         return injected + history + normalize_messages(messages)
 
     @staticmethod
@@ -98,12 +101,13 @@ class ContextMiddleware:
         *,
         created_at: str | None = None,
     ) -> None:
-        """把「本次请求入参 + 本次回复」写入会话。
+        """Write "this request's input + this reply" into the session.
 
-        这一组消息与 ``response.usage`` 会并入当前进行中的轮（``begin_round()`` 打开的
-        完整 agent-loop）；没有进行中的轮时（单独使用 Middleware）会立即定稿成一轮。
-        轮的 ``usage`` 汇总本轮的 token 消耗（同时累加到 ``session.usage``）、本轮占用
-        的上下文空间（``context_tokens`` / ``context_chars``）以及起止时间。
+        This group of messages and ``response.usage`` are merged into the currently ongoing round (the
+        complete agent-loop opened by ``begin_round()``); when there is no ongoing round (using the
+        Middleware standalone) it is finalized into one round immediately. The round's ``usage``
+        summarizes this round's token consumption (also accumulated into ``session.usage``), the context
+        space occupied by this round (``context_tokens`` / ``context_chars``), and the start/end time.
         """
         session = self.ensure_session(session_id)
         items: list[Message] = []
@@ -154,7 +158,7 @@ class ContextMiddleware:
             self._save_turn(session_id, messages, final, created_at=started_at)
 
     # ------------------------------------------------------------------
-    # Session（工作区 + 上下文表示 + 元数据）
+    # Session (workspace + context representation + metadata)
     # ------------------------------------------------------------------
 
     def ensure_session(
@@ -164,7 +168,7 @@ class ContextMiddleware:
         workspace: str | Path | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Session:
-        """获取会话；不存在时按 middleware 默认工作区创建。"""
+        """Get the session, creating it with the middleware's default workspace if it does not exist."""
         return self.store.ensure_session(
             session_id,
             workspace=self.workspace if workspace is None else workspace,
@@ -172,23 +176,23 @@ class ContextMiddleware:
         )
 
     def get_session(self, session_id: str = "default") -> Session | None:
-        """返回会话对象；不存在时为 ``None``（不会创建会话）。"""
+        """Return the session object; ``None`` if it does not exist (does not create a session)."""
         return self.store.get_session(session_id)
 
     def session_workspace(self, session_id: str = "default") -> Path:
-        """返回会话生效的工作区。"""
+        """Return the effective workspace of the session."""
         return self.store.workspace(session_id)
 
     def set_workspace(self, session_id: str, workspace: str | Path | None) -> Session:
-        """设置会话工作区；``None`` 表示恢复为“运行时继承”。"""
+        """Set the session workspace; ``None`` restores "inherited at runtime"."""
         return self.store.set_workspace(session_id, workspace)
 
     def get_session_usage(self, session_id: str = "default") -> dict[str, int]:
-        """返回会话累计的 token 用量（input/output/cache_hit/total）。
+        """Return the session's cumulative token usage (input/output/cache_hit/total).
 
-        会话存在时以独立字段 ``session.usage``（可持久化）为准，因此
-        ``reset_session_usage()`` 之后读到的是归零结果；会话不存在时回退到
-        ``LLMClient`` 的计数。
+        When the session exists, the separate field ``session.usage`` (persistable) wins, so after
+        ``reset_session_usage()`` the value read is the zeroed result; when the session does not exist it
+        falls back to the ``LLMClient`` counter.
         """
         session = self.store.get_session(session_id)
         if session is not None:
@@ -198,42 +202,43 @@ class ContextMiddleware:
         return dict(self.client.get_session_usage(session_id))
 
     def reset_session_usage(self, session_id: str = "default") -> Session | None:
-        """把会话累计的 token 用量归零；会话不存在时返回 ``None``。"""
+        """Zero the session's cumulative token usage; return ``None`` if the session does not exist."""
         session = self.store.get_session(session_id)
         if session is not None:
             session.reset_usage()
         return session
 
     def get_session_rounds(self, session_id: str = "default") -> list[Round]:
-        """返回会话的分轮记录：每一轮 ``{context, usage}``；会话不存在时为空列表。
+        """Return the session's per-round records: each round ``{context, usage}``; empty list if the session does not exist.
 
-        一轮 = 一次完整 agent-loop：``context`` 是本轮全部消息（请求 + 每次 LLM 调用 +
-        工具结果），``usage`` 是本轮输入/输出 token 汇总、本轮占用的上下文空间
-        （``context_tokens`` / ``context_chars``）以及本轮起止时间
-        （``created_at`` / ``updated_at``）。
+        One round = one complete agent-loop: ``context`` is all of this round's messages (request + every
+        LLM call + tool results), and ``usage`` is this round's input/output token summary, the context
+        space this round occupies (``context_tokens`` / ``context_chars``), and this round's start/end
+        time (``created_at`` / ``updated_at``).
         """
         session = self.store.get_session(session_id)
         return list(session.rounds) if session is not None else []
 
     # ------------------------------------------------------------------
-    # 分轮（round）：一轮 = 一次完整 agent-loop
+    # Rounds (round): one round = one complete agent-loop
     # ------------------------------------------------------------------
 
     def begin_round(self, session_id: str = "default") -> Round:
-        """开始一轮完整对话（一轮 = 一次 agent-loop）；已有进行中的轮时直接复用。
+        """Start one complete conversation round (one round = one agent-loop); reuse an ongoing round directly.
 
-        ``AgentEngine`` 在工具循环开始前调用本方法、循环结束后调用 ``end_round()``，
-        因此这一轮覆盖「一次请求 -> 多次 LLM 调用 + 工具执行 -> 最终回答」；期间
-        ``complete()`` / ``stream()`` 写入的消息与 usage 都会并入这一轮。
+        ``AgentEngine`` calls this method before the tool loop starts and ``end_round()`` after the loop
+        ends, so this round covers "one request -> multiple LLM calls + tool execution -> final answer";
+        messages and usage written by ``complete()`` / ``stream()`` during this period are merged into
+        this round.
         """
         return self.ensure_session(session_id).begin_round()
 
     def end_round(self, session_id: str = "default") -> Round | None:
-        """结束进行中的轮（把本轮消息 + usage 定稿到会话）；没有则返回 ``None``。"""
+        """End the ongoing round (finalize this round's messages + usage into the session); return ``None`` if none."""
         session = self.store.get_session(session_id)
         return session.end_round() if session is not None else None
 
     def open_round(self, session_id: str = "default") -> Round | None:
-        """返回进行中的轮（尚未 ``end_round()``）；没有时返回 ``None``。"""
+        """Return the ongoing round (not yet ``end_round()``); ``None`` if none."""
         session = self.store.get_session(session_id)
         return session.open_round if session is not None else None

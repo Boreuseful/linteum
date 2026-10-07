@@ -1,4 +1,4 @@
-"""``python -m cli`` 入口：转发到 ``cli.main.main``。"""
+"""``python -m cli`` entry point: forwards to ``cli.main.main``."""
 
 from __future__ import annotations
 

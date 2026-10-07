@@ -20,7 +20,7 @@ try:
         to_openai_message,
         to_responses_input,
     )
-except ImportError:  # 兼容直接以脚本目录作为 import path 的旧用法
+except ImportError:  # compatibility with the old style of using the script directory as the import path
     from config import LLMConfig, OpenAIMode, ProviderName
     from ..messages.agent_message import Message, MessageInputs, MessageInput, ToolCall, normalize_messages, to_anthropic_message, to_openai_message, to_responses_input
 
@@ -33,22 +33,22 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     raw_response: Any = None
     tool_calls: list[ToolCall] = field(default_factory=list)
-    # 思维链内容（DeepSeek reasoning_content / Responses API reasoning item）。
+    # Chain-of-thought content (DeepSeek reasoning_content / Responses API reasoning item).
     reasoning_content: str = ""
 
 
 @dataclass
 class LLMStreamChunk:
     """
-    统一的流式响应。
+    A unified streaming response.
 
-    普通增量:
-        LLMStreamChunk(delta="你好")
+    Plain delta:
+        LLMStreamChunk(delta="hello")
 
-    思维链增量:
-        LLMStreamChunk(reasoning_content="让我先想想...")
+    Reasoning delta:
+        LLMStreamChunk(reasoning_content="let me think...")
 
-    流结束:
+    Stream end:
         LLMStreamChunk(
             delta="",
             done=True,
@@ -61,7 +61,7 @@ class LLMStreamChunk:
     done: bool = False
     usage: dict[str, int] = field(default_factory=dict)
     response: LLMResponse | None = None
-    # 本次增量中的思维链文本。
+    # The chain-of-thought text in this delta.
     reasoning_content: str = ""
 
 
@@ -80,7 +80,7 @@ def normalize_usage(
 
 
 def _nested_usage_value(usage: Any, *names: str) -> int:
-    """读取供应商 usage 中可能位于 details 对象内的数值。"""
+    """Read a numeric value from the provider usage that may be nested inside a details object."""
     for name in names:
         value = getattr(usage, name, None)
         if value is not None:
@@ -91,7 +91,7 @@ def _nested_usage_value(usage: Any, *names: str) -> int:
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
-    """兼容对象和 dict 两种取值方式（OpenAI SDK 新旧版本都可能返回 dict）。"""
+    """Support both object and dict access (both old and new OpenAI SDK versions may return a dict)."""
     if value is None:
         return default
     if isinstance(value, dict):
@@ -100,7 +100,7 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
 
 
 def _reasoning_from_message(message: Any) -> str:
-    """从 Chat Completions 的 assistant message 中提取思维链文本。"""
+    """Extract the chain-of-thought text from a Chat Completions assistant message."""
     reasoning = _field(message, "reasoning_content") or _field(message, "reasoning")
     return reasoning if isinstance(reasoning, str) else ""
 
@@ -109,7 +109,7 @@ _RESPONSES_REASONING_PART_TYPES = {"reasoning_text", "summary_text", "thinking_t
 
 
 def _reasoning_from_responses(response: Any) -> str:
-    """从 Responses API 的 output 中提取 reasoning item 的文本。"""
+    """Extract the text of reasoning items from the Responses API output."""
     parts: list[str] = []
 
     for item in _field(response, "output") or []:
@@ -141,7 +141,7 @@ def _accumulate_tool_calls(
     state: dict[int, dict[str, str]],
     deltas: Any,
 ) -> None:
-    """把流式增量里的 tool_calls 片段按 index 累积起来。"""
+    """Accumulate the tool_calls fragments in a streaming delta by index."""
     for delta in deltas or []:
         index = _field(delta, "index")
         if index is None:
@@ -242,7 +242,7 @@ def _tool_calls_from_anthropic(response: Any) -> list[ToolCall]:
 
 class BaseLLMProvider(ABC):
     """
-    所有模型供应商必须实现的统一接口。
+    The unified interface that all model providers must implement.
     """
 
     def __init__(self, config: LLMConfig):
@@ -282,15 +282,15 @@ class BaseLLMProvider(ABC):
 
 class OpenAIProvider(BaseLLMProvider):
     """
-    OpenAI 模型供应商。
+    The OpenAI model provider.
 
-    支持:
+    Supports:
     - Responses API
     - Chat Completions API
-    - 同步调用
-    - 异步调用
-    - 同步流式调用
-    - 异步流式调用
+    - synchronous calls
+    - asynchronous calls
+    - synchronous streaming calls
+    - asynchronous streaming calls
     """
 
     provider_name = "openai"
@@ -302,8 +302,8 @@ class OpenAIProvider(BaseLLMProvider):
 
         if not api_key:
             raise ValueError(
-                "未找到 OpenAI API Key，请通过 api_key "
-                "或 OPENAI_API_KEY 环境变量配置"
+                "OpenAI API Key not found; configure it via api_key "
+                "or the OPENAI_API_KEY environment variable"
             )
 
         self.client = OpenAI(
@@ -391,11 +391,11 @@ class OpenAIProvider(BaseLLMProvider):
     @staticmethod
     def _validate_messages(messages: list[Message]) -> None:
         if not messages:
-            raise ValueError("messages 不能为空")
+            raise ValueError("messages must not be empty")
 
         for message in messages:
             if not getattr(message, "role", None):
-                raise ValueError("每条 message 必须包含 role")
+                raise ValueError("every message must contain a role")
 
     def _responses_request(
         self,
@@ -637,7 +637,7 @@ class OpenAIProvider(BaseLLMProvider):
         response = self.client.chat.completions.create(**request)
 
         if not response.choices:
-            raise RuntimeError("Chat Completions 返回结果中没有 choices")
+            raise RuntimeError("Chat Completions response contains no choices")
 
         content = response.choices[0].message.content or ""
         message = response.choices[0].message
@@ -825,7 +825,7 @@ class OpenAIProvider(BaseLLMProvider):
         response = await self.async_client.chat.completions.create(**request)
 
         if not response.choices:
-            raise RuntimeError("Chat Completions 返回结果中没有 choices")
+            raise RuntimeError("Chat Completions response contains no choices")
 
         content = response.choices[0].message.content or ""
         message = response.choices[0].message
@@ -914,21 +914,21 @@ class OpenAIProvider(BaseLLMProvider):
 
 class OpenAICompatibleProvider(OpenAIProvider):
     """
-    OpenAI 兼容模型。
+    OpenAI-compatible models.
 
-    例如:
+    For example:
     - DeepSeek
     - Moonshot
     - SiliconFlow
-    - 通义千问兼容接口
-    - 智谱兼容接口
+    - Qwen (Tongyi Qianwen) compatible endpoint
+    - Zhipu compatible endpoint
     """
     provider_name = "openai_compatible"
 
     def __init__(self, config: LLMConfig):
         if not config.base_url:
             raise ValueError(
-                "provider='openai_compatible' 时必须配置 base_url"
+                "base_url is required when provider='openai_compatible'"
             )
 
         super().__init__(config)
@@ -1204,15 +1204,16 @@ class AnthropicProvider(BaseLLMProvider):
 
 class DeepseekCompatibleProvider(OpenAIProvider):
     """
-    DeepSeek Provider。
+    The DeepSeek Provider.
 
-    既支持 ``provider="deepseek"``，也兼容旧的 ``provider="deepseek_compatible"``。
+    Supports both ``provider="deepseek"`` and the legacy ``provider="deepseek_compatible"``.
 
-    默认行为:
-    - base_url 缺省为 ``https://api.deepseek.com``
-    - api_key 缺省读取 ``DEEPSEEK_API_KEY``，回退 ``OPENAI_API_KEY``
-    - 支持 thinking mode（思维链），并在携带 tools 时按 DeepSeek 要求回传
-      ``reasoning_content``，从而支持"思维链 + 工具调用"的多轮对话
+    Default behavior:
+    - base_url defaults to ``https://api.deepseek.com``
+    - api_key reads ``DEEPSEEK_API_KEY`` by default, falling back to ``OPENAI_API_KEY``
+    - supports thinking mode (chain of thought) and, when tools are carried, sends back
+      ``reasoning_content`` as DeepSeek requires, enabling multi-turn "chain of thought + tool
+      calling" conversations
     """
 
     provider_name = "deepseek"
@@ -1228,8 +1229,8 @@ class DeepseekCompatibleProvider(OpenAIProvider):
 
         if not api_key:
             raise ValueError(
-                "未找到 DeepSeek API Key，请通过 api_key "
-                f"或 {self.api_key_env} 环境变量配置"
+                "DeepSeek API Key not found; configure it via api_key "
+                f"or the {self.api_key_env} environment variable"
             )
 
         if not config.base_url:
@@ -1241,7 +1242,7 @@ class DeepseekCompatibleProvider(OpenAIProvider):
         super().__init__(config)
 
     # ------------------------------------------------------------------
-    # DeepSeek thinking mode 参数注入
+    # DeepSeek thinking mode parameter injection
     # ------------------------------------------------------------------
 
     def _thinking_kwargs(
@@ -1250,7 +1251,7 @@ class DeepseekCompatibleProvider(OpenAIProvider):
         *,
         responses: bool,
     ) -> dict[str, Any]:
-        """把 config/调用参数中的 thinking 配置翻译成 DeepSeek 请求参数。"""
+        """Translate the thinking config from config/call arguments into DeepSeek request parameters."""
         kwargs = dict(kwargs)
 
         effort = kwargs.pop("reasoning_effort", self.config.reasoning_effort)
@@ -1286,7 +1287,7 @@ class DeepseekCompatibleProvider(OpenAIProvider):
         **kwargs: Any,
     ) -> dict[str, Any]:
         if stream:
-            # DeepSeek 只在显式开启 include_usage 时于最后一个 chunk 返回 usage。
+            # DeepSeek returns usage in the last chunk only when include_usage is explicitly enabled.
             stream_options = dict(kwargs.get("stream_options") or {})
             stream_options.setdefault("include_usage", True)
             kwargs["stream_options"] = stream_options

@@ -17,7 +17,7 @@ OpenAIMode = Literal[
     "chat_completions",
 ]
 
-# DeepSeek 思维链（thinking mode）的推理强度。
+# Reasoning effort for DeepSeek chain-of-thought (thinking mode).
 ReasoningEffort = Literal[
     "none",
     "low",
@@ -45,8 +45,8 @@ class LLMConfig:
     max_tokens: int = 1024
     top_p: float | None = None
 
-    # 思维链（reasoning / thinking mode）配置。
-    # DeepSeek 在 Chat Completions 下映射到 reasoning_effort + extra_body.thinking，
-    # 在 Responses API 下映射到 reasoning.effort。
+    # Chain-of-thought (reasoning / thinking mode) configuration.
+    # Under Chat Completions, DeepSeek maps this to reasoning_effort + extra_body.thinking,
+    # and under the Responses API it maps to reasoning.effort.
     reasoning_effort: ReasoningEffort | str | None = None
     thinking: bool | None = None

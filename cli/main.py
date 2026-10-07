@@ -1,19 +1,21 @@
-"""``linteum`` 命令行入口：注册子命令、解析 ``argv``、分发到 handler。
+"""The ``linteum`` command-line entry point: register subcommands, parse ``argv``, dispatch to handlers.
 
-架构（对齐 hermes 的 Builder + 依赖注入）:
+Architecture (mirroring hermes' Builder + dependency injection):
 
-- ``cli/subcommands/<group>.py`` **只**提供
-  ``build_<group>_parser(subparsers, *, cmd_<group>=...)``，handler 由本模块注入；
-  这些模块**绝不 import main**（避免循环依赖）。
-- ``_forward_command()`` 是**惰性 import 工厂**：handler 在被调用时才
-  ``importlib.import_module(target)``，因此
-  (a) 快路径不为重模块付启动成本；(b) ``patch("<module>.<attr>")`` 仍能拦截。
-- ``_build_cli_parser()`` 逐个 ``build_<group>_parser(subparsers, cmd_<group>=handler)``，
-  **注册顺序即 ``linteum --help`` 顺序**。
-- 统一分发契约：每个叶子 parser ``set_defaults(func=handler)``，``main()`` 统一
-  ``args.func(args)``；handler 返回 ``int`` 时作为进程退出码（``None`` = 成功）。
+- ``cli/subcommands/<group>.py`` **only** provides
+  ``build_<group>_parser(subparsers, *, cmd_<group>=...)``; the handler is injected by this module,
+  and those modules **never import main** (to avoid circular imports).
+- ``_forward_command()`` is a **lazy import factory**: the handler only calls
+  ``importlib.import_module(target)`` when invoked, so
+  (a) the fast path pays no startup cost for heavy modules; (b) ``patch("<module>.<attr>")`` can still
+  intercept.
+- ``_build_cli_parser()`` calls ``build_<group>_parser(subparsers, cmd_<group>=handler)`` one by one;
+  **the registration order is the ``linteum --help`` order**.
+- Unified dispatch contract: every leaf parser uses ``set_defaults(func=handler)`` and ``main()``
+  uniformly calls ``args.func(args)``; when a handler returns an ``int`` it is used as the process
+  exit code (``None`` = success).
 
-同时支持 ``python -m cli.main`` 与 ``python cli/main.py``。
+Both ``python -m cli.main`` and ``python cli/main.py`` are supported.
 """
 
 from __future__ import annotations
@@ -21,13 +23,14 @@ from __future__ import annotations
 import os
 import sys
 
-# 允许 `python cli/main.py` 直接运行：确保项目根目录在 sys.path 上，这样包内绝对导入
-# `cli.*` 与 `linteum_agent.*` 都能解析（`python -m cli.main` 时无副作用）。
+# Allow running `python cli/main.py` directly: ensure the project root is on sys.path so the
+# intra-package absolute imports `cli.*` and `linteum_agent.*` resolve (no side effect under
+# `python -m cli.main`).
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from cli import PROG, __version__, snapshot  # noqa: E402 - 依赖上面的 sys.path 处理
+from cli import PROG, __version__, snapshot  # noqa: E402 - depends on the sys.path handling above
 from cli._parser import build_top_level_parser  # noqa: E402
 from cli.subcommands.chat import build_chat_parser  # noqa: E402
 from cli.subcommands.config import build_config_parser  # noqa: E402
@@ -40,18 +43,19 @@ from cli.subcommands.status import build_status_parser  # noqa: E402
 from cli.subcommands.tools import build_tools_parser  # noqa: E402
 
 # ----------------------------------------------------------------------
-# 惰性 import 工厂
+# Lazy import factory
 # ----------------------------------------------------------------------
 
 
 def _forward_command(name: str, module: str, attr: str, *, forward_return: bool = False,
                      doc: str = ""):
-    """返回一个 ``linteum <cmd>`` handler：调用时才把 ``args`` 交给 ``<module>.<attr>``。
+    """Return a ``linteum <cmd>`` handler: only hands ``args`` to ``<module>.<attr>`` when invoked.
 
-    ``importlib.import_module`` 放在**调用时**，因此
-    (a) 启动 / ``--help`` 不为实现模块付 import 成本；
-    (b) ``patch("<module>.<attr>")`` 仍能拦截真实实现。
-    ``forward_return=True`` 时把实现返回码上浮给 ``main()`` 作为进程退出码。
+    ``importlib.import_module`` is deferred to **invocation time**, so
+    (a) startup / ``--help`` pays no import cost for the implementation module;
+    (b) ``patch("<module>.<attr>")`` can still intercept the real implementation.
+    With ``forward_return=True`` the implementation's return code is propagated to ``main()`` as the
+    process exit code.
     """
 
     def _cmd(args):
@@ -65,36 +69,36 @@ def _forward_command(name: str, module: str, attr: str, *, forward_return: bool 
     return _cmd
 
 
-# handler 由 main 唯一定义并注入 subcommand builder；实现本体在 cli.commands.*（惰性 import）。
+# Handlers are defined only here by main and injected into subcommand builders; the implementations live in cli.commands.* (lazy import).
 cmd_chat = _forward_command(
-    "cmd_chat", "cli.commands.chat", "run_chat", forward_return=True, doc="与 Agent 对话。")
+    "cmd_chat", "cli.commands.chat", "run_chat", forward_return=True, doc="Chat with the Agent.")
 cmd_setup = _forward_command(
-    "cmd_setup", "cli.commands.setup", "run_setup", forward_return=True, doc="初始化配置与项目状态。")
+    "cmd_setup", "cli.commands.setup", "run_setup", forward_return=True, doc="Initialize config and project state.")
 cmd_snapshot = _forward_command(
-    "cmd_snapshot", "cli.commands.snapshot", "run_snapshot", forward_return=True, doc="快照管理。")
+    "cmd_snapshot", "cli.commands.snapshot", "run_snapshot", forward_return=True, doc="Snapshot management.")
 cmd_sessions = _forward_command(
-    "cmd_sessions", "cli.commands.sessions", "run_sessions", forward_return=True, doc="会话历史。")
+    "cmd_sessions", "cli.commands.sessions", "run_sessions", forward_return=True, doc="Session history.")
 cmd_config = _forward_command(
-    "cmd_config", "cli.commands.config", "run_config", forward_return=True, doc="配置读写。")
+    "cmd_config", "cli.commands.config", "run_config", forward_return=True, doc="Config read/write.")
 cmd_model = _forward_command(
-    "cmd_model", "cli.commands.model", "run_model", forward_return=True, doc="模型选择。")
+    "cmd_model", "cli.commands.model", "run_model", forward_return=True, doc="Model selection.")
 cmd_tools = _forward_command(
-    "cmd_tools", "cli.commands.tools", "run_tools", forward_return=True, doc="工具列表。")
+    "cmd_tools", "cli.commands.tools", "run_tools", forward_return=True, doc="Tool list.")
 cmd_skills = _forward_command(
-    "cmd_skills", "cli.commands.skills", "run_skills", forward_return=True, doc="Skill 列表。")
+    "cmd_skills", "cli.commands.skills", "run_skills", forward_return=True, doc="Skill list.")
 cmd_status = _forward_command(
-    "cmd_status", "cli.commands.status", "run_status", forward_return=True, doc="运行时状态。")
+    "cmd_status", "cli.commands.status", "run_status", forward_return=True, doc="Runtime status.")
 
 
 # ----------------------------------------------------------------------
-# 子命令清单 / 默认命令
+# Subcommand list / default command
 # ----------------------------------------------------------------------
 
-#: 全部内置子命令名（与 ``_build_cli_parser`` 的注册顺序 / 集合严格一致）。
+#: All built-in subcommand names (strictly consistent with the registration order / set of ``_build_cli_parser``).
 _BUILTIN_SUBCOMMANDS = frozenset(
     {"chat", "setup", "snapshot", "sessions", "config", "model", "tools", "skills", "status"})
 
-#: 无子命令时落到 ``chat``；这些是 chat 专属字段的默认值。
+#: Without a subcommand it falls to ``chat``; these are the defaults for chat-only fields.
 _CHAT_DEFAULTS = {
     "prompt": None,
     "stream": True,
@@ -106,7 +110,7 @@ _CHAT_DEFAULTS = {
 
 
 def _default_to_chat(args):
-    """``linteum``（无子命令）→ 走 ``cmd_chat``，补上未解析的 chat 默认值。"""
+    """``linteum`` (no subcommand) -> go through ``cmd_chat``, filling in unparsed chat defaults."""
     args.command = "chat"
     for name, default in _CHAT_DEFAULTS.items():
         if not hasattr(args, name):
@@ -115,15 +119,16 @@ def _default_to_chat(args):
 
 
 # ----------------------------------------------------------------------
-# 解析树
+# Parser tree
 # ----------------------------------------------------------------------
 
 
 def _build_cli_parser():
-    """构建完整 ``linteum`` argparse 树 -> ``(parser, subparsers)``。
+    """Build the full ``linteum`` argparse tree -> ``(parser, subparsers)``.
 
-    注册顺序即 ``linteum --help`` 顺序，保持稳定。每个组的 parser 在
-    ``cli/subcommands/<group>.py`` 里构建，handler 在这里注入，因此那些模块从不 import main。
+    The registration order is the ``linteum --help`` order and is kept stable. Each group's parser is
+    built in ``cli/subcommands/<group>.py``, and the handler is injected here, so those modules never
+    import main.
     """
     parser, subparsers = build_top_level_parser()
 
@@ -141,7 +146,7 @@ def _build_cli_parser():
 
 
 def _parse_cli_args(parser, subparsers, argv):
-    """解析 ``argv``；子命令可省略（裸 ``linteum`` 落到 chat），因此 subparsers 非必需。"""
+    """Parse ``argv``; the subcommand may be omitted (bare ``linteum`` falls to chat), so subparsers is not required."""
     subparsers.required = False
     return parser.parse_args(argv)
 
@@ -151,22 +156,22 @@ def _cmd_version() -> None:
 
 
 def _run(func, args) -> int:
-    """执行 handler：``BrokenPipeError``（如输出被 ``head`` 提前关闭）静默退出。"""
+    """Execute the handler: ``BrokenPipeError`` (e.g. output closed early by ``head``) exits silently."""
     try:
         result = func(args)
     except BrokenPipeError:
-        # 把 stdout 换成 devnull，避免解释器退出时再次 flush 抛栈。
+        # Point stdout at devnull to avoid another flush stack trace when the interpreter exits.
         try:
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, sys.stdout.fileno())
-        except OSError:  # pragma: no cover - 兜底
+        except OSError:  # pragma: no cover - fallback
             pass
         return 0
     return result if isinstance(result, int) else 0
 
 
 def main(argv=None) -> int:
-    """CLI 主入口：解析 -> 处理全局 flag -> 分发到 ``args.func``，返回进程退出码。"""
+    """CLI main entry point: parse -> handle global flags -> dispatch to ``args.func``; return the process exit code."""
     argv = list(sys.argv[1:] if argv is None else argv)
 
     parser, subparsers = _build_cli_parser()
@@ -176,11 +181,12 @@ def main(argv=None) -> int:
         _cmd_version()
         return 0
 
-    # 快照（默认启用）：解析工作区（默认命令启动目录 / --use-snapshot）+ 写快照。
-    # setup / snapshot 子命令自行管理，boot() 会跳过。
+    # Snapshot (enabled by default): resolve the workspace (default: the command's start directory /
+    # --use-snapshot) + write the snapshot.
+    # The setup / snapshot subcommands manage this themselves; boot() skips them.
     snapshot.boot(args)
 
-    # 没有子命令（可带顶层 -w / -s / -y）→ 默认 chat；`linteum` 直接进入交互式对话。
+    # No subcommand (top-level -w / -s / -y allowed) -> default to chat; bare `linteum` enters interactive conversation.
     if args.command is None:
         return _run(_default_to_chat, args)
 

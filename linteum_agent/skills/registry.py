@@ -10,9 +10,9 @@ from ..tools import Session, Tool, ToolResult
 
 class SkillRegistry:
     """
-    Skill 发现、注册和延迟加载器。
+    Skill discovery, registration, and lazy loader.
 
-    使用方式：
+    Usage:
 
         registry = SkillRegistry(
             system_skill_dirs=[
@@ -60,13 +60,13 @@ class SkillRegistry:
             for path in project_skill_dirs
         )
 
-        # 保存所有同名候选 Skill，便于诊断和选择。
+        # Keep all candidates with the same Skill name, for diagnostics and selection.
         self._candidates: dict[str, list[SkillMetadata]] = {}
 
-        # 选中的 Skill，也就是实际使用的 Skill。
+        # The selected Skill, i.e. the one actually used.
         self._selected: dict[str, SkillMetadata] = {}
 
-        # 延迟加载后的内容缓存。
+        # Content cache after lazy loading.
         self._content_cache: dict[Path, str] = {}
 
     # ------------------------------------------------------------------
@@ -75,9 +75,9 @@ class SkillRegistry:
 
     def discover(self) -> list[SkillMetadata]:
         """
-        扫描所有来源目录，发现 SKILL.md 并注册元数据。
+        Scan all source directories, discover SKILL.md, and register metadata.
 
-        返回所有发现的 Skill，包括被覆盖的候选项。
+        Return all discovered Skills, including overridden candidates.
         """
         self._candidates.clear()
         self._selected.clear()
@@ -118,9 +118,9 @@ class SkillRegistry:
 
     def _find_skill_files(self, root: Path) -> list[Path]:
         """
-        找到来源目录下所有 SKILL.md。
+        Find all SKILL.md files under a source directory.
 
-        每个包含 SKILL.md 的目录都被视为一个 Skill。
+        Every directory containing a SKILL.md is treated as a Skill.
         """
         return sorted(
             path
@@ -135,10 +135,10 @@ class SkillRegistry:
         source: SkillSource,
     ) -> SkillMetadata:
         """
-        读取 Skill 元数据。
+        Read Skill metadata.
 
-        注意：这里虽然读取了文件内容，但只解析 frontmatter；
-        正文不会进入 registry 的运行时提示词。
+        Note: although the file content is read here, only the frontmatter is parsed; the body does not
+        enter the registry's runtime prompt.
         """
         skill_file = skill_file.resolve()
 
@@ -169,13 +169,13 @@ class SkillRegistry:
 
     def _select_skills(self) -> None:
         """
-        为每个 Skill 名称选择一个实际生效的候选项。
+        Choose one effective candidate for each Skill name.
 
-        规则：
+        Rules:
 
-        1. priority 越高越优先；
-        2. 同一来源下，路径排序靠后的 Skill 优先；
-        3. 项目 Skill 默认覆盖系统 Skill。
+        1. The higher the priority, the higher the precedence;
+        2. Within the same source, the Skill whose path sorts later takes precedence;
+        3. Project Skills override system Skills by default.
         """
         for name, candidates in self._candidates.items():
             selected = max(
@@ -193,13 +193,13 @@ class SkillRegistry:
 
     def names(self) -> list[str]:
         """
-        返回当前生效的 Skill 名称。
+        Return the currently effective Skill names.
         """
         return sorted(self._selected)
 
     def list_skills(self) -> list[SkillMetadata]:
         """
-        返回当前生效的 Skill 元数据。
+        Return the currently effective Skill metadata.
         """
         return [
             self._selected[name]
@@ -208,13 +208,13 @@ class SkillRegistry:
 
     def get(self, name: str) -> SkillMetadata | None:
         """
-        获取当前生效的 Skill 元数据。
+        Get the currently effective Skill metadata.
         """
         return self._selected.get(name)
 
     def require(self, name: str) -> SkillMetadata:
         """
-        获取 Skill；不存在时抛出明确异常。
+        Get a Skill; raise a clear exception when it does not exist.
         """
         skill = self.get(name)
 
@@ -229,18 +229,18 @@ class SkillRegistry:
 
     def candidates(self, name: str) -> list[SkillMetadata]:
         """
-        返回同名 Skill 的所有候选项。
+        Return all candidates of a same-named Skill.
 
-        用于调试覆盖关系。
+        Used to debug the override relationships.
         """
         return list(self._candidates.get(name, []))
 
     def bind_session(self, session: Session) -> Session:
         """
-        把当前生效的 Skill 记录到会话，返回该会话。
+        Record the currently effective Skills into the session and return that session.
 
-        等价于 ``session.register_skills(self.list_skills())``，会话随后可用
-        ``session.registered_skills()`` 查看本会话注册了哪些 Skill。
+        Equivalent to ``session.register_skills(self.list_skills())``; the session can then use
+        ``session.registered_skills()`` to see which Skills were registered for it.
         """
         session.register_skills(self.list_skills())
         return session
@@ -256,9 +256,9 @@ class SkillRegistry:
         include_scope: bool = True,
     ) -> str:
         """
-        构造可以注入 system prompt 的轻量 Skill 索引。
+        Build a lightweight Skill index that can be injected into the system prompt.
 
-        不包含 SKILL.md 正文。
+        Does not include the SKILL.md body.
         """
         skills = self.list_skills()
 
@@ -307,7 +307,7 @@ class SkillRegistry:
         use_cache: bool = True,
     ) -> str:
         """
-        延迟加载完整的 SKILL.md。
+        Lazily load the full SKILL.md.
         """
         skill = self.require(name)
         return self._read_text(
@@ -323,7 +323,7 @@ class SkillRegistry:
                 return ToolResult(value)
             except Exception as exc:
                 return ToolResult(str(exc), is_error=True)
-        return Tool("load_skill", "延迟加载完整的 SKILL.md", {
+        return Tool("load_skill", "Lazily load the full SKILL.md", {
             "type": "object", "properties": {"name": {"type": "string"}},
             "required": ["name"], "additionalProperties": False}, execute)
 
@@ -335,16 +335,16 @@ class SkillRegistry:
         use_cache: bool = True,
     ) -> str:
         """
-        延迟加载 Skill 目录内的附加资料。
+        Lazily load additional material within a Skill directory.
 
-        例如：
+        For example:
 
             registry.load_reference(
                 "python-code-review",
                 "references/security-checklist.md",
             )
 
-        relative_path 必须是相对于 Skill 根目录的路径。
+        relative_path must be a path relative to the Skill root directory.
         """
         skill = self.require(skill_name)
 
@@ -379,7 +379,7 @@ class SkillRegistry:
                 return ToolResult(value)
             except Exception as exc:
                 return ToolResult(str(exc), is_error=True)
-        return Tool("load_reference", "延迟加载 Skill 目录内的附加资料", {
+        return Tool("load_reference", "Lazily load additional material within a Skill directory", {
             "type": "object", "properties": {"skill_name": {"type": "string"}, "relative_path": {"type": "string"}},
             "required": ["skill_name", "relative_path"], "additionalProperties": False}, execute)
 
@@ -392,9 +392,9 @@ class SkillRegistry:
         use_cache: bool,
     ) -> str:
         """
-        受限文件读取。
+        Restricted file read.
 
-        即使调用方传入了符号链接，也要在 resolve 后重新检查路径。
+        Even if the caller passes a symlink, re-check the path after resolving it.
         """
         path = path.resolve()
         allowed_root = allowed_root.resolve()
@@ -423,7 +423,7 @@ class SkillRegistry:
 
     def conflicts(self) -> dict[str, list[SkillMetadata]]:
         """
-        返回存在多个候选项的同名 Skill。
+        Return same-named Skills that have multiple candidates.
         """
         return {
             name: candidates
@@ -433,7 +433,7 @@ class SkillRegistry:
 
     def describe(self, name: str) -> str:
         """
-        返回一个 Skill 的来源和覆盖信息。
+        Return the source and override information of a Skill.
         """
         selected = self.require(name)
         candidates = self.candidates(name)
@@ -464,7 +464,7 @@ class SkillRegistry:
     @staticmethod
     def _is_within(path: Path, root: Path) -> bool:
         """
-        判断 path 是否位于 root 内部或就是 root 本身。
+        Determine whether path is inside root or is root itself.
         """
         try:
             path.relative_to(root)
@@ -475,7 +475,7 @@ class SkillRegistry:
     @staticmethod
     def _validate_skill_name(name: str) -> None:
         """
-        Skill 名称只允许安全的标识符形式。
+        A Skill name is only allowed to be a safe identifier form.
         """
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
             raise ValueError(
@@ -486,18 +486,17 @@ class SkillRegistry:
 
 def parse_frontmatter(text: str) -> dict[str, str]:
     """
-    解析简单 YAML 风格 frontmatter。
+    Parse simple YAML-style frontmatter.
 
-    支持：
+    Supports:
 
         ---
         name: python-code-review
         description: Review Python code
         ---
 
-    该解析器适用于简单字符串字段。
-    如果需要支持数组、嵌套对象、多行字符串等 YAML 特性，
-    建议改用 yaml.safe_load。
+    This parser works for simple string fields. If you need YAML features such as arrays, nested
+    objects, or multi-line strings, use yaml.safe_load instead.
     """
     match = re.match(
         r"\A\s*---[ \t]*\n"
