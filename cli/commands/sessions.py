@@ -128,7 +128,7 @@ def _new(args) -> int:
     if switched:
         from cli.session_state import set_current_session
 
-        set_current_session(session_id)
+        set_current_session(session_id, workspace=_workspace(args))
 
     if getattr(args, "json", False):
         print(json.dumps(
@@ -159,18 +159,19 @@ def _switch(args) -> int:
             print(f"  {info.session_id}", file=sys.stderr)
         return 2
 
-    set_current_session(found.session_id)
+    set_current_session(found.session_id, workspace=workspace)
     print(f"current     : {found.session_id}")
     print(f"file        : {found.path}")
+    print(f"workspace   : {workspace}")
     return 0
 
 
 def _current(args) -> int:
     """Show the current session (give a hint when unset; not an error)."""
-    from cli.session_state import current_session_path, get_current_session
+    from cli.session_state import current_session_path, get_current_session_entry
 
-    session_id = get_current_session()
-    if session_id is None:
+    entry = get_current_session_entry()
+    if entry is None:
         if getattr(args, "json", False):
             print(json.dumps({"session_id": None}, ensure_ascii=False))
         else:
@@ -178,15 +179,19 @@ def _current(args) -> int:
                   "or switch with `linteum sessions switch <id>`)")
         return 0
 
+    session_id = entry.session_id
     found = _resolve_session(_workspace(args), session_id)
     path = None if (found is None or isinstance(found, list)) else str(found.path)
+    workspace = str(entry.workspace) if entry.workspace is not None else None
     if getattr(args, "json", False):
         print(json.dumps(
-            {"session_id": session_id, "path": path,
+            {"session_id": session_id, "path": path, "workspace": workspace,
              "current_session_path": str(current_session_path())},
             ensure_ascii=False, indent=2))
         return 0
     print(f"current     : {session_id}")
+    if workspace is not None:
+        print(f"workspace   : {workspace}")
     if path is not None:
         print(f"file        : {path}")
     return 0

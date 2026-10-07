@@ -16,6 +16,60 @@ def _workspace(args) -> Path:
     return Path(workspace).expanduser() if workspace else Path.cwd()
 
 
+def _same_workspace(recorded, workspace) -> bool:
+    """Whether two workspace paths denote the same directory (resolved; tolerant of symlinks)."""
+    try:
+        return Path(recorded).expanduser().resolve() == Path(workspace).expanduser().resolve()
+    except OSError:  # pragma: no cover - fallback (e.g. a broken symlink)
+        return Path(recorded).expanduser() == Path(workspace).expanduser()
+
+
+def _session_in_workspace(session_id: str, workspace: Path) -> bool:
+    """Whether ``session_id`` already has a copy that belongs to ``workspace`` (read-only, never creates)."""
+    from linteum_agent.run_agent import find_context_json
+
+    return find_context_json(workspace, session_id=session_id) is not None
+
+
+def _latest_session_id(workspace: Path) -> str | None:
+    """The most recently updated session of ``workspace`` (``None`` when the workspace has none)."""
+    from linteum_agent.run_agent import list_sessions
+
+    infos = list_sessions(workspace, only_current_workspace=True)
+    return infos[0].session_id if infos else None
+
+
+def _session_for_workspace(workspace: Path) -> str | None:
+    """Pick the session ``chat`` should use in ``workspace`` and keep the current-session pointer scoped.
+
+    The current session is stored per workspace, so switching to a different workspace must not keep
+    reusing the previous workspace's session:
+
+    - the pointer already belongs to ``workspace`` -> reuse it (**fast path**, no disk scan);
+    - a legacy pointer without a workspace, or one from another workspace -> reuse it only when that
+      session really lives in ``workspace``; otherwise fall through;
+    - the newest session of ``workspace`` -> switch to it (and record it as the current session);
+    - ``workspace`` has no session -> return ``None`` so ``AgentRunner`` mints a brand-new one (the
+      fresh session is then recorded by ``_prepare_session``).
+    """
+    from cli.session_state import get_current_session_entry, set_current_session
+
+    entry = get_current_session_entry()
+    if entry is not None:
+        recorded_workspace = entry.workspace
+        if recorded_workspace is not None and _same_workspace(recorded_workspace, workspace):
+            return entry.session_id  # fast path: the pointer is already scoped to this workspace
+        if _session_in_workspace(entry.session_id, workspace):
+            set_current_session(entry.session_id, workspace=workspace)
+            return entry.session_id
+
+    latest = _latest_session_id(workspace)
+    if latest is not None:
+        set_current_session(latest, workspace=workspace)
+        return latest
+    return None
+
+
 # Friendly notice when tool rounds are exceeded: give one actionable sentence instead of exposing the
 # underlying RuntimeError text directly.
 MAX_TOOL_ROUNDS_NOTICE = "(maximum tool-call rounds reached; this turn has stopped. Use --max-tool-rounds to raise the limit)"
@@ -26,19 +80,22 @@ def _warn_max_tool_rounds() -> None:
     print(MAX_TOOL_ROUNDS_NOTICE, file=sys.stderr)
 
 
-def _build_runner(args):
+def _build_runner(args, workspace: Path | None = None):
     """Build an ``AgentRunner`` from argv (lazy import to avoid startup cost for other subcommands).
 
-    Session selection: explicit ``-s/--session`` > the **current session** (set by
-    ``linteum sessions new/switch``) > automatic lookup / creation by ``AgentRunner`` based on the
-    workspace.
+    Session selection: explicit ``-s/--session`` > the current session **of this workspace** (set by
+    ``linteum sessions new/switch`` or by a previous ``chat``) > the workspace's newest session > a
+    brand-new session created by ``AgentRunner``. The current session is scoped to the workspace, so
+    switching workspaces never reuses another workspace's session id.
     """
     from linteum_agent.run_agent import build_agent
-    from cli.session_state import get_current_session
 
-    session_id = getattr(args, "session", None) or get_current_session()
+    if workspace is None:
+        workspace = _workspace(args)
+    explicit = getattr(args, "session", None)
+    session_id = explicit or _session_for_workspace(workspace)
     return build_agent(
-        workspace=_workspace(args),
+        workspace=workspace,
         session_id=session_id,
         config_path=getattr(args, "config", None),
         auto_approve=bool(getattr(args, "auto_approve", False)),
@@ -48,14 +105,24 @@ def _build_runner(args):
 
 
 def _prepare_session(runner, args) -> None:
-    """Decide between "create new" and "continue": ``--new`` creates and sets the current session, otherwise load the found existing session."""
-    if getattr(args, "new", False):
-        from cli.session_state import set_current_session
+    """Decide between "create new" and "continue", and keep the current-session pointer workspace-scoped.
 
+    - ``--new``: create a brand-new session and make it the current session;
+    - an existing workspace session was found: load (continue) it;
+    - a brand-new workspace session was minted by ``AgentRunner`` (no ``-s``): record it as the
+      current session, together with the workspace, so the next run here reuses it instead of
+      another workspace's session (and so the fast workspace check hits).
+    """
+    from cli.session_state import set_current_session
+
+    workspace = _workspace(args)
+    if getattr(args, "new", False):
         runner.create_context()
-        set_current_session(runner.session_id)
+        set_current_session(runner.session_id, workspace=workspace)
     elif getattr(runner, "has_unloaded_session", False):
         runner.load_session()
+    elif not getattr(args, "session", None):
+        set_current_session(runner.session_id, workspace=workspace)
 
 
 class _ConsolePrinter:
