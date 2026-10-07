@@ -1,0 +1,29 @@
+[project]
+name = "linteum"
+version = "0.0.0"
+description = "Add your description here"
+readme = "README.md"
+
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=1.11.0",
+    "openai>=3.26.0",
+    "pyyaml>=6.0.3",
+]
+
+# Register the `linteum` command: equivalent to `from cli.main import main; sys.exit(main())`.
+# The return value of ``main()`` is used as the process exit code.
+[project.scripts]
+linteum = "cli.main:main"
+
+# Make the project installable (build a wheel / sdist) with the hatchling backend.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Both top-level packages live at the repo root (flat layout), so list them explicitly
+# (auto-detection would otherwise be ambiguous with more than one top-level package).
+[tool.hatch.build.targets.wheel]
+packages = ["cli", "linteum_agent"]
+
+
