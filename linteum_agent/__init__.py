@@ -2,6 +2,9 @@
 
 Module layout:
 
+- ``bus``: event-driven runtime bus (immutable ``Event`` envelope, RCU router,
+  per-origin fair scheduling, WAL durability, backpressure/coalescing, namespace
+  isolation) migrated from the experimental ``new_projer`` framework;
 - ``config``: user-level config (``~/.agent/config.yaml``) read/write;
 - ``context``: conversation / session context storage;
 - ``messages``: message data models;
