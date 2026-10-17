@@ -1,24 +1,20 @@
-"""The linteum agent library: the runtime behind the ``linteum`` command-line tool.
+"""The linteum agent library: an event-driven agent runtime.
 
 Module layout:
 
-- ``bus``: event-driven runtime bus (immutable ``Event`` envelope, RCU router,
-  per-origin fair scheduling, WAL durability, backpressure/coalescing, namespace
-  isolation) migrated from the experimental ``new_projer`` framework;
-- ``config``: user-level config (``~/.agent/config.yaml``) read/write;
-- ``context``: conversation / session context storage;
-- ``messages``: message data models;
-- ``model``: LLM clients (OpenAI / Anthropic / compatible endpoints);
-- ``prompt``: system prompt template loading;
-- ``runtime``: the event-driven agent runtime (pure ``Agent`` reducer, state /
-  phase machine / checkpoints, context plan, tool runtime + sandbox, canonical
-  LLM types) migrated from ``new_projer``;
-- ``skills``: skill registry.
+- ``bus``: the event bus (immutable ``Event`` envelope, RCU router, per-origin
+  fair scheduling, WAL durability, backpressure/coalescing, namespace isolation,
+  artifact offload, metrics);
+- ``runtime``: the event-driven runtime built on the bus — pure ``Agent`` reducer,
+  state / phase machine / checkpoints, context plan, tool runtime + sandbox, the
+  LLM layer (canonical types, provider adapters, executor) and the structured
+  run-log sidecar.
 
-The previous non-event-driven engine (``agent.engine``), tool layer
-(``tools``) and toy event bus (``evnts``) have been removed; ``runtime`` +
-``bus`` supersede them.  The CLI / ``run_agent`` facade is not yet rewired to the
-new runtime.
+Both packages were migrated from the experimental ``new_projer`` framework.  The
+previous non-event-driven layers (``run_agent`` / ``agent.engine`` / ``tools`` /
+``evnts`` / ``config`` / ``context`` / ``model`` / ``prompt`` / ``skills``) and
+the ``cli`` package have been removed; a new host entry point will be built on
+top of ``bus`` + ``runtime``.
 
-Importing this package has no side effects so the CLI can load it lazily.
+Importing this package has no side effects so hosts can load submodules lazily.
 """
