@@ -17,10 +17,12 @@ Two structural properties fall out of this shape:
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Optional, Sequence
 
+from ..bus.artifact import NullArtifactStore, hydrate_events
+from ..bus.errors import BusError
 from ..bus.event import Event, uuid7
-from .context import ContextBuilder, PassthroughContextBuilder
+from .context import ContextBuilder, ContextPolicy, PassthroughContextBuilder, normalise_message
 from .errors import ErrorSource, error_info
 from .state import AgentState, Budget, phases
 from .state.checkpoint import Checkpointer
@@ -58,7 +60,9 @@ class Agent:
         checkpointer: Optional[Checkpointer] = None,
         budget: Optional[Budget] = None,
         ctx_builder: Optional[ContextBuilder] = None,
+        context_policy: Optional[ContextPolicy] = None,
         auto_subscribe: bool = True,
+        replay: bool = False,
     ) -> None:
         self.bus = bus
         self.session_id = session_id
@@ -66,6 +70,13 @@ class Agent:
         self.state = AgentState(session_id=session_id, trace_id=uuid7(), budget=budget or Budget())
         self.checkpointer = checkpointer
         self.ctx_builder = ctx_builder or PassthroughContextBuilder()
+        self.context_policy = context_policy
+        self._replaying = replay
+        if context_policy is not None and context_policy.enabled \
+                and not hasattr(self.ctx_builder, "next_compaction"):
+            raise ValueError(
+                "context_policy requires a ContextBuilder with next_compaction()"
+            )
         self._schemas_provider = schemas          # callable -> list[dict] (ToolRegistry.schemas)
         self._static_schemas = tuple(tools_schema)
         if auto_subscribe:
@@ -82,6 +93,7 @@ class Agent:
         bus.on("tool.call.failed", self.on_tool_done)
         bus.on("approval.granted", self.on_approval)
         bus.on("agent.resumed", self.on_resumed)
+        bus.on("context.compaction.applied", self.on_compaction_applied)
         bus.on("system.plugin.loaded", self.on_tools_changed)
         bus.on("system.plugin.unloaded", self.on_tools_changed)
 
@@ -101,6 +113,7 @@ class Agent:
         if not self._mine(ev):
             return
         self.state.observe(ev)
+        self.state.pending_compaction = None  # a new turn supersedes an in-flight compaction
         self.state.messages.append({"role": "user", "content": ev.payload.get("text", "")})
         self.state.set_phase(phases.THINKING)
         self._tick()
@@ -150,7 +163,7 @@ class Agent:
         if not calls:
             self.state.set_phase(phases.IDLE)  # thinking -> idle
             self._tick()
-            await self.bus.publish(ev.child("agent.completed", {"round": self.state.round}))
+            await self._publish(ev.child("agent.completed", {"round": self.state.round}))
             return
 
         # fan out: register pending *before* publishing to avoid a race (§19)
@@ -159,7 +172,7 @@ class Agent:
         self.state.set_phase(phases.AWAITING_TOOLS)         # acting -> awaiting_tools
         self._tick()
         for call in calls:
-            await self.bus.publish(ev.child("tool.call.requested", {
+            await self._publish(ev.child("tool.call.requested", {
                 "name": call["name"],
                 "args": call.get("args") or {},
                 "call_id": call["call_id"],
@@ -181,9 +194,12 @@ class Agent:
             info = ev.payload.get("error_info") or {}
             kind = (info.get("context") or {}).get("kind", "policy")
             content = f"[blocked by safety policy: {kind}] {content}"
-        self.state.messages.append(
-            {"role": "tool", "tool_call_id": call_id, "content": content}
-        )
+        message = {"role": "tool", "tool_call_id": call_id, "content": content}
+        if ev.payload.get("output_ref") is not None:
+            message["output_ref"] = ev.payload["output_ref"]
+        if ev.payload.get("output_tokens") is not None:
+            message["output_tokens"] = ev.payload["output_tokens"]
+        self.state.messages.append(message)
         self.state.pending.discard(call_id)
 
         if self.state.pending:  # still waiting on siblings -> remain in the barrier
@@ -214,7 +230,7 @@ class Agent:
         }
         if ev.payload.get("error_info") is not None:   # carry structured detail through
             payload["error_info"] = ev.payload["error_info"]
-        await self.bus.publish(ev.child("agent.completed", payload))
+        await self._publish(ev.child("agent.completed", payload))
 
     async def on_interrupt(self, ev: Event) -> None:
         if not self._mine(ev):
@@ -224,7 +240,7 @@ class Agent:
         # tool result for each one, so the assistant's tool_calls stay complete
         # and the model can see the round was cut short (§16.3).
         if self.state.pending:
-            await self.bus.publish(ev.child("tool.cancel.requested", {}))
+            await self._publish(ev.child("tool.cancel.requested", {}))
             for call_id in sorted(self.state.pending):
                 self.state.messages.append({
                     "role": "tool",
@@ -237,9 +253,63 @@ class Agent:
             # LLM in flight: remember to tag its (partial) completion when it arrives
             self.state.interrupt_pending = True
         self.state.pending.clear()
+        self.state.pending_compaction = None
         if phases.can_transition(self.state.phase, phases.IDLE):
             self.state.set_phase(phases.IDLE)
         self._tick()
+
+    async def on_compaction_applied(self, ev: Event) -> None:
+        """Apply a recorded summary and re-issue the request it was blocking."""
+        if not self._mine(ev):
+            return
+        payload = ev.payload
+        pending = self.state.pending_compaction
+        start = int(payload.get("from_index", -1))
+        end = int(payload.get("to_index", -1))
+        valid_range = 0 <= start < end <= len(self.state.messages)
+        if pending is None:
+            if self._replaying and valid_range and self._is_next_compaction(start):
+                self.state.observe(ev)
+                self.state.compactions.append(self._compaction_record(payload))
+            return  # stale / already superseded in the live loop
+        if (
+            payload.get("source_digest") != pending.get("source_digest")
+            or start != pending.get("from_index")
+            or end != pending.get("to_index")
+            or not valid_range
+        ):
+            self.state.pending_compaction = None
+            plan = await self.ctx_builder.build(
+                self.state, ev=ev, tools=self.tools_schema
+            )
+            await self._context_overflow(
+                ev, plan,
+                message="compaction result was stale or invalid",
+            )
+            return
+        self.state.observe(ev)
+        self.state.compactions.append(self._compaction_record(payload))
+        self.state.pending_compaction = None
+        self._tick()
+        await self._intent("llm.request", ev)
+
+    def _is_next_compaction(self, start: int) -> bool:
+        last_to = max(
+            (int(record["to_index"]) for record in self.state.compactions), default=0
+        )
+        return start == last_to
+
+    @staticmethod
+    def _compaction_record(payload: dict) -> dict:
+        return {
+            "from_index": int(payload.get("from_index", 0)),
+            "to_index": int(payload.get("to_index", 0)),
+            "summary": payload.get("summary", ""),
+            "summary_ref": payload.get("summary_ref"),
+            "source_digest": payload.get("source_digest", ""),
+            "tokens": int(payload.get("tokens", 0)),
+            "fallback": bool(payload.get("fallback", False)),
+        }
 
     async def on_approval(self, ev: Event) -> None:
         if not self._mine(ev):
@@ -267,6 +337,8 @@ class Agent:
     # ══════════════ intents & bookkeeping ══════════════
 
     async def _intent(self, etype: str, parent: Event) -> None:
+        if self._replaying:
+            return
         if (reason := self.state.budget.check(self.state)):
             if phases.can_transition(self.state.phase, phases.PAUSED):
                 self.state.set_phase(phases.PAUSED)
@@ -274,24 +346,90 @@ class Agent:
             info = error_info("E_BUDGET", source=ErrorSource.AGENT.value,
                               location="linteum_agent.runtime.agent.Agent._intent",
                               message=reason, enters_history=False).to_dict()
-            await self.bus.publish(parent.child("system.budget.exceeded",
+            await self._publish(parent.child("system.budget.exceeded",
                                                 {"reason": reason, "code": "E_BUDGET",
                                                  "error_info": info}))
             return
-        plan = await self.ctx_builder.build(self.state, ev=parent, tools=self.tools_schema)
+        tools = self.tools_schema
+        plan = await self.ctx_builder.build(self.state, ev=parent, tools=tools)
+
+        policy = self.context_policy
+        if policy is not None and policy.enabled and plan.estimated_tokens() > policy.max_tokens:
+            if self.state.pending_compaction is not None:
+                return
+            choose = getattr(self.ctx_builder, "next_compaction", None)
+            compacted = choose(self.state, plan, policy) if choose is not None else None
+            if not compacted:
+                await self._context_overflow(parent, plan)
+                return
+            messages = [
+                normalise_message(message)
+                for message in self.state.messages[compacted.from_index:compacted.to_index]
+            ]
+            request = parent.child("context.compaction.requested", {
+                "from_index": compacted.from_index,
+                "to_index": compacted.to_index,
+                "source_digest": plan.digest,
+                "target_tokens": policy.max_summary_tokens,
+                "messages": messages,
+            })
+            self.state.pending_compaction = {
+                "from_index": compacted.from_index,
+                "to_index": compacted.to_index,
+                "source_digest": plan.digest,
+            }
+            self._tick()
+            try:
+                await self._publish(request)
+            except BusError as exc:
+                self.state.pending_compaction = None
+                await self._context_overflow(parent, plan, code=exc.code,
+                                             message=str(exc))
+            return
+
         request = parent.child(etype, {
             "context_digest": plan.digest,
             "messages": plan.to_provider_messages(),
-            "tools": list(self.tools_schema),
+            "tools": list(tools),
             "round": self.state.round,
             "model": self.model,
         })
         # a new request supersedes any prior one: correlate completions by cause id
         self.state.inflight_request_id = request.id
+        self.state.last_context_digest = plan.digest
         self.state.interrupt_pending = False
-        await self.bus.publish(request)
+        await self._publish(request)
+
+    async def _context_overflow(self, parent: Event, plan, *,
+                                code: str = "E_CONTEXT_OVERFLOW",
+                                message: str = "context exceeds budget with no compactable turn") -> None:
+        if phases.can_transition(self.state.phase, phases.IDLE):
+            self.state.set_phase(phases.IDLE)
+        self._tick()
+        info = error_info(
+            code,
+            source=ErrorSource.AGENT.value,
+            location="linteum_agent.runtime.agent.Agent._intent",
+            message=message,
+            enters_history=False,
+            context={"context_tokens": plan.estimated_tokens()},
+        ).to_dict()
+        await self._publish(parent.child("agent.completed", {
+            "round": self.state.round,
+            "finish": "error",
+            "code": code,
+            "error_info": info,
+            "context_tokens": plan.estimated_tokens(),
+        }))
+
+    async def _publish(self, ev: Event) -> None:
+        if self._replaying or self.bus is None:
+            return
+        await self.bus.publish(ev)
 
     def _tick(self) -> None:
+        if self._replaying:
+            return
         self.state.version += 1
         self.state.seq += 1
         if self.checkpointer is not None:
@@ -299,11 +437,112 @@ class Agent:
 
     # -- recovery -----------------------------------------------------------
     @classmethod
-    def restore(cls, bus, checkpointer: Checkpointer, *, session_id: str, **kwargs) -> "Agent":
-        """Rebuild an agent from the latest checkpoint, then keep reducing (P1)."""
-        agent = cls(bus, session_id=session_id, checkpointer=checkpointer, **kwargs)
-        restored = checkpointer.restore(session_id)
-        if restored is not None:
-            linteum_agent.runtime.state = restored
+    async def restore(cls, bus, checkpointer: Checkpointer, *, session_id: str,
+                      **kwargs) -> "Agent":
+        """Rebuild an agent from the latest checkpoint + its WAL tail (P1)."""
+        kwargs.pop("auto_subscribe", None)
+        kwargs.pop("replay", None)
+        agent = cls(bus, session_id=session_id, checkpointer=checkpointer,
+                    auto_subscribe=False, **kwargs)
+        checkpoint = checkpointer.latest(session_id)
+        events = await bus.replay(
+            session_id=session_id, after_seq=checkpoint.seq if checkpoint else 0
+        )
+        artifacts = getattr(bus, "artifacts", None)
+        if artifacts is None:
+            artifacts = NullArtifactStore()
+        events = await hydrate_events(events, artifacts)
+        if checkpoint is not None:
+            state = AgentState.from_dict(checkpoint.state)
+            state.last_event_seq = max(state.last_event_seq, checkpoint.seq)
+        else:
+            trace_id = events[0].trace_id if events else uuid7()
+            state = AgentState(session_id=session_id, trace_id=trace_id)
+        agent.state = await cls.replay_state(state, events)
+        await agent._close_half_round()
+        agent.subscribe()
         return agent
+
+    @classmethod
+    async def replay_state(cls, state: AgentState, events: Sequence[Event]) -> AgentState:
+        """Apply committed events to ``state`` without publishing or snapshotting."""
+        replay = cls(
+            None,
+            session_id=state.session_id,
+            auto_subscribe=False,
+            replay=True,
+        )
+        replay.state = state
+        for ev in events:
+            if ev.session_id != state.session_id:
+                continue
+            await replay._reduce_replay(ev)
+        return replay.state
+
+    async def _reduce_replay(self, ev: Event) -> None:
+        etype = ev.type
+        if etype == "user.message":
+            await self.on_user(ev)
+        elif etype == "user.interrupt":
+            await self.on_interrupt(ev)
+        elif etype == "llm.completed":
+            await self.on_llm(ev)
+        elif etype == "llm.failed":
+            await self.on_llm_failed(ev)
+        elif etype in ("tool.call.completed", "tool.call.failed"):
+            await self.on_tool_done(ev)
+        elif etype == "approval.granted":
+            await self.on_approval(ev)
+        elif etype == "agent.resumed":
+            await self.on_resumed(ev)
+        elif etype == "context.compaction.applied":
+            await self.on_compaction_applied(ev)
+        elif etype == "llm.request":
+            self.state.observe(ev)
+            self.state.inflight_request_id = ev.id
+            self.state.last_context_digest = ev.payload.get("context_digest", "")
+            self.state.round = max(
+                self.state.round, int(ev.payload.get("round") or 0)
+            )
+
+    async def _close_half_round(self) -> None:
+        """Close a round interrupted by a process restart (no provider call)."""
+        if self.state.phase == phases.PAUSED:
+            return
+        if self.state.phase not in (
+            phases.THINKING,
+            phases.ACTING,
+            phases.AWAITING_TOOLS,
+            phases.AWAITING_APPROVAL,
+        ):
+            return
+        round_number = self.state.round
+        if self.state.pending:
+            for call_id in sorted(self.state.pending):
+                self.state.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": INTERRUPT_TAG,
+                    "interrupted": True,
+                })
+            self.state.cancelled |= self.state.pending
+        self.state.pending.clear()
+        self.state.pending_compaction = None
+        self.state.interrupt_pending = False
+        if phases.can_transition(self.state.phase, phases.IDLE):
+            self.state.set_phase(phases.IDLE)
+        self._tick()
+        await self._publish(
+            Event.create(
+                "agent.completed",
+                {
+                    "round": round_number,
+                    "finish": "interrupted",
+                    "recovered": True,
+                    "reason": "process restart",
+                },
+                session_id=self.session_id,
+                trace_id=self.state.trace_id,
+            )
+        )
 

@@ -22,6 +22,18 @@ DEFAULT_EVERY_N = 500
 DEFAULT_KEEP = 3
 
 
+def should_snapshot(state: AgentState, *, every_n_events: int, force: bool = False) -> bool:
+    """Snapshot trigger shared by the in-memory and persistent checkpointers."""
+    if force:
+        return True
+    if state.phase == phases.PAUSED:            # must snapshot before pausing
+        return True
+    if not state.pending:                        # round boundary (primary)
+        return True
+    # fallback: every N events (guard version 0 so a fresh state is not a trigger)
+    return state.version > 0 and state.version % max(1, every_n_events) == 0
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     """An immutable snapshot of ``AgentState`` at ``seq``."""
@@ -55,21 +67,16 @@ class InMemoryCheckpointer:
 
     # -- triggers -----------------------------------------------------------
     def _should_snapshot(self, state: AgentState, force: bool) -> bool:
-        if force:
-            return True
-        if state.phase == phases.PAUSED:            # must snapshot before pausing
-            return True
-        if not state.pending:                        # round boundary (primary)
-            return True
-        # fallback: every N events (guard version 0 so a fresh state is not a trigger)
-        return state.version > 0 and state.version % self.every_n_events == 0
+        return should_snapshot(
+            state, every_n_events=self.every_n_events, force=force
+        )
 
     def maybe_snapshot(self, state: AgentState, *, force: bool = False) -> Optional[Checkpoint]:
         if not self._should_snapshot(state, force):
             return None
         cp = Checkpoint(
             session_id=state.session_id,
-            seq=state.seq,
+            seq=state.last_event_seq,
             version=state.version,
             phase=state.phase,
             state=state.to_dict(),
@@ -88,6 +95,9 @@ class InMemoryCheckpointer:
 
     def all(self, session_id: str) -> list:
         return list(self._by_session.get(session_id, ()))
+
+    def delete_session(self, session_id: str) -> None:
+        self._by_session.pop(session_id, None)
 
     def restore(self, session_id: str) -> Optional[AgentState]:
         cp = self.latest(session_id)

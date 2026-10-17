@@ -26,7 +26,7 @@ from dataclasses import replace
 from typing import Callable, Iterable, Mapping, Optional
 
 from . import namespace
-from .artifact import NullArtifactStore
+from .artifact import NullArtifactStore, hydrate_event
 from .backpressure import Backpressure
 from .coalescer import DeltaCoalescer
 from .errors import BusClosed, BusError, PayloadTooLarge
@@ -192,6 +192,7 @@ class InMemoryEventBus:
     # -- publish pipeline (§14.1) ------------------------------------------
     async def publish(self, ev: Event) -> None:
         """Commit and enqueue one event (steps ①–⑨ of §14.1)."""
+        await self._ensure_seq(ev.session_id)
         ready = await self._prepare_logged(ev)
         if ready is None:
             return
@@ -203,8 +204,11 @@ class InMemoryEventBus:
         Ordering note: the caller is responsible for passing same-session events
         in ``seq`` order; the batch's internal order is preserved end to end.
         """
+        events = list(evs)
+        for session_id in {ev.session_id for ev in events}:
+            await self._ensure_seq(session_id)
         ready: list[Event] = []
-        for ev in evs:
+        for ev in events:
             prepared = await self._prepare_logged(ev)
             if prepared is not None:
                 ready.append(prepared)
@@ -293,6 +297,22 @@ class InMemoryEventBus:
         if await self.fair.put(ev):  # ⑨ WFQ enqueue (may shed plugin overflow)
             self.metrics.published(ev.origin, ev.type)
 
+    async def _ensure_seq(self, session_id: str) -> None:
+        """Seed the in-memory counter from the WAL before appending (I10).
+
+        Without this a reopened database would restart at 1 and collide with the
+        ``(session_id, seq)`` unique index, silently dropping new events.
+        """
+        if session_id not in self.seq:
+            last_seq = getattr(self.wal, "last_seq", None)
+            if last_seq is not None:
+                self.seq[session_id] = await last_seq(session_id)
+            ids = getattr(self.wal, "event_ids", None)
+            if ids is not None:
+                for event_id in await ids(session_id):
+                    self.dedup.mark(event_id)
+            self.seq.setdefault(session_id, 0)
+
     def _assign_seq(self, ev: Event) -> Event:
         """Assign the session-local monotonic ``seq`` (I10)."""
         n = self.seq[ev.session_id] + 1
@@ -348,6 +368,16 @@ class InMemoryEventBus:
                 if ev is None:
                     await asyncio.sleep(0)
                     continue
+                if isinstance(ev.payload, dict) and ev.payload.get("_offloaded"):
+                    try:
+                        ev = await hydrate_event(ev, self.artifacts)
+                    except Exception as exc:  # noqa: BLE001 - durable event, report and continue
+                        self.metrics.dead_letter("artifact_hydration")
+                        self._dead_letter(
+                            ev, f"{type(exc).__name__}: {exc}",
+                            "artifact-hydration", exc=exc,
+                        )
+                        continue
                 for handler in self.router.match(ev.type):
                     self.pool.spawn(self._safe(handler, ev), session_id=ev.session_id)
         finally:

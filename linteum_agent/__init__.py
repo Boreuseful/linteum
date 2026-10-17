@@ -6,9 +6,11 @@ Module layout:
   fair scheduling, WAL durability, backpressure/coalescing, namespace isolation,
   artifact offload, metrics);
 - ``runtime``: the event-driven runtime built on the bus — pure ``Agent`` reducer,
-  state / phase machine / checkpoints, context plan, tool runtime + sandbox, the
-  LLM layer (canonical types, provider adapters, executor) and the structured
-  run-log sidecar.
+  state / phase machine / checkpoints, context plan + compaction, tool runtime +
+  sandbox, the LLM layer (canonical types, provider adapters, executor) and the
+  structured run-log sidecar;
+- ``storage``: durable session storage — SQLite WAL/checkpoints, a filesystem
+  artifact store and the session history/context read model.
 
 Both packages were migrated from the experimental ``new_projer`` framework.  The
 previous non-event-driven layers (``run_agent`` / ``agent.engine`` / ``tools`` /

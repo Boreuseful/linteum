@@ -13,6 +13,7 @@ bus only ever sees the protocol, swapping it later is transparent.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -105,3 +106,38 @@ def resolve_ref(ref: str, *, artifacts: ArtifactStore) -> str:
         if ref.startswith(prefix):
             return prefix.rstrip(":")
     raise ArtifactMissing(f"unknown reference: {ref!r}")
+
+
+async def hydrate_event(ev, artifacts: ArtifactStore):
+    """Restore an event payload that the bus externalised before dispatch.
+
+    ``InMemoryEventBus._maybe_offload`` replaces a >``INLINE_LIMIT`` payload with
+    an artifact envelope.  Consumers that need the original fields (the LLM
+    executor and the context compactor) call this helper; the event id/seq/cause
+    chain stays untouched, so correlation and replay remain valid.
+    """
+    payload = getattr(ev, "payload", None)
+    if not isinstance(payload, dict) or not payload.get("_offloaded"):
+        return ev
+    ref = str(payload.get("artifact", ""))
+    if not ref.startswith(ARTIFACT_PREFIX):
+        raise ArtifactMissing(f"offloaded payload has an invalid ref: {ref!r}")
+    data = await artifacts.get(ref[len(ARTIFACT_PREFIX):])
+    return ev.with_payload(json.loads(data))
+
+
+async def hydrate_events(events, artifacts: ArtifactStore) -> list:
+    """Hydrate a replay batch (events without an artifact envelope are untouched)."""
+    return [await hydrate_event(ev, artifacts) for ev in events]
+
+
+__all__ = [
+    "ARTIFACT_PREFIX",
+    "Artifact",
+    "ArtifactStore",
+    "InMemoryArtifactStore",
+    "NullArtifactStore",
+    "hydrate_event",
+    "hydrate_events",
+    "resolve_ref",
+]

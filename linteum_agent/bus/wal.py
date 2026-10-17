@@ -43,6 +43,10 @@ class WalStore(Protocol):
 
     async def replay(self, *, session_id: Optional[str] = None, after_seq: int = 0) -> list[Event]: ...
 
+    async def last_seq(self, session_id: str) -> int: ...
+
+    async def event_ids(self, session_id: str) -> list[str]: ...
+
     async def count(self) -> int: ...
 
     async def close(self) -> None: ...
@@ -81,6 +85,13 @@ class InMemoryWal:
         if session_id is None:
             return list(self._events)
         return [ev for ev in self._by_session.get(session_id, ()) if ev.seq > after_seq]
+
+    async def last_seq(self, session_id: str) -> int:
+        events = self._by_session.get(session_id, ())
+        return max((ev.seq for ev in events), default=0)
+
+    async def event_ids(self, session_id: str) -> list[str]:
+        return [ev.id for ev in self._by_session.get(session_id, ())]
 
     async def count(self) -> int:
         return len(self._events)
@@ -249,6 +260,29 @@ class SqliteWal:
                     (session_id, after_seq),
                 )
             return cur.fetchall()
+
+    async def last_seq(self, session_id: str) -> int:
+        await self._flush_pending()
+        return await asyncio.to_thread(self._last_seq_sync, session_id)
+
+    def _last_seq_sync(self, session_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(seq) FROM events WHERE session_id=?", (session_id,)
+            ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    async def event_ids(self, session_id: str) -> list[str]:
+        await self._flush_pending()
+        return await asyncio.to_thread(self._event_ids_sync, session_id)
+
+    def _event_ids_sync(self, session_id: str) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM events WHERE session_id=? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+        return [row[0] for row in rows]
 
     async def count(self) -> int:
         return await asyncio.to_thread(self._count_sync)
