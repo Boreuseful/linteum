@@ -105,6 +105,12 @@ class AgentState:
     usd_used: float = 0.0
     # ── last observed event time (drives budget wall check; no clock in reducer) ──
     last_ts: float = 0.0
+    # ── last applied bus event seq: the WAL replay anchor (checkpoint.seq) ──
+    last_event_seq: int = 0
+    # ── derived-context compaction records (full text stays in WAL/artifacts) ──
+    compactions: list = field(default_factory=list)
+    pending_compaction: Optional[dict] = None
+    last_context_digest: str = ""
 
     # -- transitions --------------------------------------------------------
     def set_phase(self, new: str) -> None:
@@ -122,6 +128,27 @@ class AgentState:
             size = len(json.dumps(msg, ensure_ascii=False).encode("utf-8"))
             if size > INLINE_LIMIT:  # I15
                 problems.append(f"I15: message[{index}] is {size}B > {INLINE_LIMIT}B")
+        last_to = 0
+        for index, record in enumerate(self.compactions):
+            try:
+                start = int(record["from_index"])
+                end = int(record["to_index"])
+            except (KeyError, TypeError, ValueError):
+                problems.append(f"COMPACTION: record[{index}] is malformed")
+                continue
+            if start != last_to:
+                problems.append(
+                    f"COMPACTION: record[{index}] starts at {start}, expected {last_to}"
+                )
+            if end <= start or end > len(self.messages):
+                problems.append(
+                    f"COMPACTION: record[{index}] range [{start},{end}) is invalid"
+                )
+            last_to = end
+        if self.pending_compaction is not None and self.phase != phases.THINKING:
+            problems.append(
+                f"COMPACTION: pending compaction while phase={self.phase!r}"
+            )
         return problems
 
     def assert_invariants(self) -> None:
@@ -131,8 +158,9 @@ class AgentState:
 
     # -- accounting ---------------------------------------------------------
     def observe(self, ev: Event) -> None:
-        """Record the event clock (reducer-safe; no ``time.time()``)."""
+        """Record the event clock and replay anchor (reducer-safe; no clock)."""
         self.last_ts = ev.ts
+        self.last_event_seq = max(self.last_event_seq, int(ev.seq or 0))
 
     def add_usage(self, *, input_tokens: int = 0, output_tokens: int = 0, usd: float = 0.0) -> None:
         self.tokens_used += int(input_tokens) + int(output_tokens)
@@ -160,6 +188,11 @@ class AgentState:
             "tokens_used": self.tokens_used,
             "usd_used": self.usd_used,
             "last_ts": self.last_ts,
+            "last_event_seq": self.last_event_seq,
+            "compactions": [dict(record) for record in self.compactions],
+            "pending_compaction": dict(self.pending_compaction)
+            if self.pending_compaction is not None else None,
+            "last_context_digest": self.last_context_digest,
         }
 
     @classmethod
@@ -184,6 +217,11 @@ class AgentState:
             tokens_used=int(data.get("tokens_used", 0)),
             usd_used=float(data.get("usd_used", 0.0)),
             last_ts=float(data.get("last_ts", 0.0)),
+            last_event_seq=int(data.get("last_event_seq", 0)),
+            compactions=list(data.get("compactions", [])),
+            pending_compaction=dict(data["pending_compaction"])
+            if data.get("pending_compaction") is not None else None,
+            last_context_digest=data.get("last_context_digest", ""),
         )
 
     def to_json(self) -> str:

@@ -20,6 +20,8 @@ from .artifact import (
     ArtifactStore,
     InMemoryArtifactStore,
     NullArtifactStore,
+    hydrate_event,
+    hydrate_events,
 )
 from .backpressure import Backpressure, BackpressurePolicy, policy_for
 from .bus import DedupSet, InMemoryEventBus
@@ -106,6 +108,8 @@ __all__ = [
     "ArtifactStore",
     "InMemoryArtifactStore",
     "NullArtifactStore",
+    "hydrate_event",
+    "hydrate_events",
     "WalStore",
     "InMemoryWal",
     "SqliteWal",

@@ -7,6 +7,7 @@ Layers, bottom-up:
 * :mod:`linteum_agent.runtime.state` — :class:`AgentState`, the phase machine
   and checkpointing.
 * :mod:`linteum_agent.runtime.context` — :class:`ContextPlan` + deterministic digest.
+* :mod:`linteum_agent.runtime.compaction` — deterministic summary effect for context compaction.
 * :mod:`linteum_agent.runtime.agent` — the pure, event-driven :class:`Agent` reducer.
 * :mod:`linteum_agent.runtime.interrupt` — trips the LLM cancel token on ``user.interrupt``.
 * :mod:`linteum_agent.runtime.tools` — ToolSpec / ToolRegistry / ToolRuntime / Sandbox.
@@ -20,4 +21,14 @@ Layers, bottom-up:
 Importing this package has no side effects so hosts can load submodules lazily.
 """
 
-__all__ = ["agent", "state", "context", "interrupt", "tools", "llm", "errors", "observability"]
+__all__ = [
+    "agent",
+    "state",
+    "context",
+    "compaction",
+    "interrupt",
+    "tools",
+    "llm",
+    "errors",
+    "observability",
+]

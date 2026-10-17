@@ -21,6 +21,7 @@ import asyncio
 import json
 from typing import Optional
 
+from ...bus.artifact import hydrate_event
 from ...bus.event import Event
 from ..errors import ErrorSource, error_info
 from ...bus.scheduler.cancel import Cancelled
@@ -106,6 +107,7 @@ class LLMExecutor:
 
     # -- entry point --------------------------------------------------------
     async def on_request(self, ev: Event) -> None:
+        ev = await hydrate_event(ev, self.bus.artifacts)
         req = LlmRequest.from_event(ev)
         candidates = self.router.candidates(req, ev.session_id)
         if not candidates:
