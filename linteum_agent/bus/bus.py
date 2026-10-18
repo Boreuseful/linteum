@@ -379,7 +379,9 @@ class InMemoryEventBus:
         it as ``asyncio.create_task(bus.run())``.
         """
         self._running = True
-        self._stop.clear()
+        # A stop may be requested before this task is first scheduled (a host
+        # that fails during startup tears down immediately).  Clearing the flag
+        # here would lose that request and spin forever.
         try:
             while not self._stop.is_set():
                 await self._flush_coalesced()  # deliver merged deltas whose window elapsed
