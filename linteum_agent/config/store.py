@@ -63,8 +63,10 @@ CONFIG_HEADER = """\
 # ${ENV_VAR} reference. Without it, the provider's default key variable is used
 # (OPENAI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY / ...).
 #
-# Edit this file directly. A CLI (`linteum config ...`) will be added after the
-# Gateway; until then the ConfigService API is the programmatic entry point.
+# Edit this file directly, or use:
+#   linteum config list / get / set / unset / edit / validate
+# `linteum config edit` validates the file on save. Map/list values accept JSON,
+# e.g. linteum config set agent.profiles '{"fast": {...}}'.
 """
 
 

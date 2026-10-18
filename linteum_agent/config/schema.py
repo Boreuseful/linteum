@@ -17,6 +17,7 @@ Design reference: ``test/new_event_dirvent/tmp_design_doc/config-design-v0.1.md`
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections.abc import Mapping as ABCMapping
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
@@ -52,6 +53,7 @@ _FIELD_KINDS: dict[tuple[str, str], str] = {
     ("LLMConfig", "openai_mode"): "optional_str",
     ("LLMConfig", "api_key"): "optional_str",
     ("LLMConfig", "base_url"): "optional_str",
+    ("LLMConfig", "temperature"): "optional_float",
     ("LLMConfig", "top_p"): "optional_float",
     ("LLMConfig", "reasoning_effort"): "optional_str",
     ("LLMConfig", "thinking"): "optional_bool",
@@ -568,6 +570,32 @@ def _issue(issues: list[Issue], key: str, code: str, message: str,
 
 
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _resolve_env_text(value: Optional[str]) -> Optional[str]:
+    """Resolve ``${VAR}`` for *comparison* only (the file keeps the reference)."""
+    if not isinstance(value, str):
+        return value
+    return _ENV_REF.sub(
+        lambda match: os.environ.get(match.group(1), match.group(0)), value
+    )
+
+
+def _resolved_api_key(llm: LLMConfig) -> Optional[str]:
+    key = llm.api_key
+    if isinstance(key, str) and "${" in key:
+        resolved = _resolve_env_text(key)
+        # A still-unresolved full reference means "use the provider env var";
+        # for provider-conflict comparison that is equivalent to None.
+        if _ENV_REF.fullmatch(resolved or ""):
+            return None
+        return resolved
+    return llm.resolved_api_key()
+
+
+def _resolved_base_url(llm: LLMConfig) -> Optional[str]:
+    return _resolve_env_text(llm.resolved_base_url())
 
 
 def _check_llm(issues: list[Issue], key: str, llm: LLMConfig, *,
@@ -651,8 +679,8 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
             seen[provider] = (entry_key, entry)
             continue
         first_key, first = seen[provider]
-        if (first.resolved_base_url() != entry.resolved_base_url()
-                or first.resolved_api_key() != entry.resolved_api_key()
+        if (_resolved_base_url(first) != _resolved_base_url(entry)
+                or _resolved_api_key(first) != _resolved_api_key(entry)
                 or first.resolved_openai_mode() != entry.resolved_openai_mode()):
             _issue(issues, entry_key, "E_CONFIG_PROVIDER_CONFLICT",
                    f"provider {provider!r} is configured differently in "
