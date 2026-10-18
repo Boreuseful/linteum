@@ -137,7 +137,14 @@ class EffectiveConfig:
         return tuple(issue for issue in self.issues if issue.severity == "warning")
 
     def source(self, key: str) -> str:
-        return self.sources.get(key, "default")
+        if key in self.sources:
+            return self.sources[key]
+        # Dynamic profile/fallback leaves inherit the composite's source so
+        # `config get agent.profiles.fast.model` does not report "default".
+        for parent in ("agent.profiles", "agent.fallbacks"):
+            if key.startswith(parent + "."):
+                return self.sources.get(parent, "default")
+        return "default"
 
     def get(self, key: str, *, reveal: bool = False) -> ConfigValue:
         spec = get_spec(key, self.config)
@@ -165,7 +172,13 @@ class EffectiveConfig:
         return data if reveal else _mask_secret_fields(data)
 
     def sources_dict(self) -> dict:
-        return dict(self.sources)
+        """Source for every leaf, including dynamic profile/fallback keys."""
+        data = _flatten(app_to_dict(self.config))
+        return {
+            key: self.source(key)
+            for key in data
+            if key != "version"
+        }
 
 
 # ---------------------------------------------------------------------------
