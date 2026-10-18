@@ -21,6 +21,7 @@ import itertools
 import uuid
 from typing import AsyncIterator, Iterable, Mapping, Optional
 
+from .log import get_logger
 from .protocol import (
     PROTOCOL_VERSION,
     Command,
@@ -34,6 +35,8 @@ from .transports.base import Transport
 #: Default command timeout (seconds).  Commands acknowledge persistence, not
 #: completion, so this only covers transport/gateway work.
 DEFAULT_COMMAND_TIMEOUT = 30.0
+
+logger = get_logger("client")
 
 #: Queue sentinel: the reader has stopped; ``next_frame`` turns it into a clear
 #: ``ConnectionClosed`` instead of leaking ``None`` to renderers.
@@ -103,12 +106,17 @@ class AgentClient:
             },
         )
         self.hello_info = dict(result)
+        logger.debug(
+            "client %s connected (protocol=%s, features=%s)",
+            self.client_id, result.get("protocol"), result.get("features"),
+        )
         return result
 
     async def close(self) -> None:
         if self._closed.is_set():
             return
         self._closed.set()
+        logger.debug("client %s closing", self.client_id)
         reader, self._reader = self._reader, None
         if reader is not None:
             reader.cancel()
@@ -155,6 +163,10 @@ class AgentClient:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
             self._pending.pop(cmd_id, None)
+            logger.warning(
+                "client %s command %s timed out after %ss",
+                self.client_id, name, timeout,
+            )
             raise ClientError({
                 "code": "E_REQUEST_TIMEOUT",
                 "source": "client",
@@ -338,8 +350,15 @@ class AgentClient:
                 # Unknown kinds are ignored for forward compatibility (§5.5).
         except asyncio.CancelledError:
             raise
+        except ConnectionClosed as exc:
+            self._close_error = exc
+            logger.debug("client %s connection closed by peer", self.client_id)
         except BaseException as exc:  # noqa: BLE001 - surface to every waiter
             self._close_error = exc
+            logger.warning(
+                "client %s reader failed: %s: %s",
+                self.client_id, type(exc).__name__, exc,
+            )
         finally:
             self._closed.set()
             self._fail_pending(self._close_error or ConnectionClosed())

@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import getpass
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -200,6 +201,58 @@ def _warn(message: str) -> None:
     print(f"linteum: {message}", file=sys.stderr)
 
 
+#: Attribute marking the stderr handler the CLI installs for gateway logs.
+_CLI_LOG_HANDLER = "_linteum_cli_log_handler"
+
+_GATEWAY_LEVELS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
+
+
+class _JsonLogFormatter(logging.Formatter):
+    """One JSON object per line (``logging.format: json``)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": round(record.created, 3),
+            "level": record.levelname.lower(),
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["error"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _configure_logging(log_config) -> None:
+    """Route ``linteum.gateway`` records to stderr for the CLI process.
+
+    Called by ``serve`` and ``chat``.  ``logging.level`` selects the threshold
+    (default ``info``) and ``logging.format`` the line format.  The handler is
+    tagged and replaced on a repeated call, so an embedded host that invokes
+    the CLI entry point twice does not stack duplicate output.
+    """
+    logger = logging.getLogger("linteum.gateway")
+    level = _GATEWAY_LEVELS.get(str(log_config.level).lower(), logging.INFO)
+    logger.setLevel(level)
+    for handler in list(logger.handlers):
+        if getattr(handler, _CLI_LOG_HANDLER, False):
+            logger.removeHandler(handler)
+    handler = logging.StreamHandler(sys.stderr)
+    setattr(handler, _CLI_LOG_HANDLER, True)
+    if str(log_config.format).lower() == "json":
+        handler.setFormatter(_JsonLogFormatter())
+    else:
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+    logger.addHandler(handler)
+
+
 # ---------------------------------------------------------------------------
 # serve
 # ---------------------------------------------------------------------------
@@ -208,6 +261,7 @@ async def _serve(args) -> int:
     service = _build_service(args.config)
     effective = service.effective(strict=False)
     cfg = effective.config
+    _configure_logging(cfg.logging)
     for issue in effective.warnings:
         _warn(f"{issue.code}: {issue.message}")
 
@@ -420,6 +474,7 @@ async def _print_frames(
 async def _chat(args) -> int:
     service = _build_service(args.config)
     effective = service.effective(strict=False)
+    _configure_logging(effective.config.logging)
     for issue in effective.warnings:
         _warn(f"{issue.code}: {issue.message}")
     workspace = Path(args.workspace).expanduser().resolve()

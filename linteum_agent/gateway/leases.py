@@ -32,9 +32,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .log import get_logger
+
 #: Default heartbeat budget in seconds.  A lease older than this is stale.
 DEFAULT_LEASE_TTL = 30.0
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+logger = get_logger("leases")
 
 
 def default_lease_root() -> Path:
@@ -203,7 +207,15 @@ class FileLeaseManager:
             current = self._read_sync(session_id)
             if current is not None and not current.owned_by(self.pid, self.instance_id):
                 if not current.is_stale(self.ttl, now=self._clock(), host=self.host):
+                    logger.warning(
+                        "session %s lease held by pid %d on %s (endpoint=%s)",
+                        session_id, current.pid, current.host, current.endpoint,
+                    )
                     raise LeaseHeld(current)
+                logger.info(
+                    "session %s taking over stale lease from pid %d on %s",
+                    session_id, current.pid, current.host,
+                )
             now = self._clock()
             lease = Lease(
                 session_id=session_id,
@@ -216,13 +228,22 @@ class FileLeaseManager:
             )
             self._write_sync(session_id, lease)
             self._held[session_id] = lease
+            logger.debug(
+                "session %s lease acquired (pid=%d, instance=%s, endpoint=%s)",
+                session_id, self.pid, self.instance_id, endpoint,
+            )
             return lease
 
     def _heartbeat_sync(self, session_id: str) -> Optional[Lease]:
         with self._lock, self._flock(self.lock_path(session_id)):
             current = self._read_sync(session_id)
             if current is None or not current.owned_by(self.pid, self.instance_id):
-                self._held.pop(session_id, None)
+                if self._held.pop(session_id, None) is not None:
+                    logger.warning(
+                        "session %s lease is no longer owned by this process; "
+                        "heartbeat stopped",
+                        session_id,
+                    )
                 return None
             lease = Lease(
                 session_id=current.session_id,
@@ -243,6 +264,8 @@ class FileLeaseManager:
             if current is not None and current.owned_by(self.pid, self.instance_id):
                 with contextlib.suppress(OSError):
                     self.lease_path(session_id).unlink()
+                logger.debug("session %s lease released (pid=%d)",
+                             session_id, self.pid)
             self._held.pop(session_id, None)
 
     def _read_sync(self, session_id: str) -> Optional[Lease]:

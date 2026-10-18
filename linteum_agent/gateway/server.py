@@ -38,6 +38,7 @@ from .errors import (
     GatewayError,
     LOCATION_SERVER,
 )
+from .log import get_logger
 from .protocol import (
     FEATURES,
     KNOWN_COMMANDS,
@@ -60,6 +61,8 @@ from .transports.base import Transport
 _PAUSED_ALLOWED = frozenset({
     "gap", "snapshot", "error", "bye", "flow", "history.page", "artifact.chunk",
 })
+
+logger = get_logger("server")
 
 
 class ClientConnection:
@@ -137,9 +140,19 @@ class ClientConnection:
         if size > self.max_frame_bytes:
             if frame.ephemeral:
                 self._dropped_ephemeral += 1
+                logger.debug(
+                    "connection %d dropped oversized ephemeral %s frame "
+                    "(%d > %d bytes)",
+                    self.id, frame.frame, size, self.max_frame_bytes,
+                )
                 self._maybe_flow()
                 return False
             self._dropped_durable += 1
+            logger.warning(
+                "connection %d replaced oversized durable %s frame "
+                "(%d > %d bytes) with a notice",
+                self.id, frame.frame, size, self.max_frame_bytes,
+            )
             frame = Frame.create(
                 "notice",
                 {"kind": "frame_too_large", "frame": frame.frame, "size": size},
@@ -150,6 +163,11 @@ class ClientConnection:
             size = len(text.encode("utf-8"))
         if frame.ephemeral and self._over_capacity(size):
             self._dropped_ephemeral += 1
+            logger.debug(
+                "connection %d dropped ephemeral %s frame (queue full: %d frames, "
+                "%d bytes)",
+                self.id, frame.frame, self._queue.qsize(), self._queued_bytes,
+            )
             self._maybe_flow()
             return False
         if self._over_capacity(size):
@@ -253,7 +271,16 @@ class ClientConnection:
         session_id = frame.session_id
         if session_id is None:
             self._dropped_durable += 1
+            logger.warning(
+                "connection %d dropped durable %s frame without a session",
+                self.id, frame.frame,
+            )
             return False
+        logger.warning(
+            "connection %d outbound queue overflow for session %s; pausing the "
+            "subscription and sending a gap",
+            self.id, session_id,
+        )
         self._paused.add(session_id)
         items = self._drain()
         kept = []
@@ -314,7 +341,11 @@ class ClientConnection:
                 await self.transport.send(text)
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - a broken socket closes the connection
+            except Exception as exc:  # noqa: BLE001 - a broken socket closes the connection
+                logger.debug(
+                    "connection %d writer failed: %s: %s",
+                    self.id, type(exc).__name__, exc,
+                )
                 self._closed = True
                 with contextlib.suppress(Exception):
                     await self.transport.close()  # unblock the server's ``recv``
@@ -385,6 +416,9 @@ class GatewayServer:
         )
         connection.start()
         self._connections[connection.id] = connection
+        logger.info(
+            "connection %d opened (%d live)", connection.id, len(self._connections)
+        )
         try:
             while not self._closed:
                 raw = await transport.recv()
@@ -394,6 +428,7 @@ class GatewayServer:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - one connection must not kill the server
+            logger.exception("connection %d failed", connection.id)
             self._audit({
                 "kind": "gateway_connection_error",
                 "level": "error",
@@ -403,12 +438,21 @@ class GatewayServer:
             })
         finally:
             await self._drop_connection(connection)
+            logger.info(
+                "connection %d closed (%d live, client=%s)",
+                connection.id, len(self._connections),
+                connection.client_info.get("id"),
+            )
         return connection
 
     async def close(self, *, close_host: bool = False) -> None:
         if self._closed:
             return
         self._closed = True
+        logger.info(
+            "gateway server closing (%d session(s), %d connection(s), close_host=%s)",
+            len(self._gateways), len(self._connections), close_host,
+        )
         for gateway in list(self._gateways.values()):
             await gateway.close()
         self._gateways.clear()
@@ -427,6 +471,8 @@ class GatewayServer:
         try:
             envelope = decode(raw, max_bytes=settings.limits.max_command_bytes)
         except GatewayError as exc:
+            logger.debug("connection %d sent an invalid envelope: %s",
+                         connection.id, exc.code)
             connection.send_frame(error_frame(exc))
             return
         if envelope.get("kind") != "cmd":
@@ -466,6 +512,11 @@ class GatewayServer:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - convert to structured data (P4)
+            logger.exception(
+                "command %s crashed (client=%d)",
+                command.name if command is not None else request_id,
+                connection.id,
+            )
             error = GatewayError(
                 E_INTERNAL, f"{type(exc).__name__}: {exc}",
                 location=LOCATION_SERVER, exc=exc,
@@ -530,6 +581,10 @@ class GatewayServer:
             )
         connection.hello_done = True
         connection.client_info = dict(command.args.get("client") or {})
+        logger.info(
+            "connection %d hello from %s (protocol=%s)",
+            connection.id, connection.client_info.get("id"), PROTOCOL_VERSION,
+        )
         return hello_payload(
             server=self.server_name,
             limits={
@@ -556,6 +611,11 @@ class GatewayServer:
             )
             handle = await self.host.open_session(
                 options, profile=args.get("profile")
+            )
+            logger.info(
+                "session %s created (workspace=%s, profile=%s, client=%d)",
+                handle.session_id, options.workspace, options.profile,
+                connection.id,
             )
         except SessionLocked as exc:
             raise GatewayError(
@@ -607,6 +667,7 @@ class GatewayServer:
                 location=LOCATION_SERVER,
             )
         await self.host.delete_session(session_id)
+        logger.info("session %s deleted", session_id)
         return {"deleted": True, "session_id": session_id}
 
     # -- session gateways ---------------------------------------------------
@@ -657,8 +718,12 @@ class GatewayServer:
             )
             await session_gateway.start()
             if gateway is not None:  # replace a stale read-only view
+                logger.debug("session %s replacing stale read-only gateway",
+                             session_id)
                 await gateway.close()
             self._gateways[session_id] = session_gateway
+            logger.info("session %s gateway opened (read_only=%s)",
+                        session_id, read_only)
             return session_gateway
 
     async def _gateway_for_readable(self, session_id: str) -> SessionGateway:
@@ -683,6 +748,19 @@ class GatewayServer:
 
     def _audit_command(self, connection: ClientConnection, command: Optional[Command],
                        status: str, started: float, *, code: Optional[str] = None) -> None:
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        if status == "ok":
+            logger.debug(
+                "cmd %s ok (client=%d session=%s %.1fms)",
+                command.name if command else "?", connection.id,
+                command.session_id if command else None, elapsed_ms,
+            )
+        else:
+            logger.info(
+                "cmd %s failed [%s] (client=%d session=%s %.1fms)",
+                command.name if command else "?", code, connection.id,
+                command.session_id if command else None, elapsed_ms,
+            )
         record = {
             "kind": "gateway_command",
             "level": "info" if status == "ok" else "warning",

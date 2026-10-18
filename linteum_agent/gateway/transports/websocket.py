@@ -15,11 +15,15 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from ..log import get_logger
+
 #: Names used by ``websockets`` for a normal peer close.  Matching by name keeps
 #: this module importable when the optional dependency is absent.
 _CLOSED_NAMES = frozenset({
     "ConnectionClosed", "ConnectionClosedOK", "ConnectionClosedError",
 })
+
+logger = get_logger("transport.websocket")
 
 
 class WebSocketTransport:
@@ -42,6 +46,7 @@ class WebSocketTransport:
             try:
                 return message.decode("utf-8")
             except UnicodeDecodeError as exc:
+                logger.warning("websocket frame is not valid UTF-8")
                 raise ConnectionError("websocket frame is not valid UTF-8") from exc
         return message
 
@@ -56,8 +61,9 @@ class WebSocketTransport:
         self._closed = True
         try:
             await self._websocket.close()
-        except Exception:  # noqa: BLE001 - closing a dead socket is fine
-            pass
+        except Exception as exc:  # noqa: BLE001 - closing a dead socket is fine
+            logger.debug("websocket close failed: %s: %s",
+                         type(exc).__name__, exc)
 
 
 __all__ = ["WebSocketTransport"]

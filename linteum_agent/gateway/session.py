@@ -41,6 +41,7 @@ from .errors import (
     GatewayError,
     LOCATION_SESSION,
 )
+from .log import get_logger
 from .projector import ProjectorState, project, snapshot_payload
 from .protocol import (
     CONTROL_FRAMES,
@@ -64,6 +65,8 @@ DEFAULT_IDEMPOTENCY_SIZE = 1_024
 #: One subscription stores at most this many catch-up frames before the replay
 #: cutoff is applied; beyond it, the subscriber is told to resubscribe.
 CATCHUP_LIMIT = 10_000
+
+logger = get_logger("session")
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +108,12 @@ class Subscription:
             else:
                 # Never silently drop durable frames: the subscribe path turns
                 # this into an explicit ``gap`` once the replay finishes.
+                if not self.overflowed:
+                    logger.debug(
+                        "connection %d catch-up buffer exceeded %d frames; "
+                        "replay will end with a gap",
+                        self.connection.id, CATCHUP_LIMIT,
+                    )
                 self.overflowed = True
             return
         self.connection.send_frame(frame)
@@ -202,6 +211,10 @@ class SessionGateway:
         self._state = state
         self._expected = (events[-1].seq + 1) if events else 1
         self._started = True
+        logger.debug(
+            "session %s gateway started (read_only=%s, replayed=%d, next_seq=%d)",
+            self.session_id, self.read_only, len(events), self._expected,
+        )
         if not self.read_only:
             self._pump_task = asyncio.create_task(self._pump())
         return self
@@ -210,6 +223,10 @@ class SessionGateway:
         if self._closed:
             return
         self._closed = True
+        logger.debug(
+            "session %s gateway closing (%d subscriber(s), %d queued input(s))",
+            self.session_id, len(self._subscribers), len(self._input_queue),
+        )
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
@@ -261,6 +278,11 @@ class SessionGateway:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - a bad event must not kill the pump
+                logger.exception(
+                    "session %s failed to project %s seq=%s",
+                    self.session_id, getattr(event, "type", None),
+                    getattr(event, "seq", None),
+                )
                 self._log({
                     "kind": "gateway_pump_error",
                     "level": "error",
@@ -329,6 +351,10 @@ class SessionGateway:
             raise
         except Exception as exc:  # noqa: BLE001 - surface as a gap, never hang
             missing = self._expected
+            logger.warning(
+                "session %s gap resolution failed at seq %d: %s: %s",
+                self.session_id, missing, type(exc).__name__, exc,
+            )
             self._emit_gap(missing, missing - 1)
             self._log({
                 "kind": "gateway_gap_error",
@@ -350,6 +376,10 @@ class SessionGateway:
             # session marked busy waiting for a projection that will not come.
             self._published_input_pending = False
             self._pending_input_seq = None
+        logger.warning(
+            "session %s emitting gap %d..%d (%d event(s) buffered)",
+            self.session_id, from_seq, to_seq, len(self._buffer),
+        )
         frame = Frame.create(
             "gap",
             {"from_seq": from_seq, "to_seq": to_seq},
@@ -488,6 +518,10 @@ class SessionGateway:
             cached = self._idempotency.get(client_message_id)
             if cached is not None:
                 self._idempotency.move_to_end(client_message_id)
+                logger.debug(
+                    "session %s duplicate user.message %s from client=%d",
+                    self.session_id, client_message_id, connection.id,
+                )
                 return {**cached, "duplicate": True}
 
             if (
@@ -518,6 +552,12 @@ class SessionGateway:
                     trace_id=cmd.trace_id,
                     metadata=dict(args.get("metadata") or {}),
                 ))
+                logger.debug(
+                    "session %s queued user.message %s from client=%d "
+                    "(phase=%s, pending=%d)",
+                    self.session_id, client_message_id, connection.id,
+                    self._state.phase, len(self._input_queue),
+                )
                 record = {
                     "client_message_id": client_message_id,
                     "event_id": None,
@@ -591,6 +631,11 @@ class SessionGateway:
                 )
             except GatewayError as exc:
                 self._published_input_pending = False
+                logger.warning(
+                    "session %s could not release queued user.message %s: "
+                    "%s: %s",
+                    self.session_id, item.client_message_id, exc.code, exc,
+                )
                 self._remember(item.client_message_id, {
                     "client_message_id": item.client_message_id,
                     "event_id": None,
@@ -634,6 +679,10 @@ class SessionGateway:
         self._decided[call_id] = decision
         while len(self._decided) > 256:
             self._decided.popitem(last=False)
+        logger.debug(
+            "session %s approval %s %s (client=%d)",
+            self.session_id, call_id, decision, connection.id,
+        )
 
         etype = "approval.granted" if decision == "granted" else "approval.denied"
         committed = await self._publish(
@@ -664,6 +713,10 @@ class SessionGateway:
                 E_BAD_FRAME, "too many or oversized frame filters",
                 location=LOCATION_SESSION,
             )
+        logger.debug(
+            "session %s subscribe client=%d after_seq=%d mode=%s frames=%d",
+            self.session_id, connection.id, after_seq, mode, len(patterns),
+        )
 
         subscription = Subscription(
             key=connection.id,

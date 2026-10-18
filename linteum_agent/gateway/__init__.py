@@ -11,7 +11,8 @@ whitelisted **commands** and receive projected **frames**:
   session catalogue;
 * :mod:`~linteum_agent.gateway.client` — transport-independent client SDK;
 * :mod:`~linteum_agent.gateway.transports` — inproc / stdio / WebSocket framing;
-* :mod:`~linteum_agent.gateway.leases` — cross-process single-writer leases.
+* :mod:`~linteum_agent.gateway.leases` — cross-process single-writer leases;
+* :mod:`~linteum_agent.gateway.log` — the ``linteum.gateway`` logger hierarchy.
 
 Dependency direction (§4.3): ``frontend → client → transport → gateway →
 runtime → bus``.  ``bus`` never imports ``gateway``; transports import only

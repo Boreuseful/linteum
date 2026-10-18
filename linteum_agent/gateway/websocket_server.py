@@ -17,7 +17,10 @@ import asyncio
 import ipaddress
 from typing import Optional
 
+from .log import get_logger
 from .transports.websocket import WebSocketTransport
+
+logger = get_logger("websocket")
 
 DEFAULT_WS_HOST = "127.0.0.1"
 DEFAULT_WS_PORT = 8765
@@ -54,6 +57,10 @@ async def serve_websocket(
     the application-level ``ping`` command is separate.
     """
     if not allow_remote and not _is_loopback(host):
+        logger.warning(
+            "refusing to bind %r: the gateway has no authentication "
+            "(pass allow_remote=True behind a proxy)", host,
+        )
         raise ValueError(
             f"refusing to bind {host!r}: the gateway has no authentication; "
             "use 127.0.0.1 or pass allow_remote=True behind your own proxy"
@@ -79,7 +86,13 @@ async def serve_websocket(
     ready = ready or asyncio.Event()
 
     async def handler(websocket, *_args) -> None:
-        await gateway_server.serve(WebSocketTransport(websocket))
+        logger.debug("websocket client connected: %s",
+                     getattr(websocket, "remote_address", None))
+        try:
+            await gateway_server.serve(WebSocketTransport(websocket))
+        finally:
+            logger.debug("websocket client disconnected: %s",
+                         getattr(websocket, "remote_address", None))
 
     async with ws_serve(
         handler,
@@ -89,8 +102,11 @@ async def serve_websocket(
         ping_interval=ping_interval,
         ping_timeout=ping_timeout,
     ):
+        logger.info("websocket gateway listening on ws://%s:%d (max_size=%d)",
+                    host, port, max_size)
         ready.set()
         await stop.wait()
+        logger.info("websocket gateway stop requested")
 
 
 __all__ = [
