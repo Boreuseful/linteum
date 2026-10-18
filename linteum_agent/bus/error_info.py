@@ -52,6 +52,7 @@ class ErrorSource(str, Enum):
     STORAGE = "storage"
     PLUGIN = "plugin"
     HOST = "host"
+    GATEWAY = "gateway"
     UNKNOWN = "unknown"
 
 
