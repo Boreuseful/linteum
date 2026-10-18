@@ -14,14 +14,17 @@ Module layout:
 - ``config``: semi-permanent configuration (LLM, gateway, storage, logging, UI)
   with YAML persistence, environment overrides, validation and UI metadata.
   Per-conversation values such as ``workspace`` live in ``SessionOptions``, not
-  in the config file.
+  in the config file;
+- ``gateway``: the stable command/frame boundary shared by CLI/TUI/Web —
+  protocol v1, a pure event projector, per-session ordering/backpressure,
+  inproc/stdio/WebSocket transports, leases and the client SDK;
+- ``cli``: ``linteum serve`` / ``linteum chat`` / ``linteum sessions``.
 
 The bus/runtime/storage packages were migrated from the experimental
 ``new_projer`` framework.  The previous non-event-driven layers (``run_agent`` /
 ``agent.engine`` / ``tools`` / ``evnts`` / the legacy ``config`` / ``context`` /
 ``model`` / ``prompt`` / ``skills``) and the legacy ``cli`` package have been
-removed.  A new host entry point (Gateway, then CLI/TUI/Web) is being built on
-top of ``bus`` + ``runtime`` + ``config``.
+removed.
 
 Importing this package has no side effects so hosts can load submodules lazily.
 """
