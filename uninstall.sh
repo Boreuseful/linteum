@@ -3,20 +3,21 @@
 # linteum uninstaller.
 #
 # Removes the `linteum` uv tool. With --purge it also deletes the user state
-# directory (~/.agent), which holds the config, sessions and CLI snapshot.
+# directory (~/.linteum, or $LINTEUM_HOME), which holds the config, state DB,
+# artifacts and leases.
 #
 # Note: this does NOT touch any shell configuration file (e.g. the PATH entry
 # that `install.sh` added via `uv tool update-shell`); those are left untouched.
 #
 # Usage:
 #   ./uninstall.sh            # remove the command only (user state is kept)
-#   ./uninstall.sh --purge    # also delete ~/.agent (config, sessions, snapshots)
+#   ./uninstall.sh --purge    # also delete ~/.linteum (config, state, artifacts)
 #   ./uninstall.sh -h | --help
 #
 set -euo pipefail
 
 PROJECT_NAME="linteum"
-AGENT_HOME="${HOME}/.agent"
+AGENT_HOME="${LINTEUM_HOME:-${HOME}/.linteum}"
 
 usage() {
     cat <<'EOF'
@@ -24,8 +25,8 @@ Usage: ./uninstall.sh [--purge]
 
 Remove the `linteum` command-line tool.
 
-  --purge         also delete the user state directory ~/.agent
-                  (config, sessions and CLI snapshot); without it, user state is kept
+  --purge         also delete the user state directory ~/.linteum
+                  (config, state DB, artifacts and leases); without it, user state is kept
   -h, --help      show this help
 EOF
 }

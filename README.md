@@ -6,44 +6,69 @@ Language: [中文](README_zh_CN.md)
 
 ## Getting Started
 
-The project currently targets the linux environment; mac and window have not been tested yet.
+The project currently targets Linux; macOS and Windows have not been tested yet.
 
 ```bash
-bash install.sh
+bash install.sh            # editable install; add --web for `linteum serve --ws`
 linteum --version
-# linteum 0.1.0-rc.1
 ```
 
 ### Basic Usage
 
 ```bash
-linteum setup
-# generate the config file template
-linteum chat -p "implement numpy matrix operations" --bash -y
+linteum setup                              # interactive provider/model/API key
+linteum config list                        # inspect the effective config
+linteum config edit                        # edit YAML with $EDITOR and validate
+
+linteum chat -w /path/to/project           # REPL
+linteum chat -w /path/to/project -m "Summarize README.md"   # one-shot
+linteum sessions                           # list sessions
+
+linteum serve --stdio                      # JSONL gateway over stdin/stdout
+linteum serve --ws                         # WebSocket gateway on 127.0.0.1:8765
 ```
 
-Config file template:
+`workspace` is a per-session option (`-w` / `session.create`), never a global
+config key.
+
+### Configuration
+
+The config file is `~/.linteum/config.yaml` (override with `$LINTEUM_CONFIG`).
+`linteum setup` or `linteum config init` writes the commented template:
 
 ```yaml
 version: 1
-llm:
-  provider: openai
-  model: gpt-6-sol
-  openai_mode: responses
-  api_key: sk-
-  base_url: https://example.com
-  timeout: 60.0
-  temperature: 0.1
-  max_tokens: 384000
-  top_p: null
-  reasoning_effort: high    # deepseek model parameter
-  thinking: true            # deepseek model parameter
+agent:
+  llm:
+    provider: openai
+    model: gpt-4o-mini
+    openai_mode: responses
+    api_key: ${OPENAI_API_KEY}
+    base_url: null
+    timeout: 60.0
+    temperature: 0.7
+    max_tokens: 4096
 ```
 
-Currently supports the openai and deepseek models.
+Useful commands:
+
+```bash
+linteum config path
+linteum config get agent.llm.model
+linteum config set agent.llm.model gpt-4o-mini
+linteum config set agent.llm.api_key '${OPENAI_API_KEY}'
+linteum config set agent.profiles '{"fast":{"provider":"deepseek","model":"deepseek-chat"}}'
+linteum config validate --effective
+linteum config list --show-origin --section agent
+```
+
+Supported providers: OpenAI (Responses / Chat Completions), OpenAI-compatible
+endpoints (`base_url`), DeepSeek and Anthropic. Named profiles and a global
+fallback chain are available via `agent.profiles` / `agent.fallbacks`.
 
 ## Uninstall
 
 ```bash
-bash uninstall.sh
+bash uninstall.sh            # remove the command; keep ~/.linteum
+bash uninstall.sh --purge    # also remove ~/.linteum (config, state, artifacts)
 ```

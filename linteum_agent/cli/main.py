@@ -27,6 +27,7 @@ import sys
 import time
 import uuid
 from dataclasses import replace
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Optional
 
@@ -50,8 +51,18 @@ DEFAULT_WORKSPACE = "."
 # argument parsing
 # ---------------------------------------------------------------------------
 
+def _version() -> str:
+    try:
+        return package_version("linteum")
+    except PackageNotFoundError:  # source tree without an installed distribution
+        return "0.0.0"
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="linteum")
+    parser.add_argument(
+        "--version", action="version", version=f"linteum {_version()}"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="run the gateway host")
