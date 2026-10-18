@@ -409,6 +409,10 @@ class WorkspaceRegistry:
             self._cache[session_id] = ws
         return ws
 
+    def drop(self, session_id: str) -> None:
+        """Discard the cached workspace for a closed/deleted session."""
+        self._cache.pop(session_id, None)
+
     def __contains__(self, session_id: object) -> bool:
         return session_id in self._cache
 
@@ -430,9 +434,13 @@ class WorkspaceToolRegistries:
     """
 
     def __init__(self, workspaces: WorkspaceRegistry, *,
-                 extra_specs: Iterable[ToolSpec] = ()) -> None:
+                 extra_specs: Iterable[ToolSpec] = (),
+                 factory: Optional[Callable[[Workspace], Iterable[ToolSpec]]] = None) -> None:
         self.workspaces = workspaces
         self._extra = tuple(extra_specs)
+        #: Host hook: build the workspace-bound tool batch (file tools by default,
+        #: plus e.g. ``bash`` when the host wants it).  Called once per session.
+        self._factory = factory or make_file_tools
         self._registries: dict[str, ToolRegistry] = {}
         self._lock = asyncio.Lock()
 
@@ -445,13 +453,17 @@ class WorkspaceToolRegistries:
             if registry is None:
                 ws = self.workspaces.for_session(session_id)
                 registry = ToolRegistry()
-                await registry.register_many([*self._extra, *make_file_tools(ws)])
+                await registry.register_many([*self._extra, *self._factory(ws)])
                 self._registries[session_id] = registry
         return registry
 
     def built(self, session_id: str) -> Optional[ToolRegistry]:
         """Sync accessor for a registry already built via :meth:`for_session`."""
         return self._registries.get(session_id)
+
+    def drop(self, session_id: str) -> None:
+        """Forget a session's registry (session eviction / deletion)."""
+        self._registries.pop(session_id, None)
 
     def __len__(self) -> int:
         return len(self._registries)

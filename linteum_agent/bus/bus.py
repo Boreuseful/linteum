@@ -189,20 +189,37 @@ class InMemoryEventBus:
             except Exception:  # noqa: BLE001 - observability must never break the bus
                 pass
 
+    def emit_log(self, record: dict) -> None:
+        """Public structured-record hook for host-side layers (e.g. gateway audit).
+
+        Follows the same contract as internal records: a sink may never publish
+        or raise into the bus, and with no sink attached this is a cheap no-op.
+        """
+        self._emit_log(record)
+
     # -- publish pipeline (§14.1) ------------------------------------------
-    async def publish(self, ev: Event) -> None:
-        """Commit and enqueue one event (steps ①–⑨ of §14.1)."""
+    async def publish(self, ev: Event) -> Optional[Event]:
+        """Commit and enqueue one event (steps ①–⑨ of §14.1).
+
+        Returns the committed event — carrying the host-assigned ``seq`` — or
+        ``None`` when the event was deduplicated, shed by backpressure, or
+        absorbed into a coalescing window.  Hosts that need a durable receipt
+        (the Gateway command result) can therefore confirm *exactly* what was
+        written instead of guessing from an id.  Ignoring the return value keeps
+        the previous fire-and-forget behaviour.
+        """
         await self._ensure_seq(ev.session_id)
         ready = await self._prepare_logged(ev)
         if ready is None:
-            return
-        await self._commit(ready)
+            return None
+        return await self._commit(ready)
 
-    async def publish_many(self, evs: Iterable[Event]) -> None:
+    async def publish_many(self, evs: Iterable[Event]) -> list[Event]:
         """Batch publish: one WAL transaction (fewer fsyncs) for the ready set.
 
         Ordering note: the caller is responsible for passing same-session events
         in ``seq`` order; the batch's internal order is preserved end to end.
+        Returns the committed events (deduplicated/shed entries are omitted).
         """
         events = list(evs)
         for session_id in {ev.session_id for ev in events}:
@@ -213,12 +230,13 @@ class InMemoryEventBus:
             if prepared is not None:
                 ready.append(prepared)
         if not ready:
-            return
+            return []
         ready = [self._assign_seq(ev) for ev in ready]
         await self.wal.append_many(ready)  # ⑦ single group commit
         for ev in ready:
             if await self.fair.put(ev):  # ⑨ per-origin enqueue
                 self.metrics.published(ev.origin, ev.type)
+        return ready
 
     async def _prepare_logged(self, ev: Event) -> Optional[Event]:
         """``_prepare`` with a publish-rejection record on the way out (§34.1)."""
@@ -271,8 +289,8 @@ class InMemoryEventBus:
             return None
         return merged
 
-    async def _commit(self, ev: Event) -> None:
-        """Steps ⑦–⑨: assign seq, WAL append, per-origin enqueue."""
+    async def _commit(self, ev: Event) -> Event:
+        """Steps ⑦–⑨: assign seq, WAL append, per-origin enqueue; return the fact."""
         ev = self._assign_seq(ev)
         started = time.perf_counter()
         await self.wal.append(ev)  # ⑦ 先落盘 (durability before delivery, P5)
@@ -296,6 +314,7 @@ class InMemoryEventBus:
             )
         if await self.fair.put(ev):  # ⑨ WFQ enqueue (may shed plugin overflow)
             self.metrics.published(ev.origin, ev.type)
+        return ev
 
     async def _ensure_seq(self, session_id: str) -> None:
         """Seed the in-memory counter from the WAL before appending (I10).

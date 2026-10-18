@@ -16,6 +16,7 @@ Two structural properties fall out of this shape:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Optional, Sequence
 
@@ -63,6 +64,7 @@ class Agent:
         context_policy: Optional[ContextPolicy] = None,
         auto_subscribe: bool = True,
         replay: bool = False,
+        serialize: bool = True,
     ) -> None:
         self.bus = bus
         self.session_id = session_id
@@ -72,6 +74,14 @@ class Agent:
         self.ctx_builder = ctx_builder or PassthroughContextBuilder()
         self.context_policy = context_policy
         self._replaying = replay
+        #: Serialise this session's reducer handlers (``WorkerPool`` permits up to
+        #: four concurrent handlers per session; the reducer itself is not
+        #: re-entrant).  A host that already provides its own lane can opt out.
+        self._serialize = serialize
+        self._reducer_lock = asyncio.Lock()
+        #: Live subscriptions; ``close()`` removes them (needed for session
+        #: eviction / host shutdown — the bus otherwise keeps the agent alive).
+        self._unsubs: list = []
         if context_policy is not None and context_policy.enabled \
                 and not hasattr(self.ctx_builder, "next_compaction"):
             raise ValueError(
@@ -84,18 +94,53 @@ class Agent:
 
     # -- subscription -------------------------------------------------------
     def subscribe(self) -> None:
+        """Attach the reducer handlers to the bus (idempotent).
+
+        Every handler is wrapped in the per-session reducer lock.  The bus
+        deliberately allows several handlers per session to run concurrently
+        (§6.2 / ``bus/scheduler/pool.py``), which is fine for effect layers but
+        would let two reducer events interleave on the same ``AgentState``.
+        """
+        if self._unsubs or self.bus is None:
+            return
         bus = self.bus
-        bus.on("user.message", self.on_user)
-        bus.on("user.interrupt", self.on_interrupt)
-        bus.on("llm.completed", self.on_llm)
-        bus.on("llm.failed", self.on_llm_failed)
-        bus.on("tool.call.completed", self.on_tool_done)
-        bus.on("tool.call.failed", self.on_tool_done)
-        bus.on("approval.granted", self.on_approval)
-        bus.on("agent.resumed", self.on_resumed)
-        bus.on("context.compaction.applied", self.on_compaction_applied)
-        bus.on("system.plugin.loaded", self.on_tools_changed)
-        bus.on("system.plugin.unloaded", self.on_tools_changed)
+        for pattern, handler in (
+            ("user.message", self.on_user),
+            ("user.interrupt", self.on_interrupt),
+            ("llm.completed", self.on_llm),
+            ("llm.failed", self.on_llm_failed),
+            ("tool.call.completed", self.on_tool_done),
+            ("tool.call.failed", self.on_tool_done),
+            ("approval.granted", self.on_approval),
+            ("agent.resumed", self.on_resumed),
+            ("context.compaction.applied", self.on_compaction_applied),
+            ("system.plugin.loaded", self.on_tools_changed),
+            ("system.plugin.unloaded", self.on_tools_changed),
+        ):
+            self._unsubs.append(bus.on(pattern, self._serialized(handler)))
+
+    def _serialized(self, handler):
+        """Wrap ``handler`` so reducer events for this session never overlap."""
+        if not self._serialize:
+            return handler
+
+        async def serialized(ev: Event) -> None:
+            async with self._reducer_lock:
+                await handler(ev)
+
+        serialized.__name__ = getattr(handler, "__name__", "handler")
+        serialized.__qualname__ = f"Agent.{serialized.__name__}"
+        return serialized
+
+    def unsubscribe(self) -> None:
+        """Detach every handler (idempotent); the agent becomes inert."""
+        for unsubscribe in self._unsubs:
+            unsubscribe()
+        self._unsubs.clear()
+
+    def close(self) -> None:
+        """Release the bus subscriptions (alias of :meth:`unsubscribe`)."""
+        self.unsubscribe()
 
     @property
     def tools_schema(self) -> list:
@@ -438,8 +483,14 @@ class Agent:
     # -- recovery -----------------------------------------------------------
     @classmethod
     async def restore(cls, bus, checkpointer: Checkpointer, *, session_id: str,
-                      **kwargs) -> "Agent":
-        """Rebuild an agent from the latest checkpoint + its WAL tail (P1)."""
+                      pending_approvals: Sequence[str] = (), **kwargs) -> "Agent":
+        """Rebuild an agent from the latest checkpoint + its WAL tail (P1).
+
+        ``pending_approvals`` lists ``call_id`` values whose approval is still
+        open in the (restored) :class:`ApprovalGate`.  The half-round closer must
+        keep those calls pending instead of declaring the round interrupted,
+        otherwise a server restart silently drops a human-in-the-loop tool call.
+        """
         kwargs.pop("auto_subscribe", None)
         kwargs.pop("replay", None)
         agent = cls(bus, session_id=session_id, checkpointer=checkpointer,
@@ -459,7 +510,7 @@ class Agent:
             trace_id = events[0].trace_id if events else uuid7()
             state = AgentState(session_id=session_id, trace_id=trace_id)
         agent.state = await cls.replay_state(state, events)
-        await agent._close_half_round()
+        await agent._close_half_round(pending_approvals=pending_approvals)
         agent.subscribe()
         return agent
 
@@ -505,8 +556,14 @@ class Agent:
                 self.state.round, int(ev.payload.get("round") or 0)
             )
 
-    async def _close_half_round(self) -> None:
-        """Close a round interrupted by a process restart (no provider call)."""
+    async def _close_half_round(self, *, pending_approvals: Sequence[str] = ()) -> None:
+        """Close a round interrupted by a process restart (no provider call).
+
+        Approval-gated calls are special: their ``tool.call.requested`` fact is
+        still valid and the human decision will arrive after the restart, so the
+        round must stay alive.  Non-approval siblings (which were genuinely
+        interrupted) are paired and voided as usual.
+        """
         if self.state.phase == phases.PAUSED:
             return
         if self.state.phase not in (
@@ -516,6 +573,21 @@ class Agent:
             phases.AWAITING_APPROVAL,
         ):
             return
+        approvals = set(pending_approvals) & self.state.pending
+        if approvals:
+            for call_id in sorted(self.state.pending - approvals):
+                self.state.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": INTERRUPT_TAG,
+                    "interrupted": True,
+                })
+                self.state.cancelled.add(call_id)
+            self.state.pending = set(approvals)
+            self.state.pending_compaction = None
+            self.state.interrupt_pending = False
+            self._tick()
+            return  # keep the approval round open for a post-restart decision
         round_number = self.state.round
         if self.state.pending:
             for call_id in sorted(self.state.pending):
