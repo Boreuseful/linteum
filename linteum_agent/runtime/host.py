@@ -52,6 +52,7 @@ from .llm.adapters import create_adapter
 from .llm.executor import LLMExecutor
 from .llm.registry import AdapterRegistry
 from .llm.router import LlmRouter
+from .observability.run_logger import RunLogger
 from .state.agent_state import Budget
 from .tools.approval import ApprovalGate
 from .tools.registry import ToolRegistry
@@ -186,6 +187,12 @@ class AgentHost:
             artifacts=self.storage.artifacts,
             coalesce_window_ms=cfg.gateway.delta.coalesce_window_ms,
         )
+
+        # -- observability sidecar (§48) ------------------------------------
+        # The run log is a bus observer, so it must be attached before the
+        # dispatch loop starts.  It degrades to stderr if the configured path
+        # is unwritable and never raises into the bus.
+        self.run_logger = RunLogger.attach(self.bus, cfg.logging)
 
         # -- effect layers (one subscriber per capability) ------------------
         self.cancel_registry = CancelRegistry()
@@ -411,6 +418,7 @@ class AgentHost:
         if task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        self.run_logger.close()          # flush deltas after dispatch has drained
         if self.storage.wal is not self.bus.wal:
             with contextlib.suppress(Exception):
                 await self.storage.wal.close()
