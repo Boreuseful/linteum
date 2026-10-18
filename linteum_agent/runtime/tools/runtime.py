@@ -75,12 +75,21 @@ class ToolRuntime:
         inline_limit: int = DEFAULT_INLINE_LIMIT,
         auto_subscribe: bool = True,
         registry_for: Optional[Callable[[str], object]] = None,
+        approval_policy: str = "ask",
     ) -> None:
+        if approval_policy not in ("ask", "allow", "deny"):
+            raise ValueError(
+                f"approval_policy must be 'ask', 'allow' or 'deny', got {approval_policy!r}"
+            )
         self.bus = bus
         self.reg = registry
         self.sandbox = sandbox
         self.results = results
         self.approvals = approvals
+        #: Host policy for ``spec.requires_approval`` tools (§24):
+        #: ``ask`` defers to the gate, ``allow`` executes immediately and
+        #: ``deny`` pairs the call as ``tool.call.failed{E_DENIED}``.
+        self.approval_policy = approval_policy
         #: Optional per-session registry selector (§ multi-tenant workspaces).
         #: ``None`` keeps the single-registry behaviour; a callable maps
         #: ``session_id`` -> :class:`ToolRegistry` (sync, or an awaitable of one
@@ -137,7 +146,12 @@ class ToolRuntime:
         }))
 
         # ③ approval-gated: suspend, do not execute
-        if spec.requires_approval:
+        if spec.requires_approval and self.approval_policy != "allow":
+            if self.approval_policy == "deny":
+                await self._fail(ev, call_id,
+                                 f"approval required but policy is 'deny': {name}",
+                                 E_DENIED)
+                return
             await self.approvals.request(ev, spec)
             return
 
@@ -265,11 +279,15 @@ class ToolRuntime:
 
     # -- cancellation (§16.3) ----------------------------------------------
     async def on_cancel(self, ev) -> None:
+        # Invalidate approval first (synchronously): a decision racing with the
+        # interrupt must never reach ``resume_approved`` and execute the tool.
         call_id = ev.payload.get("call_id")
         if call_id:
+            self.approvals.cancel(call_id=call_id)
             await self._cancel_call(call_id)
             return
         session_id = ev.payload.get("session_id") or ev.session_id
+        self.approvals.cancel(session_id=session_id)
         for cid in [c for c, s in self._sessions.items() if s == session_id]:
             await self._cancel_call(cid)
 
