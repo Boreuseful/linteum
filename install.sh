@@ -10,6 +10,7 @@
 # Usage:
 #   ./install.sh                 # editable install (default): the command tracks this source tree
 #   ./install.sh --no-editable   # regular install: a snapshot copy of the current sources
+#   ./install.sh --web           # also install the optional websockets transport
 #   ./install.sh -h | --help
 #
 # Environment:
@@ -23,12 +24,13 @@ PROJECT_NAME="linteum"
 
 usage() {
     cat <<'EOF'
-Usage: ./install.sh [--editable | --no-editable]
+Usage: ./install.sh [--editable | --no-editable] [--web]
 
 Install the `linteum` command-line tool.
 
   --editable      (default) editable install: the command tracks this source tree
   --no-editable   regular install: a snapshot copy of the current sources
+  --web           also install `websockets` for `linteum serve --ws`
   -h, --help      show this help
 
 Steps performed:
@@ -43,10 +45,12 @@ EOF
 }
 
 EDITABLE=1
+WITH_WEB=0
 for arg in "$@"; do
     case "$arg" in
         -e|--editable) EDITABLE=1 ;;
         --no-editable) EDITABLE=0 ;;
+        --web)         WITH_WEB=1 ;;
         -h|--help)     usage; exit 0 ;;
         *) echo "install.sh: unknown option '$arg'" >&2; usage >&2; exit 2 ;;
     esac
@@ -70,10 +74,14 @@ fi
 
 # --- 2. install the project as a uv tool -------------------------------
 echo "==> installing '$PROJECT_NAME' from $PROJECT_ROOT"
+WEB_ARGS=()
+if [ "$WITH_WEB" -eq 1 ]; then
+    WEB_ARGS+=(--with websockets)
+fi
 if [ "$EDITABLE" -eq 1 ]; then
-    uv tool install --force --editable "$PROJECT_ROOT"
+    uv tool install --force --editable "$PROJECT_ROOT" "${WEB_ARGS[@]}"
 else
-    uv tool install --force "$PROJECT_ROOT"
+    uv tool install --force "$PROJECT_ROOT" "${WEB_ARGS[@]}"
 fi
 
 # --- 3. make sure the tool bin directory is on PATH (persisted) --------
@@ -91,6 +99,12 @@ echo "==> done."
 echo "    '$TOOL_BIN' has been added to your shell configuration; open a new"
 echo "    shell (or re-source your shell rc) to use 'linteum' globally."
 echo "    Verify with: linteum --version"
+echo "    Then try:    linteum setup"
+echo "                 linteum config list"
+echo "                 linteum chat -w /path/to/project"
+if [ "$WITH_WEB" -eq 0 ]; then
+    echo "    (websockets for 'linteum serve --ws' is optional: ./install.sh --web)"
+fi
 if ! command -v linteum >/dev/null 2>&1; then
     echo
     echo "note: not on this shell's PATH yet. For the current shell, run:"
