@@ -143,6 +143,18 @@ class DeltaCoalescer:
                 out.append(group.build())
         return out
 
+    def next_delay(self) -> float | None:
+        """Seconds until the earliest buffered group is due.
+
+        ``None`` means nothing is buffered; ``0.0`` means flush immediately.
+        The dispatch loop uses this to sleep until the window expires instead
+        of polling.
+        """
+        if not self._groups:
+            return None
+        deadline = min(group.deadline for group in self._groups.values())
+        return max(0.0, deadline - self._clock())
+
     @property
     def pending(self) -> int:
         return len(self._groups)

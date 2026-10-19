@@ -136,6 +136,9 @@ class InMemoryEventBus:
         self._log_sinks: list[LogSink] = []
 
         self._stop = asyncio.Event()
+        #: Wakes the idle dispatch loop when work arrives, a delta window
+        #: expires, or a stop is requested (§14.1 step ⑨).
+        self._wake = asyncio.Event()
         self._running = False
         self._closed = False
 
@@ -233,9 +236,13 @@ class InMemoryEventBus:
             return []
         ready = [self._assign_seq(ev) for ev in ready]
         await self.wal.append_many(ready)  # ⑦ single group commit
+        queued = False
         for ev in ready:
             if await self.fair.put(ev):  # ⑨ per-origin enqueue
                 self.metrics.published(ev.origin, ev.type)
+                queued = True
+        if queued:
+            self._wake.set()
         return ready
 
     async def _prepare_logged(self, ev: Event) -> Optional[Event]:
@@ -286,6 +293,7 @@ class InMemoryEventBus:
         if merged is None:
             # deferred into a merge window (counts every coalesced delta)
             self.metrics.coalesced(ev.type)
+            self._wake.set()  # the dispatcher must come back at the deadline
             return None
         return merged
 
@@ -314,6 +322,7 @@ class InMemoryEventBus:
             )
         if await self.fair.put(ev):  # ⑨ WFQ enqueue (may shed plugin overflow)
             self.metrics.published(ev.origin, ev.type)
+            self._wake.set()
         return ev
 
     async def _ensure_seq(self, session_id: str) -> None:
@@ -387,7 +396,7 @@ class InMemoryEventBus:
                 await self._flush_coalesced()  # deliver merged deltas whose window elapsed
                 ev = self.fair.next()
                 if ev is None:
-                    await asyncio.sleep(0)
+                    await self._wait_for_work()
                     continue
                 if isinstance(ev.payload, dict) and ev.payload.get("_offloaded"):
                     try:
@@ -403,6 +412,26 @@ class InMemoryEventBus:
                     self.pool.spawn(self._safe(handler, ev), session_id=ev.session_id)
         finally:
             self._running = False
+
+    async def _wait_for_work(self) -> None:
+        """Sleep until an event is queued, a delta window expires, or stop.
+
+        The previous ``asyncio.sleep(0)`` spun the loop at 100% CPU whenever
+        the scheduler was empty.  Clearing before the re-check is what makes
+        the wakeup lossless: a producer either queued before the check (seen
+        here) or sets :attr:`_wake` afterwards (wakes the wait).
+        """
+        self._wake.clear()
+        if self._stop.is_set() or self.fair.total() > 0:
+            return
+        delay = self.coalescer.next_delay()
+        if delay is None:
+            await self._wake.wait()
+        elif delay <= 0:
+            return
+        else:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), delay)
 
     async def _flush_coalesced(self) -> None:
         for ev in self.coalescer.flush_due():
@@ -538,12 +567,14 @@ class InMemoryEventBus:
     def stop(self) -> None:
         """Ask :meth:`run` to return at the next iteration."""
         self._stop.set()
+        self._wake.set()  # an idle loop must not sleep through the stop
 
     async def close(self, drain: bool = True) -> None:
         """Stop dispatch, flush coalesced deltas, optionally drain, close the WAL."""
         if self._closed:
             return
         self._stop.set()
+        self._wake.set()
         try:
             for ev in self.coalescer.flush_all():
                 await self._commit(ev)
