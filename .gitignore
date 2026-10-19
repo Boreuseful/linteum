@@ -6,6 +6,7 @@ wheels/
 *.egg-info
 
 test/
+docs/
 .agent
 .vscode
 .venv

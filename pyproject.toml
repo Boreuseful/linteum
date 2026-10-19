@@ -13,7 +13,6 @@ dependencies = [
 
 [project.optional-dependencies]
 web = ["websockets>=13"]
-tui = ["textual>=0.80"]
 
 [project.scripts]
 linteum = "linteum_agent.cli.main:main"
