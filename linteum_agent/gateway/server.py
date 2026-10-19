@@ -62,6 +62,16 @@ _PAUSED_ALLOWED = frozenset({
     "gap", "snapshot", "error", "bye", "flow", "history.page", "artifact.chunk",
 })
 
+#: A replay stream blocks when the outbound queue reaches this much headroom.
+#: Without the pause the whole history is enqueued in one synchronous turn, the
+#: writer task never runs, and the queue overflows into a ``gap``.
+REPLAY_HEADROOM_FRAMES = 64
+REPLAY_HEADROOM_BYTES = 64 * 1024
+REPLAY_POLL_SECONDS = 0.001
+#: A client that stops reading must not pin the session's command lock forever:
+#: after this long without headroom the replay falls back to the explicit gap.
+REPLAY_DRAIN_TIMEOUT = 30.0
+
 logger = get_logger("server")
 
 
@@ -174,6 +184,38 @@ class ClientConnection:
             return self._overflow(frame, text)
         self._queue.put_nowait((text, frame))
         self._queued_bytes += size
+        return True
+
+    async def send_replay_frame(self, frame: Frame) -> bool:
+        """Enqueue one replayed frame, giving the writer room to drain first.
+
+        Replay loops have no other await points, so the writer task cannot run
+        and a long history fills the bounded queue in a single turn.  Waiting
+        for headroom keeps the replay streaming instead of being truncated by
+        :meth:`_overflow`.
+        """
+        if not await self._wait_for_replay_room():
+            # The client stopped reading.  Take the normal overflow path now
+            # instead of waiting out another timeout on every frame.
+            return self._overflow(frame, "")
+        return self.send_frame(frame)
+
+    async def _wait_for_replay_room(self) -> bool:
+        """Wait until the writer has made room; ``False`` means it timed out."""
+        frames = int(getattr(self.limits, "client_queue_frames", 1_024))
+        max_bytes = int(getattr(self.limits, "client_queue_bytes", 1_048_576))
+        # Leave room for control frames and the command result that follow the
+        # replay; never reserve more than half the configured queue.
+        frame_mark = max(1, frames - min(REPLAY_HEADROOM_FRAMES, frames // 2))
+        byte_mark = max(1, max_bytes - min(REPLAY_HEADROOM_BYTES, max_bytes // 2))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + REPLAY_DRAIN_TIMEOUT
+        while not self._closed and (
+            self._queue.qsize() >= frame_mark or self._queued_bytes >= byte_mark
+        ):
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(REPLAY_POLL_SECONDS)
         return True
 
     def send_result(self, result: CommandResult) -> bool:

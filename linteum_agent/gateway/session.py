@@ -89,7 +89,7 @@ class Subscription:
     mode: str = "view"
     patterns: tuple = ()
     catchup: bool = True
-    pending: list = field(default_factory=list)
+    pending: deque = field(default_factory=deque)
     overflowed: bool = False
 
     def accepts(self, frame: Frame) -> bool:
@@ -729,7 +729,7 @@ class SessionGateway:
         connection.resume_session(self.session_id)  # an explicit subscribe lifts a gap pause
         try:
             entries, state = await self._replay_entries(after_seq)
-            connection.send_frame(Frame.create(
+            await connection.send_replay_frame(Frame.create(
                 "snapshot",
                 snapshot_payload(state),
                 session_id=self.session_id,
@@ -745,7 +745,7 @@ class SessionGateway:
                         seq=event.seq, replay=True,
                     )
                     if subscription.accepts(replay):
-                        connection.send_frame(replay)
+                        await connection.send_replay_frame(replay)
                     continue
                 for ordinal, projected in enumerate(frames):
                     if projected.ephemeral:
@@ -756,17 +756,20 @@ class SessionGateway:
                         ephemeral=False, replay=True, ordinal=ordinal,
                     )
                     if subscription.accepts(replay):
-                        connection.send_frame(replay)
+                        await connection.send_replay_frame(replay)
 
-            subscription.catchup = False
             cutoff = state.last_seq
             delivered_upto = cutoff
-            for seq, frame in subscription.pending:
+            # Keep buffering live frames while the catch-up backlog is flushed:
+            # a paced send yields to the pump, and a direct send would let a
+            # newer frame overtake the older pending ones.
+            while subscription.pending:
+                seq, frame = subscription.pending.popleft()
                 if seq is None or seq > cutoff:
-                    connection.send_frame(frame)
+                    await connection.send_replay_frame(frame)
                     if seq is not None:
                         delivered_upto = max(delivered_upto, seq)
-            subscription.pending.clear()
+            subscription.catchup = False
             if subscription.overflowed:
                 # Live frames arrived faster than the replay could flush; tell
                 # the client where to resume instead of silently losing finals.
