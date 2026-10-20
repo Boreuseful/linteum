@@ -53,11 +53,24 @@ from .llm.executor import LLMExecutor
 from .llm.registry import AdapterRegistry
 from .llm.router import LlmRouter
 from .observability.run_logger import RunLogger
+from .skills.catalog import load_catalog
+from .skills.model import SkillCatalog, SkillLimits
+from .skills.source import (
+    PRIORITY_EXTRA,
+    PRIORITY_PROJECT,
+    PRIORITY_USER,
+    SOURCE_EXTRA,
+    SOURCE_PROJECT,
+    SOURCE_USER,
+    DirectorySkillSource,
+    SkillSource,
+)
+from .skills.tools import make_skill_tools
 from .state.agent_state import Budget
 from .tools.approval import ApprovalGate
 from .tools.registry import ToolRegistry
 from .tools.results import InMemoryResultStore
-from .tools.runtime import ToolRuntime
+from .tools.runtime import DEFAULT_INLINE_LIMIT, ToolRuntime
 from .tools.sandbox import Sandbox
 from .tools.workspace import (
     Workspace,
@@ -207,6 +220,7 @@ class AgentHost:
         self.sandbox = sandbox if sandbox is not None else Sandbox()
         self.approvals = approvals if approvals is not None else ApprovalGate(self.bus)
         self._workspace_by_session: dict[str, Workspace] = {}
+        self._skill_catalogs: dict[str, SkillCatalog] = {}
         self.workspaces = WorkspaceRegistry(self._workspace_for)
         self._tool_factory_cfg = cfg
         self.tool_registries = WorkspaceToolRegistries(
@@ -319,16 +333,65 @@ class AgentHost:
         self._llm_signature = signature
 
     @staticmethod
-    def _context_settings(cfg: AppConfig):
+    def _context_settings(cfg: AppConfig, skill_index: str = ""):
+        blocks = (skill_index,) if skill_index else ()
         ctx = cfg.agent.context
         if ctx.policy == "compacting" and ctx.max_tokens > 0:
-            return CompactingContextBuilder(), ContextPolicy(
+            return CompactingContextBuilder(system_blocks=blocks), ContextPolicy(
                 max_tokens=ctx.max_tokens,
                 compact_to_tokens=ctx.compact_to_tokens,
                 keep_last_messages=ctx.keep_last_messages,
                 max_summary_tokens=ctx.max_summary_tokens,
             )
-        return PassthroughContextBuilder(), None
+        return PassthroughContextBuilder(system_blocks=blocks), None
+
+    def _skill_sources(
+        self, cfg: AppConfig, workspace: Workspace
+    ) -> tuple[SkillSource, ...]:
+        """Build the host-configured source list (the plugin seam is future)."""
+        settings = cfg.agent.skills
+        if not settings.enabled:
+            return ()
+        sources: list[SkillSource] = []
+        for directory in settings.system_dirs:
+            sources.append(DirectorySkillSource(
+                Path(directory).expanduser(), SOURCE_USER, PRIORITY_USER,
+                missing_ok=True,
+            ))
+        for directory in settings.extra_dirs:
+            sources.append(DirectorySkillSource(
+                Path(directory).expanduser(), SOURCE_EXTRA, PRIORITY_EXTRA,
+                missing_ok=False,
+            ))
+        if settings.allow_project:
+            sources.append(DirectorySkillSource(
+                workspace.root / settings.project_dir,
+                SOURCE_PROJECT, PRIORITY_PROJECT, missing_ok=True,
+            ))
+        return tuple(sources)
+
+    async def _build_skill_catalog(
+        self, cfg: AppConfig, workspace: Workspace
+    ) -> SkillCatalog:
+        settings = cfg.agent.skills
+        limits = SkillLimits(
+            max_result_bytes=min(
+                settings.max_result_bytes, DEFAULT_INLINE_LIMIT - 512
+            ),
+            max_skill_bytes=settings.max_skill_bytes,
+            max_resource_bytes=settings.max_resource_bytes,
+            max_resources_per_skill=settings.max_resources_per_skill,
+            max_index_bytes=settings.max_index_bytes,
+            max_skills=settings.max_skills,
+            max_catalog_bytes=settings.max_catalog_bytes,
+        )
+        return await load_catalog(
+            self._skill_sources(cfg, workspace),
+            limits=limits,
+            max_catalog_bytes=settings.max_catalog_bytes,
+            max_index_bytes=settings.max_index_bytes,
+            max_skills=settings.max_skills,
+        )
 
     @staticmethod
     def _budget(cfg: AppConfig) -> Budget:
@@ -343,10 +406,14 @@ class AgentHost:
 
     def _make_tools(self, workspace: Workspace) -> list:
         cfg = self._tool_factory_cfg
-        return [
+        specs = [
             *make_file_tools(workspace),
             make_bash_tool(workspace, timeout=cfg.agent.tools.bash_timeout),
         ]
+        catalog = self._skill_catalogs.get(workspace.session_id)
+        if catalog:
+            specs.extend(make_skill_tools(catalog))
+        return specs
 
     def _workspace_for(self, session_id: str) -> Workspace:
         workspace = self._workspace_by_session.get(session_id)
@@ -574,9 +641,34 @@ class AgentHost:
         try:
             workspace = Workspace(root=info.workspace, session_id=info.session_id)
             self._workspace_by_session[info.session_id] = workspace
+            catalog = await self._build_skill_catalog(cfg, workspace)
+            self._skill_catalogs[info.session_id] = catalog
             registry = await self.tool_registries.for_session(info.session_id)
 
-            builder, policy = self._context_settings(cfg)
+            builder, policy = self._context_settings(cfg, catalog.index_text)
+            warnings = (*warnings, *catalog.warnings)
+            for warning in catalog.warnings:
+                self._log({
+                    "kind": "skills_catalog",
+                    "level": "warning",
+                    "msg": warning,
+                    "ts": time.time(),
+                    "session_id": info.session_id,
+                })
+            current_digest = catalog.digest if catalog.entries else ""
+            metadata = dict(info.metadata or {})
+            stored_digest = metadata.get("skills_digest")
+            if stored_digest is not None and stored_digest != current_digest:
+                warnings = (*warnings,
+                            "skills changed since the session was created "
+                            f"({str(stored_digest)[:12] or 'none'} -> "
+                            f"{current_digest[:12] or 'none'}); the new snapshot is used")
+            if (metadata.get("skills_digest") != current_digest
+                    or metadata.get("skills_count") != len(catalog)):
+                metadata["skills_digest"] = current_digest
+                metadata["skills_count"] = len(catalog)
+                info = replace(info, metadata=metadata)
+                await self.storage.catalog.upsert_session(info)
             budget = self._budget(cfg)
             kwargs = {
                 "model": profile,
@@ -631,6 +723,7 @@ class AgentHost:
         except BaseException:
             self._release_lease(info.session_id)
             self._workspace_by_session.pop(info.session_id, None)
+            self._skill_catalogs.pop(info.session_id, None)
             self.workspaces.drop(info.session_id)
             self.tool_registries.drop(info.session_id)
             raise
@@ -647,6 +740,7 @@ class AgentHost:
         if handle is not None:
             handle.agent.close()
         self._workspace_by_session.pop(session_id, None)
+        self._skill_catalogs.pop(session_id, None)
         self.workspaces.drop(session_id)
         self.tool_registries.drop(session_id)
         self.approvals.cancel(session_id=session_id)
