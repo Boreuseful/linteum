@@ -37,6 +37,53 @@ fn picker_renders_columns_and_load_more() {
 }
 
 #[test]
+fn picker_selection_line_shows_the_title_and_id() {
+    let mut state = TuiState::default();
+    state.picker.sessions = vec![
+        SessionInfo {
+            session_id: "s1".into(),
+            title: Some("build the parser".into()),
+            ..Default::default()
+        },
+        SessionInfo {
+            session_id: "s2".into(),
+            ..Default::default()
+        },
+    ];
+
+    state.picker.selected = 0;
+    let rendered = joined(&picker_lines(&state, &Theme::dark()));
+    assert!(rendered.contains("selected: build the parser · s1"));
+
+    state.picker.selected = 1;
+    let rendered = joined(&picker_lines(&state, &Theme::dark()));
+    assert!(rendered.contains("selected: (untitled) · s2"));
+}
+
+#[test]
+fn picker_highlights_the_selected_row() {
+    let mut state = TuiState::default();
+    let theme = Theme::dark();
+    state.picker.sessions = vec![
+        SessionInfo {
+            session_id: "s1".into(),
+            title: Some("one".into()),
+            ..Default::default()
+        },
+        SessionInfo {
+            session_id: "s2".into(),
+            title: Some("two".into()),
+            ..Default::default()
+        },
+    ];
+    state.picker.selected = 1;
+
+    let lines = picker_lines(&state, &theme);
+    assert_ne!(lines[1].style.bg, theme.selection.bg);
+    assert_eq!(lines[2].style.bg, theme.selection.bg);
+}
+
+#[test]
 fn new_session_shows_workspace_title_profile() {
     let mut state = TuiState::default();
     state.new_session = NewSessionForm {
