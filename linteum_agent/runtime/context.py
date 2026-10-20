@@ -132,13 +132,28 @@ class ContextBuilder(Protocol):
 
 
 class PassthroughContextBuilder:
-    """Minimal builder: state messages in, provider messages + digest out."""
+    """Minimal builder: state messages in, provider messages + digest out.
+
+    ``system_blocks`` are host-owned, already-rendered system messages (for
+    example the skills L0 index).  They are prepended on every build and are
+    therefore part of the deterministic ``context.digest``; they never enter
+    ``AgentState.messages``.
+    """
+
+    def __init__(self, *, system_blocks: Sequence[str] = ()) -> None:
+        self.system_blocks = (
+            (system_blocks,) if isinstance(system_blocks, str)
+            else tuple(system_blocks)
+        )
 
     async def build(self, state, *, ev=None, tools: Sequence = ()) -> ContextPlan:
-        messages = tuple(self._normalise(m) for m in state.messages)
+        messages: list = [
+            {"role": "system", "content": block} for block in self.system_blocks
+        ]
+        messages.extend(self._normalise(m) for m in state.messages)
         tools_tuple = tuple(tools)
-        digest = self.digest(messages, tools_tuple)
-        return ContextPlan(messages, digest, tools_tuple)
+        digest = self.digest(tuple(messages), tools_tuple)
+        return ContextPlan(tuple(messages), digest, tools_tuple)
 
     @staticmethod
     def _normalise(message: dict) -> dict:
@@ -160,13 +175,25 @@ class CompactingContextBuilder(PassthroughContextBuilder):
     can request a summary without any I/O or provider access in the reducer.
     """
 
-    def __init__(self, *, system_prompt: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        *,
+        system_prompt: Optional[str] = None,
+        system_blocks: Sequence[str] = (),
+    ) -> None:
         self.system_prompt = system_prompt
+        self.system_blocks = (
+            (system_blocks,) if isinstance(system_blocks, str)
+            else tuple(system_blocks)
+        )
 
     async def build(self, state, *, ev=None, tools: Sequence = ()) -> ContextPlan:
         messages: list = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
+        messages.extend(
+            {"role": "system", "content": block} for block in self.system_blocks
+        )
         records = {
             int(record["from_index"]): record
             for record in state.compactions
