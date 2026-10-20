@@ -123,6 +123,32 @@ fn long_cjk_output_fits_the_transcript_pane() {
 }
 
 #[test]
+fn reasoning_renders_before_the_answer_text() {
+    let mut state = TuiState::default();
+    state.prefs.show_reasoning = true;
+    state.transcript.items.push(Item::Assistant(AssistantItem {
+        reasoning: "thinking first".into(),
+        text: "answer second".into(),
+        ..Default::default()
+    }));
+
+    let lines = transcript_lines(&state, 80, &Theme::dark());
+    let rendered: Vec<String> = lines.iter().map(text).collect();
+    let reasoning = rendered
+        .iter()
+        .position(|line| line.contains("thinking first"))
+        .expect("reasoning line");
+    let answer = rendered
+        .iter()
+        .position(|line| line.contains("answer second"))
+        .expect("answer line");
+    assert!(
+        reasoning < answer,
+        "reasoning must render above the answer text: {rendered:?}"
+    );
+}
+
+#[test]
 fn streaming_text_is_plain() {
     let mut state = TuiState::default();
     state.transcript.items.push(Item::Assistant(AssistantItem {

@@ -43,6 +43,12 @@ class ErrorCode(str, Enum):
     E_SANDBOX = "E_SANDBOX"
     E_BUDGET = "E_BUDGET"
     E_SAFETY = "E_SAFETY"
+    # -- skills (produced by the runtime/skills tool layer) --
+    E_SKILL_NOT_FOUND = "E_SKILL_NOT_FOUND"
+    E_SKILL_RESOURCE_NOT_FOUND = "E_SKILL_RESOURCE_NOT_FOUND"
+    E_SKILL_PATH = "E_SKILL_PATH"
+    E_SKILL_LIMIT = "E_SKILL_LIMIT"
+    E_SKILL_INVALID = "E_SKILL_INVALID"
 
 
 class BusError(Exception):

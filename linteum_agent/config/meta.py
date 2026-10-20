@@ -38,6 +38,7 @@ SECTION_TITLES: dict[str, str] = {
     "agent.profiles": "模型 Profiles",
     "agent.context": "上下文",
     "agent.tools": "工具与审批",
+    "agent.skills": "Skills",
     "agent.budget": "预算",
     "agent.session": "会话默认值",
     "gateway": "网关",
@@ -58,6 +59,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "agent.profiles",
     "agent.context",
     "agent.tools",
+    "agent.skills",
     "agent.budget",
     "agent.session",
     "gateway",
@@ -199,6 +201,54 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "title": "Bash 超时（秒）",
         "type": "float",
         "minimum": 0.1,
+    },
+    # -- agent.skills ---------------------------------------------------
+    "agent.skills.enabled": {
+        "title": "启用 Skills",
+        "type": "bool",
+        "description": "关闭后不扫描技能目录、不注册加载工具、不注入索引。",
+    },
+    "agent.skills.allow_project": {
+        "title": "允许项目技能",
+        "type": "bool",
+        "description": "允许 <workspace>/.linteum/skills；同名时项目级覆盖用户级。",
+    },
+    "agent.skills.system_dirs": {
+        "title": "用户技能目录",
+        "type": "list",
+        "item_type": "path",
+        "description": "默认 linteum_home()/skills，遵循 LINTEUM_HOME。",
+    },
+    "agent.skills.project_dir": {
+        "title": "项目技能目录",
+        "description": "相对 workspace 的路径，默认 .linteum/skills。",
+    },
+    "agent.skills.extra_dirs": {
+        "title": "额外技能目录",
+        "type": "list",
+        "item_type": "path",
+        "advanced": True,
+    },
+    "agent.skills.max_index_bytes": {
+        "title": "索引预算字节", "type": "int", "minimum": 512,
+    },
+    "agent.skills.max_result_bytes": {
+        "title": "单次工具结果字节", "type": "int", "minimum": 1, "maximum": 7679,
+    },
+    "agent.skills.max_skill_bytes": {
+        "title": "SKILL.md 上限字节", "type": "int", "minimum": 1,
+    },
+    "agent.skills.max_resource_bytes": {
+        "title": "单资源上限字节", "type": "int", "minimum": 1,
+    },
+    "agent.skills.max_resources_per_skill": {
+        "title": "单技能资源数", "type": "int", "minimum": 1,
+    },
+    "agent.skills.max_skills": {
+        "title": "技能数量上限", "type": "int", "minimum": 1,
+    },
+    "agent.skills.max_catalog_bytes": {
+        "title": "Catalog 内存预算字节", "type": "int", "minimum": 1,
     },
     # -- agent.budget ---------------------------------------------------
     "agent.budget.tokens": {"title": "Token 上限（0=不限）", "type": "int", "minimum": 0},

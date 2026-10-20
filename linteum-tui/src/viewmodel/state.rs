@@ -460,15 +460,25 @@ fn apply_snapshot(state: &mut TuiState, frame: &Frame, replay: bool) {
         {
             text.push_str(" … (truncated)");
         }
+        // ``kind`` tells which section the partial belongs to. Writing a
+        // reasoning partial into ``text`` merges the thinking into the answer.
+        let reasoning = streaming.get("kind").and_then(Value::as_str) == Some("reasoning");
         if state.transcript.active_stream.is_some()
             && let Some(item) = last_assistant_mut(state)
         {
-            item.text = text;
+            if reasoning {
+                item.reasoning = text;
+            } else {
+                item.text = text;
+            }
         } else {
-            state.transcript.items.push(Item::Assistant(AssistantItem {
-                text,
-                ..Default::default()
-            }));
+            let mut item = AssistantItem::default();
+            if reasoning {
+                item.reasoning = text;
+            } else {
+                item.text = text;
+            }
+            state.transcript.items.push(Item::Assistant(item));
             state.transcript.active_stream = Some("snapshot".to_owned());
         }
     }
