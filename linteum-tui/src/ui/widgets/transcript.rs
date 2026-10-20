@@ -25,13 +25,15 @@ pub fn transcript_lines(state: &TuiState, width: u16, theme: &Theme) -> Vec<Line
             }
             Item::Assistant(assistant) => {
                 lines.push(Line::from(Span::styled("Assistant", theme.accent)));
+                // Providers stream reasoning before the answer, so keep that
+                // chronology: the reasoning section sits above the text.
+                if state.prefs.show_reasoning && !assistant.reasoning.is_empty() {
+                    lines.extend(plain_lines(&assistant.reasoning, theme.reasoning));
+                }
                 if assistant.final_message.is_some() {
                     lines.extend(render_markdown(&assistant.text, width, theme));
                 } else {
                     lines.extend(plain_lines(&assistant.text, theme.text));
-                }
-                if state.prefs.show_reasoning && !assistant.reasoning.is_empty() {
-                    lines.extend(plain_lines(&assistant.reasoning, theme.reasoning));
                 }
                 lines.push(Line::from(""));
             }

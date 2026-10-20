@@ -49,6 +49,41 @@ fn snapshot_initializes_status() {
 }
 
 #[test]
+fn snapshot_mid_reasoning_keeps_partial_in_reasoning() {
+    let mut s = state();
+    apply_frame(
+        &mut s,
+        &frame(
+            "snapshot",
+            5,
+            serde_json::json!({
+                "last_seq": 5, "phase": "thinking", "round": 1, "busy": true,
+                "pending": [], "pending_approvals": [],
+                "streaming": {
+                    "request_id": "r-1", "kind": "reasoning",
+                    "partial_text": "thinking", "truncated": false
+                },
+                "usage": {}, "bound_model": null, "context_digest": null,
+                "last_error": null
+            }),
+        ),
+        false,
+    );
+
+    let assistant = s
+        .transcript
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })
+        .expect("assistant item");
+    assert_eq!(assistant.reasoning, "thinking");
+    assert_eq!(assistant.text, "");
+}
+
+#[test]
 fn live_user_message_creates_item() {
     let mut s = state();
     apply_frame(
