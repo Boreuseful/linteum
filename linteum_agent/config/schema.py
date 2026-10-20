@@ -21,6 +21,7 @@ import os
 import re
 from collections.abc import Mapping as ABCMapping
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional, get_args, get_origin, get_type_hints
 
 from ..runtime.llm.config import (
@@ -135,6 +136,31 @@ class ToolSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class SkillsSettings:
+    """Third-party skill discovery and progressive-disclosure limits.
+
+    ``system_dirs`` is the user-level root (resolved through ``linteum_home()``
+    so ``LINTEUM_HOME`` is honoured); ``project_dir`` is relative to the
+    session workspace; ``extra_dirs`` are host-configured trusted roots.
+    """
+
+    enabled: bool = True
+    allow_project: bool = True
+    system_dirs: tuple[str, ...] = field(
+        default_factory=lambda: (str(linteum_home() / "skills"),)
+    )
+    project_dir: str = ".linteum/skills"
+    extra_dirs: tuple[str, ...] = ()
+    max_index_bytes: int = 8 * 1024
+    max_result_bytes: int = 7 * 1024
+    max_skill_bytes: int = 256 * 1024
+    max_resource_bytes: int = 1024 * 1024
+    max_resources_per_skill: int = 64
+    max_skills: int = 256
+    max_catalog_bytes: int = 16 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
 class BudgetSettings:
     """Session budget limits (0 = unlimited)."""
 
@@ -174,6 +200,7 @@ class AgentSettings:
     fallbacks: tuple[LLMConfig, ...] = ()
     context: ContextSettings = field(default_factory=ContextSettings)
     tools: ToolSettings = field(default_factory=ToolSettings)
+    skills: SkillsSettings = field(default_factory=SkillsSettings)
     budget: BudgetSettings = field(default_factory=BudgetSettings)
     session: SessionSettings = field(default_factory=SessionSettings)
 
@@ -723,6 +750,32 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
     if config.agent.tools.bash_timeout <= 0:
         _issue(issues, "agent.tools.bash_timeout", "E_CONFIG_RANGE", "must be > 0")
 
+    # -- agent.skills ---------------------------------------------------
+    skills = config.agent.skills
+    for name in (
+        "max_index_bytes", "max_result_bytes", "max_skill_bytes",
+        "max_resource_bytes", "max_resources_per_skill", "max_skills",
+        "max_catalog_bytes",
+    ):
+        if getattr(skills, name) <= 0:
+            _issue(issues, f"agent.skills.{name}", "E_CONFIG_RANGE", "must be > 0")
+    if skills.max_index_bytes < 512:
+        _issue(issues, "agent.skills.max_index_bytes", "E_CONFIG_RANGE",
+               "must be >= 512 so the fixed index header can fit")
+    if skills.max_result_bytes + 512 >= 8192:
+        _issue(issues, "agent.skills.max_result_bytes", "E_CONFIG_RANGE",
+               "must be < 7680 (ToolRuntime externalises output above 8 KiB)")
+    project_dir = Path(skills.project_dir)
+    if (not skills.project_dir or project_dir.is_absolute()
+            or ".." in project_dir.parts):
+        _issue(issues, "agent.skills.project_dir", "E_CONFIG_RANGE",
+               "must be a relative path without '..'")
+    for name in ("system_dirs", "extra_dirs"):
+        for index, path in enumerate(getattr(skills, name)):
+            if not isinstance(path, str) or not path.strip():
+                _issue(issues, f"agent.skills.{name}.{index}", "E_CONFIG_RANGE",
+                       "must be a non-empty string")
+
     # -- agent.budget ---------------------------------------------------
     budget = config.agent.budget
     for name in ("tokens", "wall_ms", "rounds"):
@@ -821,6 +874,7 @@ __all__ = [
     "HistorySettings",
     "Issue",
     "SessionSettings",
+    "SkillsSettings",
     "StorageSettings",
     "ToolSettings",
     "UiSettings",
