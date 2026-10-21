@@ -7,7 +7,10 @@ use ratatui::widgets::{Paragraph, Widget};
 use crate::viewmodel::{Focus, Overlay, TuiState};
 
 use super::layout;
-use super::overlays::{render_activity, render_approval_modal, render_artifact, render_help};
+use super::overlays::{
+    render_activity, render_approval_modal, render_artifact, render_help, render_subagent_context,
+    render_subagents,
+};
 use super::palette;
 use super::screens::{render_fatal, render_new_session, render_picker};
 use super::strings;
@@ -102,6 +105,14 @@ pub fn render(frame: &mut Frame, state: &TuiState, theme: &Theme) {
             }
             Overlay::Artifact => {
                 render_artifact(area, frame.buffer_mut(), state, theme);
+                cursor = None;
+            }
+            Overlay::Subagents => {
+                render_subagents(area, frame.buffer_mut(), state, theme);
+                cursor = None;
+            }
+            Overlay::SubagentContext => {
+                render_subagent_context(area, frame.buffer_mut(), state, theme);
                 cursor = None;
             }
             Overlay::Picker => {

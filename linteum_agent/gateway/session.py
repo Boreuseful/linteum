@@ -37,6 +37,7 @@ from .errors import (
     E_INTERNAL,
     E_PROTOCOL,
     E_SESSION_LOCKED,
+    E_SESSION_NOT_FOUND,
     E_UNKNOWN_REF,
     GatewayError,
     LOCATION_SESSION,
@@ -133,6 +134,8 @@ class SessionGateway:
         gap_timeout: float = DEFAULT_GAP_TIMEOUT,
         ring_size: int = DEFAULT_RING_SIZE,
         read_only: bool = False,
+        follow: bool = False,
+        allow_approval: bool = False,
     ) -> None:
         if input_policy not in ("queue", "interrupt", "reject"):
             raise ValueError(f"unknown input policy: {input_policy!r}")
@@ -148,6 +151,13 @@ class SessionGateway:
         #: lease; it serves history/snapshot/artifacts while another process
         #: owns the session (§6.1).
         self.read_only = bool(read_only)
+        #: A read-only gateway normally just replays the WAL.  ``follow`` adds
+        #: the live ``on_any`` pump without creating an Agent or a lease — used
+        #: for a subagent child session the orchestrator owns (design §8.4).
+        self.follow = bool(follow)
+        #: ``approval.decide`` is the only write a read-only child gateway may
+        #: perform (human-in-the-loop with ``approval_policy=inherit``).
+        self.allow_approval = bool(allow_approval)
         self._started = False
 
         self._state = ProjectorState()
@@ -189,7 +199,7 @@ class SessionGateway:
         """
         if self._started or self._closed:
             return self
-        if not self.read_only:
+        if not self.read_only or self.follow:
             self._unsub = self.bus.on_any(self._on_event)
 
         try:
@@ -215,7 +225,7 @@ class SessionGateway:
             "session %s gateway started (read_only=%s, replayed=%d, next_seq=%d)",
             self.session_id, self.read_only, len(events), self._expected,
         )
-        if not self.read_only:
+        if not self.read_only or self.follow:
             self._pump_task = asyncio.create_task(self._pump())
         return self
 
@@ -451,8 +461,15 @@ class SessionGateway:
     async def dispatch(self, cmd: Command, connection: "ClientConnection") -> dict:
         """Route one validated command; returns the ``result`` payload."""
         if self.read_only and cmd.name in (
-            "user.message", "user.interrupt", "approval.decide", "agent.resume",
+            "user.message", "user.interrupt", "agent.resume",
         ):
+            raise GatewayError(
+                E_SESSION_LOCKED,
+                "session is owned by another process; attach to the owner to write",
+                location=LOCATION_SESSION,
+                retryable=True,
+            )
+        if self.read_only and cmd.name == "approval.decide" and not self.allow_approval:
             raise GatewayError(
                 E_SESSION_LOCKED,
                 "session is owned by another process; attach to the owner to write",
@@ -501,6 +518,8 @@ class SessionGateway:
                 return await self._history(cmd, connection)
             if cmd.name == "artifact.read":
                 return await self._artifact(cmd, connection)
+            if cmd.name == "session.context":
+                return await self._context()
             if cmd.name == "session.get":
                 return {"session_id": self.session_id, "snapshot": self.snapshot()}
         raise GatewayError(
@@ -702,6 +721,71 @@ class SessionGateway:
             "decision": decision,
             **_receipt(committed),
         }
+
+    # -- derived context -------------------------------------------------
+    async def _context(self) -> dict:
+        """Return the derived context plan without creating an Agent.
+
+        A live session uses the reducer's own builder, so host system blocks
+        (subagent role/environment/output contract, skill index) are included.
+        A closed session falls back to the persisted state, where those
+        host-only blocks are no longer available.
+        """
+        handle = self.host.session(self.session_id)
+        if handle is not None:
+            agent = handle.agent
+            # ``tools_schema`` is the provider-facing list: for a root it also
+            # contains the reserved spawn schema that never enters the registry.
+            tools = agent.tools_schema
+            plan = await agent.ctx_builder.build(agent.state, tools=tools)
+            blocks = getattr(agent.ctx_builder, "system_blocks", ()) or ()
+            prompt = getattr(agent.ctx_builder, "system_prompt", None)
+            return {"context": {
+                "session_id": self.session_id,
+                "kind": handle.kind,
+                "phase": agent.state.phase,
+                "round": agent.state.round,
+                "source": "live",
+                "system_blocks_included": bool(blocks or prompt),
+                "digest": plan.digest,
+                "estimated_tokens": plan.estimated_tokens(),
+                "messages": plan.to_provider_messages(),
+                "tools": [
+                    name for name in (
+                        self._schema_name(schema) for schema in tools
+                    ) if name
+                ],
+            }}
+
+        info = await self.host.get_session_info(self.session_id)
+        if info is None:
+            raise GatewayError(
+                E_SESSION_NOT_FOUND,
+                f"session not found: {self.session_id!r}",
+                location=LOCATION_SESSION,
+            )
+        plan = await self.host.service.context(self.session_id, tools=())
+        return {"context": {
+            "session_id": self.session_id,
+            "kind": info.kind,
+            "phase": info.phase,
+            "round": info.round,
+            "source": "replay",
+            "system_blocks_included": False,
+            "digest": plan.digest,
+            "estimated_tokens": plan.estimated_tokens(),
+            "messages": plan.to_provider_messages(),
+            "tools": [],
+        }}
+
+    @staticmethod
+    def _schema_name(schema) -> Optional[str]:
+        if not isinstance(schema, dict):
+            return None
+        function = schema.get("function")
+        target = function if isinstance(function, dict) else schema
+        name = target.get("name")
+        return name if isinstance(name, str) else None
 
     # -- subscribe / replay ----------------------------------------------
     async def _subscribe(self, cmd: Command, connection: "ClientConnection") -> dict:

@@ -451,6 +451,39 @@ fn overlay_effects(state: &mut TuiState, key: crossterm::event::KeyEvent) -> Opt
             KeyCode::Esc => reduce(state, Input::Action(UiAction::CloseOverlay)),
             _ => Vec::new(),
         }),
+        Overlay::Subagents => Some(match key.code {
+            KeyCode::Up => reduce(state, Input::Action(UiAction::SelectPreviousSubagent)),
+            KeyCode::Down => reduce(state, Input::Action(UiAction::SelectNextSubagent)),
+            KeyCode::Enter => reduce(state, Input::Action(UiAction::OpenSelectedSubagent)),
+            KeyCode::Esc => reduce(state, Input::Action(UiAction::CloseOverlay)),
+            _ => Vec::new(),
+        }),
+        Overlay::SubagentContext => Some(match key.code {
+            KeyCode::Esc => {
+                state.overlay = Some(Overlay::Subagents);
+                Vec::new()
+            }
+            KeyCode::Up => {
+                state.subagents.scroll = state.subagents.scroll.saturating_sub(1);
+                Vec::new()
+            }
+            KeyCode::Down => {
+                let limit = subagent_scroll_limit(state);
+                state.subagents.scroll = state.subagents.scroll.saturating_add(1).min(limit);
+                Vec::new()
+            }
+            KeyCode::PageUp => {
+                state.subagents.scroll = state.subagents.scroll.saturating_sub(10);
+                Vec::new()
+            }
+            KeyCode::PageDown => {
+                let limit = subagent_scroll_limit(state);
+                state.subagents.scroll = state.subagents.scroll.saturating_add(10).min(limit);
+                Vec::new()
+            }
+            KeyCode::Char('r') => reduce(state, Input::Action(UiAction::ReloadSubagentContext)),
+            _ => Vec::new(),
+        }),
         Overlay::Fatal => Some(match key.code {
             KeyCode::Char('q') => vec![Effect::Quit {
                 mode: state.quit_mode,
@@ -462,6 +495,12 @@ fn overlay_effects(state: &mut TuiState, key: crossterm::event::KeyEvent) -> Opt
             _ => Vec::new(),
         }),
     }
+}
+
+/// Stop Down/PageDown at the final screenful of the subagent context.
+fn subagent_scroll_limit(state: &TuiState) -> usize {
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    crate::ui::overlays::subagent_context_scroll_limit(state, width, height)
 }
 
 /// Terminals disagree on the byte Backspace sends. Most send DEL (`0x7F`),

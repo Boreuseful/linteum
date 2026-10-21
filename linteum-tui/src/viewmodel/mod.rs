@@ -12,6 +12,7 @@ pub mod sessions;
 pub mod sidebar;
 pub mod slash;
 pub mod state;
+pub mod subagents;
 pub mod transcript;
 
 pub use approvals::{ApprovalDecision, ApprovalState};
@@ -24,6 +25,9 @@ pub use slash::{SlashCommand, SlashState};
 pub use state::{
     ActivityEntry, ActivityLog, ComposerState, ConnectionEvent, ConnectionState, Focus, Limits,
     Overlay, PaletteState, Prefs, QuitMode, SessionView, ThemeChoice, TuiState, UsageView,
+};
+pub use subagents::{
+    ContextMessage, SubagentContextView, SubagentStatus, SubagentView, SubagentsState,
 };
 pub use transcript::{
     ApprovalCard, AssistantItem, CompactionCard, ErrorCard, GapMarker, Item, ScrollState, ToolCard,
@@ -124,6 +128,11 @@ pub enum UiAction {
     RefreshSessions,
     OpenArtifact,
     CloseArtifact,
+    OpenSubagents,
+    SelectNextSubagent,
+    SelectPreviousSubagent,
+    OpenSelectedSubagent,
+    ReloadSubagentContext,
 }
 
 /// A command the reducer wants the connection layer to send.
@@ -416,7 +425,51 @@ fn reduce_action(state: &mut TuiState, action: UiAction) -> Vec<Effect> {
             }
             Vec::new()
         }
+        UiAction::OpenSubagents => open_subagents(state),
+        UiAction::SelectNextSubagent => {
+            state.subagents.select_next();
+            Vec::new()
+        }
+        UiAction::SelectPreviousSubagent => {
+            state.subagents.select_previous();
+            Vec::new()
+        }
+        UiAction::OpenSelectedSubagent | UiAction::ReloadSubagentContext => {
+            open_selected_subagent(state)
+        }
     }
+}
+
+fn open_subagents(state: &mut TuiState) -> Vec<Effect> {
+    if state.subagents.is_empty() {
+        return vec![Effect::ShowToast(Toast {
+            text: "no subagents in this session".to_owned(),
+        })];
+    }
+    state.overlay = Some(Overlay::Subagents);
+    Vec::new()
+}
+
+fn open_selected_subagent(state: &mut TuiState) -> Vec<Effect> {
+    let Some(child_id) = state
+        .subagents
+        .selected_entry()
+        .and_then(|entry| entry.child_session_id.clone())
+    else {
+        return vec![Effect::ShowToast(Toast {
+            text: "subagent has no child session yet".to_owned(),
+        })];
+    };
+    state.subagents.loading = Some(child_id.clone());
+    state.subagents.detail = None;
+    state.subagents.error = None;
+    state.subagents.scroll = 0;
+    state.overlay = Some(Overlay::SubagentContext);
+    vec![Effect::SendCommand(CommandSpec {
+        name: "session.context".to_owned(),
+        args: Map::new(),
+        session_id: Some(child_id),
+    })]
 }
 
 fn open_selected_session(state: &mut TuiState) -> Vec<Effect> {
@@ -447,6 +500,7 @@ fn open_selected_session(state: &mut TuiState) -> Vec<Effect> {
     state.cursor.reset();
     state.transcript = Default::default();
     state.usage = Default::default();
+    state.subagents = Default::default();
     state.queue = Default::default();
     state.approvals = Default::default();
     state.slash = Default::default();
@@ -544,6 +598,9 @@ fn unsubscribe_effect(session_id: &str) -> Effect {
 fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Effect> {
     let mut effects = Vec::new();
     if result.ok {
+        if let Some(context) = result.result.get("context") {
+            state.subagents.apply_context_result(context);
+        }
         if result.result.get("subscribed").and_then(Value::as_bool) == Some(true) {
             state.connection = ConnectionState::Live;
         }
@@ -576,6 +633,9 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
         }
     }
     if let Some(error) = &result.error {
+        if state.subagents.loading.take().is_some() {
+            state.subagents.error = Some(format!("{}: {}", error.code, error.message));
+        }
         if error.code == "E_SESSION_LOCKED" {
             state.connection = ConnectionState::ReadOnly;
         }
@@ -721,7 +781,10 @@ fn toggle_sidebar(state: &mut TuiState) -> Vec<Effect> {
         state.focus = Focus::Composer;
         Vec::new()
     } else {
-        open_sidebar_panel(state, state.sidebar.panel)
+        let layout = state.sidebar.layout;
+        let effects = open_sidebar_panel(state, state.sidebar.panel);
+        state.sidebar.layout = layout;
+        effects
     }
 }
 
@@ -736,6 +799,9 @@ fn toggle_focus(state: &mut TuiState) -> Vec<Effect> {
 
 fn open_sidebar_panel(state: &mut TuiState, panel: SidebarPanel) -> Vec<Effect> {
     state.sidebar.panel = panel;
+    // Selecting a panel means "show that panel", not "keep the last split".
+    // `/split` opts back into the multi-panel layout explicitly.
+    state.sidebar.layout = SidebarLayout::Merged;
     state.focus = Focus::Composer;
     let root = sidebar_root(state);
     state
@@ -756,13 +822,19 @@ fn set_sidebar_layout(state: &mut TuiState, layout: SidebarLayout) -> Vec<Effect
             .into_iter()
             .collect()
     } else {
-        open_sidebar_panel(state, state.sidebar.panel)
+        let effects = open_sidebar_panel(state, state.sidebar.panel);
+        // Opening a panel forces Merged; an explicit `/split` must win.
+        state.sidebar.layout = layout;
+        effects
     }
 }
 
 fn refresh_sidebar(state: &mut TuiState) -> Vec<Effect> {
     if !state.sidebar.visible {
-        return open_sidebar_panel(state, state.sidebar.panel);
+        let layout = state.sidebar.layout;
+        let effects = open_sidebar_panel(state, state.sidebar.panel);
+        state.sidebar.layout = layout;
+        return effects;
     }
     let expanded: Vec<String> = state.sidebar.expanded.iter().cloned().collect();
     state.sidebar.loaded.clear();
@@ -853,6 +925,7 @@ fn exit_session(state: &mut TuiState) -> Vec<Effect> {
     state.cursor.reset();
     state.transcript = Default::default();
     state.usage = Default::default();
+    state.subagents = Default::default();
     state.queue = Default::default();
     state.approvals = Default::default();
     state.pending_tools.clear();

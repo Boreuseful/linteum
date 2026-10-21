@@ -89,6 +89,14 @@ class AgentState:
     phase: str = phases.IDLE
     messages: list = field(default_factory=list)      # final results only (I4)
     pending: set = field(default_factory=set)          # unfinished call_ids
+    #: ``call_id`` subset of ``pending`` routed to ``subagent.*`` instead of
+    #: ``tool.call.*`` (subagent design §6.3).  It is only a routing marker; the
+    #: convergence barrier still uses ``pending``.
+    pending_subagents: set = field(default_factory=set)
+    #: Terminal ``call_id`` values whose child usage was already added to the
+    #: parent budget.  Monotone: guarantees at-most-once accounting on replay or
+    #: duplicate terminals (subagent design §6.4 / S13).
+    subagent_usage_accounted: set = field(default_factory=set)
     cancelled: set = field(default_factory=set)        # call_ids voided by an interrupt (§16.3)
     interrupt_pending: bool = False                    # awaiting an interrupted LLM completion to tag
     plan: list = field(default_factory=list)
@@ -124,6 +132,16 @@ class AgentState:
         problems: list = []
         if self.phase == phases.IDLE and self.pending:  # I2
             problems.append(f"I2: idle with non-empty pending {sorted(self.pending)}")
+        if self.phase == phases.IDLE and self.pending_subagents:  # S3
+            problems.append(
+                "I2: idle with non-empty pending_subagents "
+                f"{sorted(self.pending_subagents)}"
+            )
+        if not self.pending_subagents <= self.pending:  # S3
+            problems.append(
+                "S3: pending_subagents is not a subset of pending "
+                f"{sorted(self.pending_subagents - self.pending)}"
+            )
         for index, msg in enumerate(self.messages):
             size = len(json.dumps(msg, ensure_ascii=False).encode("utf-8"))
             if size > INLINE_LIMIT:  # I15
@@ -174,6 +192,8 @@ class AgentState:
             "phase": self.phase,
             "messages": self.messages,
             "pending": sorted(self.pending),
+            "pending_subagents": sorted(self.pending_subagents),
+            "subagent_usage_accounted": sorted(self.subagent_usage_accounted),
             "cancelled": sorted(self.cancelled),
             "interrupt_pending": self.interrupt_pending,
             "plan": self.plan,
@@ -203,6 +223,8 @@ class AgentState:
             phase=data.get("phase", phases.IDLE),
             messages=list(data.get("messages", [])),
             pending=set(data.get("pending", [])),
+            pending_subagents=set(data.get("pending_subagents", [])),
+            subagent_usage_accounted=set(data.get("subagent_usage_accounted", [])),
             cancelled=set(data.get("cancelled", [])),
             interrupt_pending=bool(data.get("interrupt_pending", False)),
             plan=list(data.get("plan", [])),

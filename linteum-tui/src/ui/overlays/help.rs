@@ -11,7 +11,8 @@ pub fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
     vec![
         Line::from("Keys"),
         Line::from("Enter send · Ctrl+J newline · Ctrl+C interrupt"),
-        Line::from("F1 help · F2 sessions · F3 activity · F4 approvals · F5 reconnect"),
+        Line::from("F1 help · F2 sessions · F3 activity · F4 approvals"),
+        Line::from("F5 reconnect · F6 subagents"),
         Line::from("Ctrl+N new session · Ctrl+P palette · Ctrl+R reasoning · Ctrl+G resume"),
         Line::from("Ctrl+Q quit · Esc close overlay"),
         Line::from(""),

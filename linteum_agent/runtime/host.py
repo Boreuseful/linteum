@@ -32,7 +32,7 @@ import json
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from ..bus.bus import InMemoryEventBus
 from ..bus.event import uuid7
@@ -162,6 +162,11 @@ class SessionHandle:
     profile: str
     config_digest: str
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    #: ``root`` (user session) or ``subagent`` (orchestrator child).
+    kind: str = "root"
+    #: False for children: the parent session's lease covers the whole tree.
+    lease_owned: bool = True
+    parent_session_id: Optional[str] = None
 
 
 class AgentHost:
@@ -221,6 +226,11 @@ class AgentHost:
         self.approvals = approvals if approvals is not None else ApprovalGate(self.bus)
         self._workspace_by_session: dict[str, Workspace] = {}
         self._skill_catalogs: dict[str, SkillCatalog] = {}
+        #: Subagent sessions may override the root approval policy (§7.3 / S11).
+        self._approval_policies: dict[str, str] = {}
+        #: Lazily built in :meth:`_ensure_orchestrator` (Task 8); ``None`` keeps
+        #: hosts that never enable subagents free of the extra subscriptions.
+        self.orchestrator = None
         self.workspaces = WorkspaceRegistry(self._workspace_for)
         self._tool_factory_cfg = cfg
         self.tool_registries = WorkspaceToolRegistries(
@@ -235,6 +245,7 @@ class AgentHost:
             registry_for=self.tool_registries.for_session,
             artifacts=self.storage.artifacts,
             approval_policy=cfg.agent.tools.approval,
+            approval_policy_for=self.approval_policy_for,
         )
         self.compactor = context_compactor or ContextCompactor(
             self.bus, artifacts=self.storage.artifacts
@@ -333,8 +344,12 @@ class AgentHost:
         self._llm_signature = signature
 
     @staticmethod
-    def _context_settings(cfg: AppConfig, skill_index: str = ""):
-        blocks = (skill_index,) if skill_index else ()
+    def _context_settings(
+        cfg: AppConfig,
+        skill_index: str = "",
+        extra_blocks: Sequence[str] = (),
+    ):
+        blocks = (*((skill_index,) if skill_index else ()), *tuple(extra_blocks))
         ctx = cfg.agent.context
         if ctx.policy == "compacting" and ctx.max_tokens > 0:
             return CompactingContextBuilder(system_blocks=blocks), ContextPolicy(
@@ -441,7 +456,9 @@ class AgentHost:
         interval = float(getattr(self.lease_manager, "heartbeat_interval", 10.0))
         while True:
             await asyncio.sleep(max(1.0, interval))
-            for session_id in list(self._handles):
+            for session_id, handle in list(self._handles.items()):
+                if not handle.lease_owned:
+                    continue  # a child is covered by the parent's lease
                 try:
                     lease = await self.lease_manager.heartbeat(session_id)
                 except asyncio.CancelledError:
@@ -477,6 +494,8 @@ class AgentHost:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
+        if self.orchestrator is not None:
+            await self.orchestrator.close()
         for session_id in list(self._handles):
             self.close_session(session_id)
         self.bus.stop()
@@ -522,9 +541,21 @@ class AgentHost:
         async with self._registry_lock:
             handle = self._handles.get(session_id)
             if handle is not None:
+                if handle.kind == "subagent":
+                    raise ConfigError(
+                        f"session {session_id!r} is a subagent session; "
+                        "it is driven by its parent's orchestrator",
+                        key="session_id", code="E_SESSION_SUBAGENT",
+                    )
                 return handle
 
             info = await self.service.get_session(session_id)
+            if info is not None and info.kind == "subagent":
+                raise ConfigError(
+                    f"session {session_id!r} is a subagent session; "
+                    "it is driven by its parent's orchestrator",
+                    key="session_id", code="E_SESSION_SUBAGENT",
+                )
             if info is None:
                 chosen = profile or options.profile or cfg.agent.default_profile
                 try:
@@ -589,10 +620,22 @@ class AgentHost:
         """Open an existing session from its persisted workspace."""
         handle = self._handles.get(session_id)
         if handle is not None:
+            if handle.kind == "subagent":
+                raise ConfigError(
+                    f"session {session_id!r} is a subagent session; "
+                    "it is driven by its parent's orchestrator",
+                    key="session_id", code="E_SESSION_SUBAGENT",
+                )
             return handle
         info = await self.service.get_session(session_id)
         if info is None:
             raise SessionNotFound(session_id)
+        if info.kind == "subagent":
+            raise ConfigError(
+                f"session {session_id!r} is a subagent session; "
+                "it is driven by its parent's orchestrator",
+                key="session_id", code="E_SESSION_SUBAGENT",
+            )
         if not info.workspace:
             raise ConfigError(
                 f"session {session_id!r} has no workspace",
@@ -636,9 +679,18 @@ class AgentHost:
         digest: str,
         warnings: tuple[str, ...],
     ) -> SessionHandle:
+        if info.kind == "subagent":
+            raise ConfigError(
+                f"session {info.session_id!r} is a subagent session",
+                key="session_id", code="E_SESSION_SUBAGENT",
+            )
         # ★ One live reducer per session, process-wide and machine-wide (§6.1).
         await self._acquire_lease(info.session_id)
         try:
+            # Only the lease owner may mutate the child catalogue; doing this
+            # before the lease could mark another process's live children as
+            # interrupted.
+            await self.reconcile_children(info.session_id)
             workspace = Workspace(root=info.workspace, session_id=info.session_id)
             self._workspace_by_session[info.session_id] = workspace
             catalog = await self._build_skill_catalog(cfg, workspace)
@@ -670,12 +722,31 @@ class AgentHost:
                 info = replace(info, metadata=metadata)
                 await self.storage.catalog.upsert_session(info)
             budget = self._budget(cfg)
+            subagent_tools: frozenset[str] = frozenset()
+            schemas = registry.schemas
+            subagent_settings = cfg.agent.subagents
+            if subagent_settings.enabled:
+                from .subagents.catalog import SubagentCatalog
+                if registry.has(subagent_settings.tool_name):
+                    raise ConfigError(
+                        f"tool {subagent_settings.tool_name!r} is reserved for "
+                        "subagent delegation and cannot be registered",
+                        key="agent.subagents.tool_name", code="E_CONFIG_TOOL_RESERVED",
+                    )
+                registry.reserve(subagent_settings.tool_name)
+                subagent_catalog = SubagentCatalog(subagent_settings)
+                subagent_tools = frozenset({subagent_settings.tool_name})
+
+                def schemas(reg=registry, cat=subagent_catalog):
+                    return [*reg.schemas(), cat.schema()]
+
             kwargs = {
                 "model": profile,
-                "schemas": registry.schemas,
+                "schemas": schemas,
                 "budget": budget,
                 "ctx_builder": builder,
                 "context_policy": policy,
+                "subagent_tools": subagent_tools,
             }
 
             # Restore approvals before closing/reducing the half-round: the calls
@@ -719,6 +790,8 @@ class AgentHost:
                 warnings=warnings,
             )
             self._handles[info.session_id] = handle
+            if subagent_settings.enabled:
+                self._ensure_orchestrator()
             return handle
         except BaseException:
             self._release_lease(info.session_id)
@@ -735,27 +808,308 @@ class AgentHost:
         return {session_id: handle.agent for session_id, handle in self._handles.items()}
 
     def close_session(self, session_id: str) -> None:
-        """Detach a session's reducer; durable history stays in the WAL."""
+        """Detach a session's reducer; durable history stays in the WAL.
+
+        Closing a root cancels its orchestrator work and closes every child
+        handle first; children never release a lease of their own (§8.5).
+        """
+        if self.orchestrator is not None:
+            self.orchestrator.cancel_parent(session_id)
         handle = self._handles.pop(session_id, None)
         if handle is not None:
             handle.agent.close()
         self._workspace_by_session.pop(session_id, None)
         self._skill_catalogs.pop(session_id, None)
-        self.workspaces.drop(session_id)
+        self.workspaces.drop(session_id)   # a reused id must re-resolve its root
         self.tool_registries.drop(session_id)
+        self._approval_policies.pop(session_id, None)
         self.approvals.cancel(session_id=session_id)
-        self._release_lease(session_id)  # another process may now take over
+        if handle is None or handle.lease_owned:
+            self._release_lease(session_id)  # another process may now take over
+        if handle is not None and handle.kind == "root":
+            children = [
+                child_id for child_id, child in list(self._handles.items())
+                if child.parent_session_id == session_id
+            ]
+            for child_id in children:
+                self.close_session(child_id)
 
     async def delete_session(self, session_id: str) -> None:
-        """Close and erase a session's catalogue/checkpoint rows."""
+        """Close and erase a session and its child catalogue/checkpoint rows."""
         self.close_session(session_id)
+        for child in await self.service.list_children(session_id):
+            await self.delete_session(child.session_id)
         await self.service.delete_session(session_id)
 
+    async def reconcile_children(self, parent_session_id: str) -> None:
+        """Mark orphaned children interrupted without calling a provider (§7.8).
+
+        Recovery must never re-run a delegated task or synthesise a terminal:
+        the parent's half-round closer already pairs the calls as interrupted.
+        """
+        for child in await self.service.list_children(parent_session_id):
+            status = (child.metadata or {}).get("subagent_status")
+            if status not in ("spawned", "running"):
+                continue
+            metadata = {**child.metadata, "subagent_status": "interrupted"}
+            await self.storage.catalog.upsert_session(
+                replace(child, metadata=metadata)
+            )
+            self.close_session(child.session_id)
+
+    # -- subagent assembly --------------------------------------------------
+    def _ensure_orchestrator(self):
+        """Build the effect layer once, without a host<->subagents import cycle.
+
+        A config reload must affect new sessions (§9.3): refresh the settings
+        and catalog in place.  Running children keep the ``SubagentPolicy``
+        they captured at spawn time.
+        """
+        settings = self._current_config().agent.subagents
+        if self.orchestrator is None:
+            from .subagents.orchestrator import SubagentOrchestrator
+            self.orchestrator = SubagentOrchestrator(
+                self.bus, self, settings, artifacts=self.storage.artifacts,
+            )
+        elif self.orchestrator.settings != settings:
+            from .subagents.catalog import SubagentCatalog
+            self.orchestrator.settings = settings
+            self.orchestrator.catalog = SubagentCatalog(settings)
+        return self.orchestrator
+
+    def approval_policy_for(self, session_id: str) -> Optional[str]:
+        """Per-session approval policy consumed by :class:`ToolRuntime`.
+
+        ``None`` means "use the host-wide policy"; a child's ``inherit`` is
+        resolved against the current root policy on every call.
+        """
+        policy = self._approval_policies.get(session_id)
+        if policy == "inherit":
+            return self._current_config().agent.tools.approval
+        if policy in ("allow", "deny"):
+            return policy
+        return None
+
+    def subagent_tool_specs(self, parent_session_id: str) -> dict[str, str]:
+        """``name -> side_effect`` for the parent's live, non-spawn tools."""
+        handle = self._handles.get(parent_session_id)
+        registry = (
+            handle.registry if handle is not None
+            else self.tool_registries.built(parent_session_id)
+        )
+        if registry is None:
+            return {}
+        reserved = self._current_config().agent.subagents.tool_name
+        return {
+            name: registry.spec(name).side_effect
+            for name in registry.names()
+            if name != reserved
+        }
+
+    async def open_subagent_session(
+        self,
+        *,
+        parent_session_id: str,
+        call_id: str,
+        task_title: str,
+        trace_id: str,
+        workspace_root: str,
+        tools: Sequence[str],
+        model_profile: str,
+        system_blocks: Sequence[str],
+        budget: Budget,
+        read_only: bool,
+        approval_policy: str,
+        metadata: Mapping[str, Any],
+    ) -> SessionHandle:
+        """Assemble one isolated child session (design §7.4).
+
+        The child shares the parent workspace root (optionally read-only), gets
+        its own ``session_id`` / state / WAL / checkpoint / registry, and does
+        **not** acquire a lease or receive the reserved spawn schema.
+        """
+        from .subagents.errors import (
+            E_SUBAGENT_CANCELLED,
+            E_SUBAGENT_DEPTH,
+            E_SUBAGENT_SPAWN,
+            SubagentError,
+        )
+
+        parent = self._handles.get(parent_session_id)
+        if parent is None:
+            raise SubagentError(
+                E_SUBAGENT_SPAWN, "parent session is not open",
+                context={"parent_session_id": parent_session_id,
+                         "call_id": call_id},
+            )
+        if parent.kind != "root":
+            raise SubagentError(
+                E_SUBAGENT_DEPTH, "subagents cannot spawn subagents",
+                context={"parent_session_id": parent_session_id,
+                         "call_id": call_id},
+            )
+        if self._closed:
+            raise SubagentError(
+                E_SUBAGENT_SPAWN, "host is closed",
+                context={"parent_session_id": parent_session_id,
+                         "call_id": call_id},
+            )
+
+        cfg = self._current_config()
+        self._ensure_llm_routing(cfg)
+        self._tool_factory_cfg = cfg
+        spawn_name = cfg.agent.subagents.tool_name
+        child_id = uuid7()
+        workspace = Workspace(
+            root=workspace_root, session_id=child_id, read_only=read_only,
+        )
+        parent_catalog = self._skill_catalogs.get(parent_session_id)
+        inherit_skills = cfg.agent.subagents.inherit_skills
+        skill_index = (
+            parent_catalog.index_text
+            if inherit_skills and parent_catalog is not None else ""
+        )
+
+        agent = None
+        try:
+            self._workspace_by_session[child_id] = workspace
+            if inherit_skills and parent_catalog is not None:
+                self._skill_catalogs[child_id] = parent_catalog
+
+            available = {spec.name: spec for spec in self._make_tools(workspace)}
+            selected = []
+            for name in tools:
+                if name == spawn_name:
+                    raise SubagentError(
+                        E_SUBAGENT_DEPTH,
+                        f"{name!r} would exceed "
+                        f"max_depth={cfg.agent.subagents.max_depth}",
+                        context={"parent_session_id": parent_session_id,
+                                 "call_id": call_id},
+                    )
+                spec = available.get(name)
+                if spec is None:
+                    raise SubagentError(
+                        E_SUBAGENT_SPAWN,
+                        f"tool {name!r} is not available for a child session",
+                        context={"parent_session_id": parent_session_id,
+                                 "call_id": call_id,
+                                 "requested_tools": list(tools),
+                                 "available_tools": sorted(available)},
+                    )
+                selected.append(spec)
+
+            registry = ToolRegistry()
+            await registry.register_many(selected)
+            self.tool_registries.install(child_id, registry)
+
+            builder, policy = self._context_settings(
+                cfg, skill_index=skill_index, extra_blocks=system_blocks,
+            )
+            child_budget = Budget(
+                tokens=budget.tokens,
+                usd=budget.usd,
+                wall_ms=budget.wall_ms,
+                rounds=budget.rounds,
+                started_ms=time.time(),
+            )
+            agent = Agent(
+                self.bus,
+                session_id=child_id,
+                model=model_profile,
+                schemas=registry.schemas,
+                checkpointer=self.storage.checkpointer,
+                budget=child_budget,
+                ctx_builder=builder,
+                context_policy=policy,
+                subagent_tools=frozenset(),   # max_depth=1 at the capability layer
+                auto_subscribe=False,
+            )
+            agent.state.trace_id = trace_id
+            agent.state.config_digest = profile_digest(
+                model_profile, cfg.agent.profile(model_profile)
+            )
+            agent.subscribe()
+
+            # The parent may have closed while we awaited registry/storage
+            # work; never publish a child for a session this host no longer
+            # owns.
+            if self._closed or parent_session_id not in self._handles:
+                raise SubagentError(
+                    E_SUBAGENT_CANCELLED,
+                    "parent session closed while spawning the child",
+                    context={"parent_session_id": parent_session_id,
+                             "call_id": call_id},
+                )
+
+            now = time.time()
+            row_metadata = {
+                "parent_session_id": parent_session_id,
+                "call_id": call_id,
+                "subagent_type": "spawn_subagent",
+                "subagent_status": "spawned",
+                "model_profile": model_profile,
+                "tools": list(tools),
+                "read_only": bool(read_only),
+                **dict(metadata),
+            }
+            info = SessionInfo(
+                session_id=child_id,
+                created_at=now,
+                updated_at=now,
+                title=(task_title or "subagent")[:120],
+                workspace=str(workspace_root),
+                metadata=row_metadata,
+                parent_session_id=parent_session_id,
+                kind="subagent",
+            )
+            await self.storage.catalog.upsert_session(info)
+        except BaseException:
+            if agent is not None:
+                agent.close()
+            self._workspace_by_session.pop(child_id, None)
+            self._skill_catalogs.pop(child_id, None)
+            self.tool_registries.drop(child_id)
+            raise
+
+        self._approval_policies[child_id] = approval_policy
+        handle = SessionHandle(
+            session_id=child_id,
+            agent=agent,
+            workspace=workspace,
+            registry=registry,
+            profile=model_profile,
+            config_digest=agent.state.config_digest,
+            parent_session_id=parent_session_id,
+            kind="subagent",
+            lease_owned=False,
+        )
+        self._handles[child_id] = handle
+        return handle
+
     # -- reads --------------------------------------------------------------
-    async def list_sessions(self, *, limit: int = 50, offset: int = 0,
-                            workspace: Optional[str] = None) -> list[SessionInfo]:
+    async def list_sessions(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        workspace: Optional[str] = None,
+        include_subagents: bool = False,
+        parent_session_id: Optional[str] = None,
+    ) -> list[SessionInfo]:
         return await self.service.list_sessions(
-            limit=limit, offset=offset, workspace=workspace
+            limit=limit,
+            offset=offset,
+            workspace=workspace,
+            include_subagents=include_subagents,
+            parent_session_id=parent_session_id,
+        )
+
+    async def list_children(
+        self, parent_session_id: str, *, limit: int = 50, offset: int = 0,
+    ) -> list[SessionInfo]:
+        return await self.service.list_children(
+            parent_session_id, limit=limit, offset=offset,
         )
 
     async def get_session_info(self, session_id: str) -> Optional[SessionInfo]:

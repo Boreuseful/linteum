@@ -25,6 +25,9 @@ pub fn key_to_action(key: KeyEvent) -> Option<UiAction> {
         (KeyCode::F(5), _) | (KeyCode::Char('5'), KeyModifiers::ALT) => {
             Some(UiAction::RetryConnection)
         }
+        (KeyCode::F(6), _) | (KeyCode::Char('6'), KeyModifiers::ALT) => {
+            Some(UiAction::OpenSubagents)
+        }
         (KeyCode::Esc, _) => Some(UiAction::CloseOverlay),
         (KeyCode::Tab, _) | (KeyCode::BackTab, _) => Some(UiAction::ToggleFocus),
         (KeyCode::Left, _) => Some(UiAction::CursorLeft),

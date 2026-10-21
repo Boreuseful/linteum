@@ -1,6 +1,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use linteum_tui::protocol::Frame;
 use linteum_tui::ui::{App, Theme, layout, render};
 use linteum_tui::viewmodel::{
     AssistantItem, Effect, Focus, Input, Item, SidebarLayout, SidebarPanel, TuiState, UiAction,
@@ -9,6 +10,21 @@ use linteum_tui::viewmodel::{
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
+use serde_json::json;
+
+fn frame(seq: u64, name: &str, payload: serde_json::Value) -> Frame {
+    Frame {
+        v: 1,
+        id: format!("f-{seq}"),
+        frame: name.into(),
+        payload,
+        session_id: Some("parent".into()),
+        seq: Some(seq),
+        ephemeral: false,
+        replay: false,
+        ordinal: 0,
+    }
+}
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -60,6 +76,78 @@ fn rendered(state: &TuiState) -> String {
         .iter()
         .map(|cell| cell.symbol())
         .collect()
+}
+
+#[test]
+fn subagents_panel_shows_live_status() {
+    let mut state = TuiState::default();
+    state.workspace_root = Some("/work/demo".into());
+    reduce(
+        &mut state,
+        Input::Frame(frame(
+            1,
+            "subagent.requested",
+            json!({"call_id": "c1", "task": "review the module"}),
+        )),
+    );
+    reduce(
+        &mut state,
+        Input::Frame(frame(
+            2,
+            "subagent.progress",
+            json!({"call_id": "c1", "phase": "acting", "round": 2, "last_tool": "read_file"}),
+        )),
+    );
+    let _ = reduce(
+        &mut state,
+        Input::Action(UiAction::SidebarShowPanel(SidebarPanel::Subagents)),
+    );
+    assert!(state.sidebar.visible);
+    assert_eq!(state.sidebar.panel, SidebarPanel::Subagents);
+    let rendered = rendered(&state);
+    assert!(rendered.contains("Subagents"));
+    assert!(rendered.contains("review"));
+    assert!(rendered.contains("running"));
+    assert!(rendered.contains("acting"));
+    assert!(rendered.contains("read_file"));
+}
+
+#[test]
+fn split_info_panel_shows_subagents_when_present() {
+    let mut state = with_files();
+    reduce(
+        &mut state,
+        Input::Frame(frame(
+            10,
+            "subagent.requested",
+            json!({"call_id": "c1", "task": "review the module"}),
+        )),
+    );
+    reduce(
+        &mut state,
+        Input::Frame(frame(
+            11,
+            "subagent.progress",
+            json!({"call_id": "c1", "phase": "acting", "round": 2, "last_tool": "read_file"}),
+        )),
+    );
+    reduce(&mut state, Input::Action(UiAction::SidebarSplit));
+    let rendered = rendered(&state);
+    assert!(rendered.contains("Subagents"));
+    assert!(rendered.contains("running"));
+    assert!(rendered.contains("review"));
+}
+
+#[test]
+fn subagents_slash_command_selects_the_panel() {
+    let command = slash::COMMANDS
+        .iter()
+        .find(|command| command.id == "subagents")
+        .expect("subagents slash command");
+    assert!(matches!(
+        command.action,
+        UiAction::SidebarShowPanel(SidebarPanel::Subagents)
+    ));
 }
 
 #[test]
@@ -126,6 +214,48 @@ fn collapse_on_a_file_toasts() {
         effects.as_slice(),
         [Effect::ShowToast(toast)] if toast.text.contains("not a folder")
     ));
+}
+
+#[test]
+fn panel_command_without_split_renders_one_panel() {
+    for panel in [SidebarPanel::Files, SidebarPanel::Subagents] {
+        let mut state = TuiState::default();
+        state.workspace_root = Some("/work".into());
+        reduce(&mut state, Input::Action(UiAction::SidebarShowPanel(panel)));
+        assert_eq!(state.sidebar.layout, SidebarLayout::Merged);
+        let rendered = rendered(&state);
+        assert!(rendered.contains(panel.title()));
+        assert!(!rendered.contains("Preview"));
+        assert!(!rendered.contains("No content yet"));
+    }
+}
+
+#[test]
+fn panel_commands_leave_split_mode() {
+    let mut state = with_files();
+    reduce(&mut state, Input::Action(UiAction::SidebarSplit));
+    assert_eq!(state.sidebar.layout, SidebarLayout::Split);
+
+    reduce(
+        &mut state,
+        Input::Action(UiAction::SidebarShowPanel(SidebarPanel::Subagents)),
+    );
+    assert_eq!(state.sidebar.layout, SidebarLayout::Merged);
+    assert_eq!(state.sidebar.panel, SidebarPanel::Subagents);
+    let rendered = rendered(&state);
+    assert!(rendered.contains("Subagents"));
+    assert!(!rendered.contains("Preview"));
+}
+
+#[test]
+fn toggle_sidebar_preserves_an_explicit_split() {
+    let mut state = with_files();
+    reduce(&mut state, Input::Action(UiAction::SidebarSplit));
+    reduce(&mut state, Input::Action(UiAction::ToggleSidebar));
+    assert!(!state.sidebar.visible);
+    reduce(&mut state, Input::Action(UiAction::ToggleSidebar));
+    assert!(state.sidebar.visible);
+    assert_eq!(state.sidebar.layout, SidebarLayout::Split);
 }
 
 #[test]

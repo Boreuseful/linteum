@@ -457,6 +457,14 @@ class WorkspaceToolRegistries:
                 self._registries[session_id] = registry
         return registry
 
+    def install(self, session_id: str, registry: ToolRegistry) -> None:
+        """Install an already-built registry (e.g. a filtered subagent table).
+
+        Without this, ``for_session`` would rebuild the full workspace tool set
+        through the factory and silently undo the filter (design §7.4).
+        """
+        self._registries[session_id] = registry
+
     def built(self, session_id: str) -> Optional[ToolRegistry]:
         """Sync accessor for a registry already built via :meth:`for_session`."""
         return self._registries.get(session_id)

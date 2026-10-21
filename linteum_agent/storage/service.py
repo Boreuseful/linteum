@@ -51,6 +51,8 @@ class SessionService:
         title: Optional[str] = None,
         workspace: Optional[str] = None,
         metadata: Optional[dict] = None,
+        parent_session_id: Optional[str] = None,
+        kind: str = "root",
     ) -> SessionInfo:
         current = await self.storage.catalog.get_session(session_id)
         if current is not None:
@@ -63,6 +65,8 @@ class SessionService:
             title=title,
             workspace=workspace,
             metadata=dict(metadata or {}),
+            parent_session_id=parent_session_id,
+            kind=kind,
         )
         await self.storage.catalog.upsert_session(info)
         return info
@@ -73,9 +77,26 @@ class SessionService:
         limit: int = 50,
         offset: int = 0,
         workspace: Optional[str] = None,
+        include_subagents: bool = False,
+        parent_session_id: Optional[str] = None,
     ) -> list[SessionInfo]:
         return await self.storage.catalog.list_sessions(
-            limit=limit, offset=offset, workspace=workspace
+            limit=limit,
+            offset=offset,
+            workspace=workspace,
+            include_subagents=include_subagents,
+            parent_session_id=parent_session_id,
+        )
+
+    async def list_children(
+        self,
+        parent_session_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[SessionInfo]:
+        return await self.storage.catalog.list_children(
+            parent_session_id, limit=limit, offset=offset
         )
 
     async def get_session(self, session_id: str) -> Optional[SessionInfo]:

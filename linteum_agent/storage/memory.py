@@ -32,6 +32,12 @@ class InMemorySessionCatalog:
             title=info.title if info.title is not None else current.title,
             workspace=info.workspace if info.workspace is not None else current.workspace,
             metadata=dict(info.metadata or current.metadata),
+            parent_session_id=(
+                info.parent_session_id
+                if info.parent_session_id is not None
+                else current.parent_session_id
+            ),
+            kind=info.kind,
         )
 
     async def get_session(self, session_id: str) -> SessionInfo | None:
@@ -43,13 +49,35 @@ class InMemorySessionCatalog:
         limit: int = 50,
         offset: int = 0,
         workspace: str | None = None,
+        include_subagents: bool = False,
+        parent_session_id: str | None = None,
     ) -> list[SessionInfo]:
-        rows = [
-            info for info in self._sessions.values()
-            if workspace is None or info.workspace == workspace
-        ]
+        rows = []
+        for info in self._sessions.values():
+            if workspace is not None and info.workspace != workspace:
+                continue
+            if parent_session_id is not None:
+                if info.parent_session_id != parent_session_id:
+                    continue
+            elif not include_subagents and info.kind != "root":
+                continue
+            rows.append(info)
         rows.sort(key=lambda info: (info.updated_at, info.session_id), reverse=True)
         return rows[max(0, offset): max(0, offset) + max(1, limit)]
+
+    async def list_children(
+        self,
+        parent_session_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[SessionInfo]:
+        return await self.list_sessions(
+            limit=limit,
+            offset=offset,
+            include_subagents=True,
+            parent_session_id=parent_session_id,
+        )
 
     async def delete_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)

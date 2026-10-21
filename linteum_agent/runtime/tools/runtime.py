@@ -76,6 +76,7 @@ class ToolRuntime:
         auto_subscribe: bool = True,
         registry_for: Optional[Callable[[str], object]] = None,
         approval_policy: str = "ask",
+        approval_policy_for: Optional[Callable[[str], Optional[str]]] = None,
     ) -> None:
         if approval_policy not in ("ask", "allow", "deny"):
             raise ValueError(
@@ -90,6 +91,10 @@ class ToolRuntime:
         #: ``ask`` defers to the gate, ``allow`` executes immediately and
         #: ``deny`` pairs the call as ``tool.call.failed{E_DENIED}``.
         self.approval_policy = approval_policy
+        #: Optional per-session policy selector.  A child subagent session can
+        #: use ``allow``/``deny``/``inherit`` without mutating the global policy
+        #: that other sessions depend on (subagent design §7.3 / S11).
+        self.approval_policy_for = approval_policy_for
         #: Optional per-session registry selector (§ multi-tenant workspaces).
         #: ``None`` keeps the single-registry behaviour; a callable maps
         #: ``session_id`` -> :class:`ToolRegistry` (sync, or an awaitable of one
@@ -146,8 +151,9 @@ class ToolRuntime:
         }))
 
         # ③ approval-gated: suspend, do not execute
-        if spec.requires_approval and self.approval_policy != "allow":
-            if self.approval_policy == "deny":
+        policy = await self._effective_approval_policy(ev.session_id)
+        if spec.requires_approval and policy != "allow":
+            if policy == "deny":
                 await self._fail(ev, call_id,
                                  f"approval required but policy is 'deny': {name}",
                                  E_DENIED)
@@ -190,6 +196,28 @@ class ToolRuntime:
         task = self.pool.spawn(self._execute(ev, spec, token, registry), session_id=ev.session_id)
         self.inflight[call_id] = task
         task.add_done_callback(lambda _t, cid=call_id: self.inflight.pop(cid, None))
+
+    async def _effective_approval_policy(self, session_id: str) -> str:
+        """Resolve ``ask``/``allow``/``deny`` for one session.
+
+        The host provider may return ``None`` (no override), an unknown string,
+        or an awaitable; all of those fall back to the constructor-wide policy,
+        so single-session wiring behaves exactly as before.
+        """
+        provider = self.approval_policy_for
+        if provider is None:
+            return self.approval_policy
+        try:
+            chosen = provider(session_id)
+            if inspect.isawaitable(chosen):
+                chosen = await chosen
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a broken policy hook must pair the call
+            return self.approval_policy
+        if chosen in ("ask", "allow", "deny"):
+            return chosen
+        return self.approval_policy
 
     async def _registry_for_session(self, session_id: str):
         """Select the registry for ``session_id`` (``self.reg`` when unhooked).

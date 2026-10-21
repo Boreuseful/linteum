@@ -6,7 +6,10 @@ use serde_json::{Map, Value};
 use unicode_width::UnicodeWidthStr;
 
 use crate::ui::Theme;
-use crate::viewmodel::{ArtifactViewerState, CommandSpec, Effect, Item, Overlay, TuiState, edit};
+use crate::viewmodel::{
+    ArtifactViewerState, CommandSpec, Effect, Input, Item, Overlay, SidebarPanel, TuiState,
+    UiAction, edit, reduce,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaletteAction {
@@ -35,6 +38,14 @@ pub fn palette_actions() -> Vec<PaletteAction> {
         PaletteAction {
             id: "approvals",
             label: "Approvals",
+        },
+        PaletteAction {
+            id: "sidebar_subagents",
+            label: "Sidebar: subagents",
+        },
+        PaletteAction {
+            id: "subagents",
+            label: "Subagents",
         },
         PaletteAction {
             id: "help",
@@ -100,6 +111,20 @@ pub fn execute(action: PaletteAction, state: &mut TuiState) -> Vec<Effect> {
             state.overlay = Some(Overlay::Approvals);
             Vec::new()
         }
+        "subagents" => {
+            if state.subagents.is_empty() {
+                state
+                    .activity
+                    .push("subagents", "no subagents in this session");
+            } else {
+                state.overlay = Some(Overlay::Subagents);
+            }
+            Vec::new()
+        }
+        "sidebar_subagents" => reduce(
+            state,
+            Input::Action(UiAction::SidebarShowPanel(SidebarPanel::Subagents)),
+        ),
         "help" => {
             state.overlay = Some(Overlay::Help);
             Vec::new()

@@ -48,6 +48,7 @@ class ErrorSource(str, Enum):
     SAFETY = "safety"
     SANDBOX = "sandbox"
     AGENT = "agent"
+    SUBAGENT = "subagent"
     CONTEXT = "context"
     STORAGE = "storage"
     PLUGIN = "plugin"

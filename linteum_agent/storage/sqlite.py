@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seq      INTEGER NOT NULL DEFAULT 0,
     title         TEXT,
     workspace     TEXT,
-    metadata      TEXT NOT NULL DEFAULT '{}'
+    metadata      TEXT NOT NULL DEFAULT '{}',
+    parent_session_id TEXT,
+    kind          TEXT NOT NULL DEFAULT 'root'
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
     session_id TEXT NOT NULL,
@@ -50,10 +52,17 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE INDEX IF NOT EXISTS idx_cp_session ON checkpoints(session_id, created);
 """
 
+#: Created after the column migration, so a legacy ``sessions`` table does not
+#: fail ``executescript`` before ``ALTER TABLE`` has run.
+_SESSION_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_sessions_parent "
+    "ON sessions(parent_session_id, updated_at)"
+)
+
 _CHECKPOINT_COLUMNS = "session_id, seq, version, phase, state, created"
 _SESSION_COLUMNS = (
     "session_id, created_at, updated_at, phase, round, message_count, "
-    "last_seq, title, workspace, metadata"
+    "last_seq, title, workspace, metadata, parent_session_id, kind"
 )
 
 
@@ -75,7 +84,23 @@ class SqliteStorage(SqliteWal):
         super().__init__(path, group_commit_ms=group_commit_ms)
         with self._lock:
             self._conn.executescript(_EXTRA_SCHEMA)
+            self._migrate_session_columns()
+            self._conn.execute(_SESSION_INDEX)
             self._conn.commit()
+
+    def _migrate_session_columns(self) -> None:
+        """Add parent/kind columns to a pre-subagent ``sessions`` table."""
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(sessions)")
+        }
+        if "parent_session_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT"
+            )
+        if "kind" not in columns:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'root'"
+            )
 
     # -- Checkpointer -------------------------------------------------------
     def maybe_snapshot(self, state: AgentState, *, force: bool = False) -> Optional[Checkpoint]:
@@ -192,7 +217,7 @@ class SqliteStorage(SqliteWal):
             self._conn.execute(
                 f"""
                 INSERT INTO sessions ({_SESSION_COLUMNS})
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     updated_at=excluded.updated_at,
                     phase=excluded.phase,
@@ -201,7 +226,11 @@ class SqliteStorage(SqliteWal):
                     last_seq=excluded.last_seq,
                     title=COALESCE(excluded.title, sessions.title),
                     workspace=COALESCE(excluded.workspace, sessions.workspace),
-                    metadata=excluded.metadata
+                    metadata=excluded.metadata,
+                    parent_session_id=COALESCE(
+                        excluded.parent_session_id, sessions.parent_session_id
+                    ),
+                    kind=excluded.kind
                 """,
                 (
                     info.session_id,
@@ -214,6 +243,8 @@ class SqliteStorage(SqliteWal):
                     info.title,
                     info.workspace,
                     json.dumps(info.metadata or {}, ensure_ascii=False, allow_nan=False),
+                    info.parent_session_id,
+                    info.kind,
                 ),
             )
             self._conn.commit()
@@ -235,30 +266,55 @@ class SqliteStorage(SqliteWal):
         limit: int = 50,
         offset: int = 0,
         workspace: str | None = None,
+        include_subagents: bool = False,
+        parent_session_id: str | None = None,
     ) -> list[SessionInfo]:
         return await asyncio.to_thread(
-            self._list_sessions_sync, limit, offset, workspace
+            self._list_sessions_sync, limit, offset, workspace,
+            include_subagents, parent_session_id,
+        )
+
+    async def list_children(
+        self,
+        parent_session_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[SessionInfo]:
+        return await self.list_sessions(
+            limit=limit,
+            offset=offset,
+            include_subagents=True,
+            parent_session_id=parent_session_id,
         )
 
     def _list_sessions_sync(
-        self, limit: int, offset: int, workspace: str | None
+        self,
+        limit: int,
+        offset: int,
+        workspace: str | None,
+        include_subagents: bool = False,
+        parent_session_id: str | None = None,
     ) -> list[SessionInfo]:
         limit = max(1, int(limit))
         offset = max(0, int(offset))
+        clauses: list[str] = []
+        params: list = []
+        if parent_session_id is not None:
+            clauses.append("parent_session_id=?")
+            params.append(parent_session_id)
+        elif not include_subagents:
+            clauses.append("kind='root'")
+        if workspace is not None:
+            clauses.append("workspace=?")
+            params.append(workspace)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
         with self._lock:
-            if workspace is None:
-                rows = self._conn.execute(
-                    f"SELECT {_SESSION_COLUMNS} FROM sessions "
-                    "ORDER BY updated_at DESC, session_id ASC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    f"SELECT {_SESSION_COLUMNS} FROM sessions "
-                    "WHERE workspace=? "
-                    "ORDER BY updated_at DESC, session_id ASC LIMIT ? OFFSET ?",
-                    (workspace, limit, offset),
-                ).fetchall()
+            rows = self._conn.execute(
+                f"SELECT {_SESSION_COLUMNS} FROM sessions {where}"
+                "ORDER BY updated_at DESC, session_id ASC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
         return [self._session_from_row(row) for row in rows]
 
     async def delete_session(self, session_id: str) -> None:
@@ -287,6 +343,8 @@ class SqliteStorage(SqliteWal):
             title=row[7],
             workspace=row[8],
             metadata=metadata,
+            parent_session_id=row[10],
+            kind=row[11],
         )
 
 

@@ -19,6 +19,7 @@ use super::queue::QueueState;
 use super::sessions::{NewSessionForm, SessionPickerState};
 use super::sidebar::SidebarState;
 use super::slash::SlashState;
+use super::subagents::SubagentsState;
 use super::transcript::{
     ApprovalCard, AssistantItem, CompactionCard, ErrorCard, GapMarker, Item, ToolCard, ToolState,
     Transcript, UserItem,
@@ -167,6 +168,8 @@ pub enum Overlay {
     Approvals,
     Activity,
     Artifact,
+    Subagents,
+    SubagentContext,
     Palette,
     Fatal,
 }
@@ -282,6 +285,7 @@ pub struct TuiState {
     pub slash: SlashState,
     pub drafts: std::collections::HashMap<String, String>,
     pub artifact: Option<ArtifactViewerState>,
+    pub subagents: SubagentsState,
     pub features: Vec<String>,
     pub overlay: Option<Overlay>,
     pub focus: Focus,
@@ -345,6 +349,8 @@ impl TuiState {
             "tool.started" => apply_tool_started(self, frame),
             "tool.delta" => apply_tool_delta(self, frame),
             "tool.result" => apply_tool_result(self, frame),
+            "subagent.requested" | "subagent.started" | "subagent.progress" | "subagent.result"
+            | "subagent.error" => self.subagents.apply_frame(frame),
             "approval.required" => {
                 let card = parse_approval(&frame.payload);
                 if let Some(existing) = approval_card_mut(self, &card.call_id) {
@@ -377,6 +383,9 @@ impl TuiState {
             "agent.completed" => apply_agent_completed(self, frame, replay),
             "compaction.started" | "compaction.applied" => apply_compaction(self, frame),
             "notice" => {
+                if frame.payload.get("kind").and_then(Value::as_str) == Some("subagent_cancel") {
+                    self.subagents.apply_cancel(&frame.payload);
+                }
                 if !replay {
                     super::notices::route_notice(self, &frame.payload);
                 }
@@ -790,6 +799,7 @@ fn apply_bye(state: &mut TuiState, frame: &Frame) {
 pub(crate) fn reset_after_session_loss(state: &mut TuiState, reason: &str) {
     state.session = None;
     state.transcript = Transcript::default();
+    state.subagents = SubagentsState::default();
     state.queue = QueueState::default();
     state.approvals = ApprovalState::default();
     state.slash = SlashState::default();

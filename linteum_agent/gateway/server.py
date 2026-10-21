@@ -581,6 +581,8 @@ class GatewayServer:
             return await self._session_create(connection, command)
         if command.name == "session.list":
             return await self._session_list(command)
+        if command.name == "session.children":
+            return await self._session_children(command)
         if command.name == "session.delete":
             return await self._session_delete(command)
         if command.name == "session.get":
@@ -601,7 +603,13 @@ class GatewayServer:
             return await gateway.dispatch(command, connection)
         if command.name in KNOWN_COMMANDS:
             session_id = command_session_id(command)
-            if command.name in ("session.subscribe", "history.read", "artifact.read"):
+            if command.name in (
+                "session.subscribe", "history.read", "artifact.read",
+                "session.context", "approval.decide",
+            ):
+                # A subagent is only reachable through the read-only follow
+                # gateway (which permits ``approval.decide``); a root keeps the
+                # live-owner / read-only fallback semantics.
                 gateway = await self._gateway_for_readable(session_id)
             else:
                 gateway = await self._gateway_for(session_id)
@@ -684,10 +692,26 @@ class GatewayServer:
         limit = int(command.args.get("limit") or 50)
         offset = int(command.args.get("offset") or 0)
         workspace = command.args.get("workspace")
+        include_subagents = bool(command.args.get("include_subagents", False))
         infos = await self.host.list_sessions(
-            limit=limit, offset=offset, workspace=workspace
+            limit=limit, offset=offset, workspace=workspace,
+            include_subagents=include_subagents,
         )
         return {
+            "sessions": [info.to_dict() for info in infos],
+            "limit": limit,
+            "offset": offset,
+        }
+
+    async def _session_children(self, command: Command) -> dict:
+        parent_session_id = command_session_id(command)
+        limit = int(command.args.get("limit") or 50)
+        offset = int(command.args.get("offset") or 0)
+        infos = await self.host.list_children(
+            parent_session_id, limit=limit, offset=offset,
+        )
+        return {
+            "parent_session_id": parent_session_id,
             "sessions": [info.to_dict() for info in infos],
             "limit": limit,
             "offset": offset,
@@ -708,13 +732,23 @@ class GatewayServer:
                 E_SESSION_NOT_FOUND, f"session not found: {session_id!r}",
                 location=LOCATION_SERVER,
             )
+        children = await self.host.list_children(session_id)
         await self.host.delete_session(session_id)
+        # Child gateways are independent subscriptions; reclaim them here so a
+        # deleted session cannot keep projecting or broadcasting frames.
+        for child in children:
+            child_gateway = self._gateways.pop(child.session_id, None)
+            if child_gateway is not None:
+                child_gateway.broadcast("bye", {"reason": "session deleted"})
+                await child_gateway.close()
         logger.info("session %s deleted", session_id)
         return {"deleted": True, "session_id": session_id}
 
     # -- session gateways ---------------------------------------------------
     async def _gateway_for(self, session_id: str, *,
-                           read_only: bool = False) -> SessionGateway:
+                           read_only: bool = False,
+                           follow: bool = False,
+                           allow_approval: bool = False) -> SessionGateway:
         gateway = self._gateways.get(session_id)
         if gateway is not None and (read_only or not gateway.read_only):
             return gateway
@@ -757,6 +791,8 @@ class GatewayServer:
                 input_policy=cfg.agent.session.input_policy,
                 gap_timeout=self.gap_timeout,
                 read_only=read_only,
+                follow=follow,
+                allow_approval=allow_approval,
             )
             await session_gateway.start()
             if gateway is not None:  # replace a stale read-only view
@@ -769,7 +805,17 @@ class GatewayServer:
             return session_gateway
 
     async def _gateway_for_readable(self, session_id: str) -> SessionGateway:
-        """Live gateway when this process owns the session, else read-only."""
+        """Live gateway when this process owns the session, else read-only.
+
+        A subagent child is never opened as a live session here; it gets a
+        read-only, live-following view while the orchestrator owns the reducer
+        (design §8.4).
+        """
+        info = await self.host.get_session_info(session_id)
+        if info is not None and info.kind == "subagent":
+            return await self._gateway_for(
+                session_id, read_only=True, follow=True, allow_approval=True,
+            )
         try:
             return await self._gateway_for(session_id)
         except GatewayError as exc:

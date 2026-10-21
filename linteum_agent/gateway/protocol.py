@@ -46,6 +46,8 @@ FEATURES: tuple = (
     "approval",
     "artifacts",
     "history",
+    "subagents",
+    "context",
 )
 
 #: Commands a client may send (§5.2).  Anything else is ``E_UNKNOWN_COMMAND``.
@@ -54,6 +56,7 @@ KNOWN_COMMANDS: frozenset = frozenset(
         "hello",
         "session.create",
         "session.list",
+        "session.children",
         "session.get",
         "session.delete",
         "session.subscribe",
@@ -64,6 +67,7 @@ KNOWN_COMMANDS: frozenset = frozenset(
         "agent.resume",
         "history.read",
         "artifact.read",
+        "session.context",
         "ping",
     }
 )
@@ -207,6 +211,16 @@ def validate_command(cmd: "Command") -> None:
         _integer(args, "limit", minimum=1)
         _integer(args, "offset", minimum=0)
         _string(args, "workspace")
+        include = args.get("include_subagents")
+        if include is not None and not isinstance(include, bool):
+            raise _bad("session.list.include_subagents must be a boolean")
+        return
+
+    if cmd.name == "session.children":
+        if command_session_id(cmd) is None:
+            raise _bad("session.children requires session_id")
+        _integer(args, "limit", minimum=1)
+        _integer(args, "offset", minimum=0)
         return
 
     if cmd.name in ("session.get", "session.delete", "session.subscribe",
@@ -258,6 +272,11 @@ def validate_command(cmd: "Command") -> None:
         mode = args.get("mode", "view")
         if mode not in ("view", "events"):
             raise _bad("history mode must be 'view' or 'events'")
+        return
+
+    if cmd.name == "session.context":
+        if command_session_id(cmd) is None:
+            raise _bad("session.context requires session_id")
         return
 
     if cmd.name == "artifact.read":

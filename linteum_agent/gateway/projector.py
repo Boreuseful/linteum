@@ -440,6 +440,113 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         phase = phases.IDLE
         streaming = None
 
+    # -- subagent domain --------------------------------------------------
+    elif etype == "subagent.spawn.requested":
+        call_id = payload.get("call_id")
+        frames.append(ProjectedFrame("subagent.requested", {
+            "call_id": call_id,
+            "title": payload.get("title"),
+            "task": _preview_text(payload.get("task", "") or ""),
+            "tools": list(payload.get("tools") or ()),
+            "model_profile": payload.get("model_profile"),
+        }))
+        if call_id:
+            pending.add(call_id)
+            tool_names[call_id] = "spawn_subagent"
+        phase = phases.AWAITING_TOOLS
+
+    elif etype == "subagent.started":
+        frames.append(ProjectedFrame("subagent.started", {
+            "call_id": payload.get("call_id"),
+            "child_session_id": payload.get("child_session_id"),
+            "parent_session_id": payload.get("parent_session_id"),
+            "title": payload.get("title"),
+            "tools": list(payload.get("tools") or ()),
+            "model_profile": payload.get("model_profile"),
+            "read_only": bool(payload.get("read_only", False)),
+            "approval_policy": payload.get("approval_policy"),
+            "timeout_ms": payload.get("timeout_ms"),
+            "timeout_clamped": bool(payload.get("timeout_clamped", False)),
+        }))
+
+    elif etype == "subagent.progress":
+        frames.append(ProjectedFrame("subagent.progress", {
+            "call_id": payload.get("call_id"),
+            "child_session_id": payload.get("child_session_id"),
+            "title": payload.get("title"),
+            "phase": payload.get("phase"),
+            "round": payload.get("round"),
+            "last_tool": payload.get("last_tool"),
+            "message_count": payload.get("message_count"),
+            "tokens_input": payload.get("tokens_input"),
+            "tokens_output": payload.get("tokens_output"),
+        }))
+
+    elif etype == "subagent.completed":
+        call_id = payload.get("call_id")
+        was_pending = call_id is not None and call_id in pending
+        frames.append(ProjectedFrame("subagent.result", {
+            "call_id": call_id,
+            "child_session_id": payload.get("child_session_id"),
+            "title": payload.get("title"),
+            "ok": True,
+            "finish": payload.get("finish", "completed"),
+            "summary": _preview_text(payload.get("summary", "") or ""),
+            "summary_ref": payload.get("summary_ref"),
+            "summary_truncated": bool(payload.get("summary_truncated", False)),
+            "usage": payload.get("usage") or {},
+            "rounds": payload.get("rounds"),
+            "duration_ms": payload.get("duration_ms"),
+            "model_profile": payload.get("model_profile"),
+        }))
+        pending.discard(call_id)
+        tool_names.pop(call_id, None)
+        approvals.pop(call_id, None)
+        if was_pending:
+            phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
+
+    elif etype == "subagent.failed":
+        call_id = payload.get("call_id")
+        was_pending = call_id is not None and call_id in pending
+        info = _as_error_info(payload)
+        frames.append(ProjectedFrame("subagent.error", {
+            "call_id": call_id,
+            "child_session_id": payload.get("child_session_id"),
+            "title": payload.get("title"),
+            "ok": False,
+            "finish": payload.get("finish", "error"),
+            "code": payload.get("code"),
+            "error": payload.get("error"),
+            "error_info": info,
+            "usage": payload.get("usage") or {},
+            "rounds": payload.get("rounds"),
+            "duration_ms": payload.get("duration_ms"),
+        }))
+        pending.discard(call_id)
+        tool_names.pop(call_id, None)
+        approvals.pop(call_id, None)
+        last_error = info or last_error
+        if was_pending:
+            phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
+
+    elif etype == "subagent.cancel.requested":
+        call_ids = list(payload.get("call_ids") or ())
+        if call_ids:
+            for call_id in call_ids:
+                pending.discard(call_id)
+                tool_names.pop(call_id, None)
+                approvals.pop(call_id, None)
+        else:
+            for call_id, name in list(tool_names.items()):
+                if name == "spawn_subagent":
+                    pending.discard(call_id)
+                    tool_names.pop(call_id, None)
+        frames.append(ProjectedFrame("notice", {
+            "kind": "subagent_cancel", "call_ids": call_ids,
+        }))
+        if not pending:
+            phase = phases.IDLE
+
     # -- notices / compaction / plugins ----------------------------------
     elif etype == "system.budget.exceeded":
         info = _as_error_info(payload)
