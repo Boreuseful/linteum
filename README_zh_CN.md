@@ -142,6 +142,29 @@ agent:
     enabled: true
     project_dir: .linteum/skills  # 相对于会话 workspace
 
+  subagents:
+    enabled: false                # 需显式开启；开启后根会话才看到 tool_name
+    tool_name: spawn_subagent     # 保留名，不会注册进子会话的工具表
+    max_depth: 1                  # 子会话不能再派生 subagent
+    max_concurrent_per_session: 4
+    max_queued_per_session: 32
+    default_timeout_ms: 1800000   # 30 分钟
+    max_timeout_ms: 3600000       # 60 分钟；超出的请求会被截断
+    cancel_grace_ms: 5000
+    max_prompt_bytes: 16384       # spawn 提示词的 UTF-8 总字节数
+    max_summary_bytes: 7168       # 返回父会话的摘要上限
+    progress_interval_ms: 1000
+    default_tools: []             # 为空 = 父会话全部工具（tool_name 除外）
+    allowed_tools: []             # 为空 = 以父会话当前工具表为准
+    default_model_profile: default
+    allowed_model_profiles: []    # 为空 = 只允许 default_model_profile
+    approval_policy: allow        # allow | deny | inherit（继承 agent.tools.approval）
+    inherit_skills: true
+    max_tokens: 0                 # 每个子会话的预算；0 = 不限制
+    max_usd: 0.0
+    max_rounds: 0
+    max_wall_ms: 0
+
   budget:                         # 0 = 不限制
     tokens: 0
     usd: 0.0
@@ -178,6 +201,13 @@ ui:
   theme: auto                     # auto | light | dark
   show_reasoning: true
 ```
+
+Subagent 默认关闭。设置 `agent.subagents.enabled: true` 后，根会话的工具表会
+加入保留的 `spawn_subagent`；每次派生在独立的子会话中运行，只把一份有界摘要
+交回父会话。模型只能收窄 `tools`、`model_profile` 和 `timeout_ms`：
+`allowed_tools` 为空时取父会话当前工具表，`allowed_model_profiles` 为空时只允许
+`default_model_profile`。子会话不能再派生，默认不出现在 `session.list` 中
+（需 `include_subagents=true`），并与根会话共用租约。
 
 其他配置段与限制（`agent.skills` 的各项上限、`gateway.limits`、
 `gateway.delta`、`gateway.history`、`gateway.backpressure`、

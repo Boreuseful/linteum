@@ -147,6 +147,29 @@ agent:
     enabled: true
     project_dir: .linteum/skills  # relative to the session workspace
 
+  subagents:
+    enabled: false                # opt in; the root then sees tool_name
+    tool_name: spawn_subagent     # reserved; never registered in child tables
+    max_depth: 1                  # children cannot spawn subagents
+    max_concurrent_per_session: 4
+    max_queued_per_session: 32
+    default_timeout_ms: 1800000   # 30 minutes
+    max_timeout_ms: 3600000       # 60 minutes; longer requests are clamped
+    cancel_grace_ms: 5000
+    max_prompt_bytes: 16384       # whole spawn prompt, in UTF-8 bytes
+    max_summary_bytes: 7168       # bounded summary returned to the parent
+    progress_interval_ms: 1000
+    default_tools: []             # empty = every parent tool except tool_name
+    allowed_tools: []             # empty = the parent's live tool registry
+    default_model_profile: default
+    allowed_model_profiles: []    # empty = default_model_profile only
+    approval_policy: allow        # allow | deny | inherit (agent.tools.approval)
+    inherit_skills: true
+    max_tokens: 0                 # per-child budget; 0 = unlimited
+    max_usd: 0.0
+    max_rounds: 0
+    max_wall_ms: 0
+
   budget:                         # 0 = unlimited
     tokens: 0
     usd: 0.0
@@ -183,6 +206,15 @@ ui:
   theme: auto                     # auto | light | dark
   show_reasoning: true
 ```
+
+Subagents are off by default. With `agent.subagents.enabled: true`, a root
+session's tool table gains the reserved `spawn_subagent`; each spawn runs in an
+isolated child session and returns a single bounded summary. The model may only
+narrow `tools`, `model_profile`, and `timeout_ms`: an empty `allowed_tools`
+falls back to the parent's live registry, and an empty `allowed_model_profiles`
+allows only `default_model_profile`. Children cannot spawn further children, are
+hidden from `session.list` unless `include_subagents=true`, and share the root
+session's lease.
 
 Other sections and limits (`agent.skills` caps, `gateway.limits`,
 `gateway.delta`, `gateway.history`, `gateway.backpressure`,
