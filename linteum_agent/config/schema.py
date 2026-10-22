@@ -133,6 +133,9 @@ class ToolSettings:
     """Tool execution policy.  ``workspace`` is intentionally absent."""
 
     approval: str = "ask"                # ask | allow | deny
+    #: Tools that execute immediately even when ``approval`` is ``ask``
+    #: (``approval == "deny"`` still refuses them).
+    auto_approve: tuple[str, ...] = ()
     bash_timeout: float = 30.0
 
 
@@ -782,6 +785,10 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
     if config.agent.tools.approval not in ("ask", "allow", "deny"):
         _issue(issues, "agent.tools.approval", "E_CONFIG_ENUM",
                f"unknown approval policy {config.agent.tools.approval!r}")
+    for index, name in enumerate(config.agent.tools.auto_approve):
+        if not isinstance(name, str) or not name.strip():
+            _issue(issues, f"agent.tools.auto_approve.{index}", "E_CONFIG_RANGE",
+                   "must be a non-empty string")
     if config.agent.tools.bash_timeout <= 0:
         _issue(issues, "agent.tools.bash_timeout", "E_CONFIG_RANGE", "must be > 0")
 

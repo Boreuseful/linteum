@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from collections.abc import Collection
 from typing import Callable, Optional
 
 from ...bus.artifact import NullArtifactStore
@@ -77,6 +78,7 @@ class ToolRuntime:
         registry_for: Optional[Callable[[str], object]] = None,
         approval_policy: str = "ask",
         approval_policy_for: Optional[Callable[[str], Optional[str]]] = None,
+        auto_approve: Collection[str] = (),
     ) -> None:
         if approval_policy not in ("ask", "allow", "deny"):
             raise ValueError(
@@ -95,6 +97,9 @@ class ToolRuntime:
         #: use ``allow``/``deny``/``inherit`` without mutating the global policy
         #: that other sessions depend on (subagent design §7.3 / S11).
         self.approval_policy_for = approval_policy_for
+        #: Tools that bypass the gate when the policy is ``ask``.  ``deny``
+        #: still pairs them as ``E_DENIED``.
+        self.auto_approve: frozenset[str] = frozenset(auto_approve)
         #: Optional per-session registry selector (§ multi-tenant workspaces).
         #: ``None`` keeps the single-registry behaviour; a callable maps
         #: ``session_id`` -> :class:`ToolRegistry` (sync, or an awaitable of one
@@ -158,8 +163,9 @@ class ToolRuntime:
                                  f"approval required but policy is 'deny': {name}",
                                  E_DENIED)
                 return
-            await self.approvals.request(ev, spec)
-            return
+            if name not in self.auto_approve:
+                await self.approvals.request(ev, spec)
+                return
 
         # ④ fire-and-forget on the worker pool (non-blocking)
         await self._spawn(ev, spec, registry)

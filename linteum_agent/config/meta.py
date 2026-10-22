@@ -197,6 +197,12 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "enum": ("ask", "allow", "deny"),
         "description": "ask=人工审批；allow=自动放行；deny=自动拒绝。",
     },
+    "agent.tools.auto_approve": {
+        "title": "免审批工具",
+        "type": "list",
+        "item_type": "str",
+        "description": "approval=ask 时这些工具直接执行；deny 仍会拒绝。",
+    },
     "agent.tools.bash_timeout": {
         "title": "Bash 超时（秒）",
         "type": "float",

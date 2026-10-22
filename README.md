@@ -141,6 +141,7 @@ agent:
 
   tools:
     approval: ask                 # ask | allow | deny
+    auto_approve: []              # names that skip the gate when approval=ask
     bash_timeout: 30.0
 
   skills:
@@ -206,6 +207,10 @@ ui:
   theme: auto                     # auto | light | dark
   show_reasoning: true
 ```
+
+`agent.tools.auto_approve` lists tool names that run without human approval
+while `agent.tools.approval` is `ask` (for example
+`[write_file, edit_file]`); `deny` still refuses them.
 
 Subagents are off by default. With `agent.subagents.enabled: true`, a root
 session's tool table gains the reserved `spawn_subagent`; each spawn runs in an

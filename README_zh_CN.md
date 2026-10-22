@@ -136,6 +136,7 @@ agent:
 
   tools:
     approval: ask                 # ask | allow | deny
+    auto_approve: []              # approval=ask 时免审批的工具名
     bash_timeout: 30.0
 
   skills:
@@ -201,6 +202,9 @@ ui:
   theme: auto                     # auto | light | dark
   show_reasoning: true
 ```
+
+`agent.tools.auto_approve` 列出 `agent.tools.approval: ask` 时无需人工审批的
+工具（例如 `[write_file, edit_file]`）；`deny` 仍会拒绝这些工具。
 
 Subagent 默认关闭。设置 `agent.subagents.enabled: true` 后，根会话的工具表会
 加入保留的 `spawn_subagent`；每次派生在独立的子会话中运行，只把一份有界摘要

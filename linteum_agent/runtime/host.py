@@ -246,6 +246,7 @@ class AgentHost:
             artifacts=self.storage.artifacts,
             approval_policy=cfg.agent.tools.approval,
             approval_policy_for=self.approval_policy_for,
+            auto_approve=cfg.agent.tools.auto_approve,
         )
         self.compactor = context_compactor or ContextCompactor(
             self.bus, artifacts=self.storage.artifacts
@@ -536,6 +537,7 @@ class AgentHost:
         self._ensure_llm_routing(cfg)
         self._tool_factory_cfg = cfg
         self.tool_runtime.approval_policy = cfg.agent.tools.approval
+        self.tool_runtime.auto_approve = frozenset(cfg.agent.tools.auto_approve)
         session_id = options.session_id or uuid7()
 
         async with self._registry_lock:
