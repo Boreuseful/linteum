@@ -62,6 +62,7 @@ class Agent:
         budget: Optional[Budget] = None,
         ctx_builder: Optional[ContextBuilder] = None,
         context_policy: Optional[ContextPolicy] = None,
+        subagent_tools: frozenset[str] = frozenset(),
         auto_subscribe: bool = True,
         replay: bool = False,
         serialize: bool = True,
@@ -69,6 +70,10 @@ class Agent:
         self.bus = bus
         self.session_id = session_id
         self.model = model
+        #: Reserved tool names the reducer routes to ``subagent.spawn.requested``
+        #: instead of ``tool.call.requested`` (subagent design §3.1 / §6.1).
+        #: Empty for child sessions, which is how ``max_depth=1`` is enforced.
+        self._subagent_tools = frozenset(subagent_tools)
         self.state = AgentState(session_id=session_id, trace_id=uuid7(), budget=budget or Budget())
         self.checkpointer = checkpointer
         self.ctx_builder = ctx_builder or PassthroughContextBuilder()
@@ -111,6 +116,10 @@ class Agent:
             ("llm.failed", self.on_llm_failed),
             ("tool.call.completed", self.on_tool_done),
             ("tool.call.failed", self.on_tool_done),
+            ("subagent.completed", self.on_subagent_done),
+            ("subagent.failed", self.on_subagent_done),
+            ("subagent.started", self.on_subagent_notice),
+            ("subagent.progress", self.on_subagent_notice),
             ("approval.granted", self.on_approval),
             ("agent.resumed", self.on_resumed),
             ("context.compaction.applied", self.on_compaction_applied),
@@ -211,12 +220,27 @@ class Agent:
             await self._publish(ev.child("agent.completed", {"round": self.state.round}))
             return
 
-        # fan out: register pending *before* publishing to avoid a race (§19)
+        # fan out: register pending *before* publishing to avoid a race (§19).
+        # Reserved subagent names are split here — the model still speaks tool
+        # calls, but the runtime fact is ``subagent.spawn.requested`` and the
+        # ToolRuntime never sees it (subagent design §3.1).
+        subagent_calls = [
+            call for call in calls if call.get("name") in self._subagent_tools
+        ]
+        tool_calls = [
+            call for call in calls if call.get("name") not in self._subagent_tools
+        ]
         self.state.set_phase(phases.ACTING)                 # thinking -> acting
         self.state.pending = {c["call_id"] for c in calls}
+        self.state.pending_subagents = {c["call_id"] for c in subagent_calls}
         self.state.set_phase(phases.AWAITING_TOOLS)         # acting -> awaiting_tools
         self._tick()
-        for call in calls:
+        for call in subagent_calls:
+            await self._publish(ev.child("subagent.spawn.requested", {
+                **dict(call.get("args") or {}),
+                "call_id": call["call_id"],     # host-owned, never model-overridable
+            }))
+        for call in tool_calls:
             await self._publish(ev.child("tool.call.requested", {
                 "name": call["name"],
                 "args": call.get("args") or {},
@@ -246,12 +270,80 @@ class Agent:
             message["output_tokens"] = ev.payload["output_tokens"]
         self.state.messages.append(message)
         self.state.pending.discard(call_id)
+        self.state.pending_subagents.discard(call_id)  # defensive replay cleanup
 
         if self.state.pending:  # still waiting on siblings -> remain in the barrier
             self.state.set_phase(phases.AWAITING_TOOLS)
             self._tick()
             return
         # ★ convergence barrier: every branch done -> think again (§18.2, I2)
+        self.state.set_phase(phases.THINKING)
+        self.state.round += 1
+        self._tick()
+        await self._intent("llm.request", ev)
+
+    async def on_subagent_notice(self, ev: Event) -> None:
+        """Observe ``started`` / ``progress`` without touching messages or phase.
+
+        These are UI/audit metadata.  Reducing them keeps ``last_ts`` and the
+        replay anchor identical between a live run and ``replay_state`` (§6.1).
+        """
+        if not self._mine(ev):
+            return
+        self.state.observe(ev)
+
+    async def on_subagent_done(self, ev: Event) -> None:
+        """Pair one ``subagent.completed`` / ``subagent.failed`` (design §6.4).
+
+        Usage is accounted **before** the cancellation/pending guards: a child
+        that already spent tokens must hit the parent budget even when the
+        result itself is voided by an interrupt.  ``subagent_usage_accounted``
+        makes that at-most-once across duplicates, late events and replay.
+        """
+        if not self._mine(ev):
+            return
+        call_id = ev.payload.get("call_id")
+        self.state.observe(ev)
+
+        if call_id and call_id not in self.state.subagent_usage_accounted:
+            usage = ev.payload.get("usage") or {}
+            self.state.add_usage(
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                usd=usage.get("usd", 0.0),
+            )
+            self.state.subagent_usage_accounted.add(call_id)
+
+        if not call_id or call_id in self.state.cancelled:
+            return  # voided by an interrupt: never enters history
+        if call_id not in self.state.pending:
+            return  # duplicate / late / post-restore terminal: never double-pair
+
+        ok = bool(ev.payload.get("ok"))
+        summary = ev.payload.get("summary") or ev.payload.get("error") or ""
+        if not isinstance(summary, str):
+            summary = json.dumps(summary, ensure_ascii=False)
+        if not ok:
+            code = ev.payload.get("code") or "E_SUBAGENT_FAILED"
+            summary = f"[subagent failed: {code}] {summary}".rstrip()
+
+        message = {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": summary,
+            "subagent_session_id": ev.payload.get("child_session_id"),
+        }
+        if ev.payload.get("summary_ref") is not None:
+            message["output_ref"] = ev.payload["summary_ref"]
+        self.state.messages.append(message)
+        self.state.pending.discard(call_id)
+        self.state.pending_subagents.discard(call_id)
+
+        if self.state.pending:  # sibling tools/subagents still running
+            self.state.set_phase(phases.AWAITING_TOOLS)
+            self._tick()
+            return
+        # ★ the barrier covers tools and subagents alike (design §3.4)
         self.state.set_phase(phases.THINKING)
         self.state.round += 1
         self._tick()
@@ -285,7 +377,15 @@ class Agent:
         # tool result for each one, so the assistant's tool_calls stay complete
         # and the model can see the round was cut short (§16.3).
         if self.state.pending:
-            await self._publish(ev.child("tool.cancel.requested", {}))
+            # Publish cancellation before writing the paired messages: the
+            # orchestrator must never publish a terminal into the window where
+            # the parent would pair it twice (design §6.5).
+            if self.state.pending_subagents:
+                await self._publish(ev.child("subagent.cancel.requested", {
+                    "call_ids": sorted(self.state.pending_subagents),
+                }))
+            if self.state.pending - self.state.pending_subagents:
+                await self._publish(ev.child("tool.cancel.requested", {}))
             for call_id in sorted(self.state.pending):
                 self.state.messages.append({
                     "role": "tool",
@@ -298,6 +398,7 @@ class Agent:
             # LLM in flight: remember to tag its (partial) completion when it arrives
             self.state.interrupt_pending = True
         self.state.pending.clear()
+        self.state.pending_subagents.clear()
         self.state.pending_compaction = None
         if phases.can_transition(self.state.phase, phases.IDLE):
             self.state.set_phase(phases.IDLE)
@@ -542,6 +643,19 @@ class Agent:
             await self.on_llm_failed(ev)
         elif etype in ("tool.call.completed", "tool.call.failed"):
             await self.on_tool_done(ev)
+        elif etype in ("subagent.completed", "subagent.failed"):
+            await self.on_subagent_done(ev)
+        elif etype in ("subagent.started", "subagent.progress"):
+            self.state.observe(ev)
+        elif etype == "subagent.spawn.requested":
+            self.state.observe(ev)
+            call_id = ev.payload.get("call_id")
+            if call_id:
+                # Trust the WAL fact, not the *current* host configuration: a
+                # session recorded with subagents enabled must replay the same
+                # routing even when the feature is now disabled (design §6.6).
+                self.state.pending.add(call_id)
+                self.state.pending_subagents.add(call_id)
         elif etype == "approval.granted":
             await self.on_approval(ev)
         elif etype == "agent.resumed":
@@ -573,6 +687,15 @@ class Agent:
             phases.AWAITING_APPROVAL,
         ):
             return
+        # A recovered process has no live orchestrator; tell any still-running
+        # one to close the child before pairing the round as interrupted.
+        if self.state.pending_subagents:
+            await self._publish(Event.create(
+                "subagent.cancel.requested",
+                {"call_ids": sorted(self.state.pending_subagents)},
+                session_id=self.session_id,
+                trace_id=self.state.trace_id,
+            ))
         approvals = set(pending_approvals) & self.state.pending
         if approvals:
             for call_id in sorted(self.state.pending - approvals):
@@ -584,6 +707,8 @@ class Agent:
                 })
                 self.state.cancelled.add(call_id)
             self.state.pending = set(approvals)
+            # Approvals are tool calls, never subagent calls.
+            self.state.pending_subagents &= approvals
             self.state.pending_compaction = None
             self.state.interrupt_pending = False
             self._tick()
@@ -599,6 +724,7 @@ class Agent:
                 })
             self.state.cancelled |= self.state.pending
         self.state.pending.clear()
+        self.state.pending_subagents.clear()
         self.state.pending_compaction = None
         self.state.interrupt_pending = False
         if phases.can_transition(self.state.phase, phases.IDLE):

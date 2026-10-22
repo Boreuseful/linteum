@@ -36,6 +36,10 @@ class SessionInfo:
     title: str | None = None
     workspace: str | None = None
     metadata: dict = field(default_factory=dict)
+    #: Parent session for a delegated child (``None`` for root sessions).
+    parent_session_id: str | None = None
+    #: ``root`` (user-created) or ``subagent`` (orchestrator-created).
+    kind: str = "root"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -53,6 +57,8 @@ class SessionInfo:
             title=data.get("title"),
             workspace=data.get("workspace"),
             metadata=dict(data.get("metadata") or {}),
+            parent_session_id=data.get("parent_session_id"),
+            kind=data.get("kind", "root"),
         )
 
 
@@ -70,6 +76,16 @@ class SessionCatalog(Protocol):
         limit: int = 50,
         offset: int = 0,
         workspace: str | None = None,
+        include_subagents: bool = False,
+        parent_session_id: str | None = None,
+    ) -> list[SessionInfo]: ...
+
+    async def list_children(
+        self,
+        parent_session_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
     ) -> list[SessionInfo]: ...
 
     async def delete_session(self, session_id: str) -> None: ...

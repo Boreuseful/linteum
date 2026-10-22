@@ -36,6 +36,7 @@ pub enum SidebarPanel {
     Files,
     Preview,
     Info,
+    Subagents,
 }
 
 impl SidebarPanel {
@@ -44,6 +45,7 @@ impl SidebarPanel {
             Self::Files => "Files",
             Self::Preview => "Preview",
             Self::Info => "Info",
+            Self::Subagents => "Subagents",
         }
     }
 }

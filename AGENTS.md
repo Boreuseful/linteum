@@ -99,6 +99,13 @@ change requires breaking one, stop and redesign the change.
 
 - `Agent.restore` is now async and closes an interrupted half-round; the host
   must still supply the same model/tool/context configuration before subscribing.
+- Subagents: `SubagentOrchestrator` is the sole `subagent.spawn.requested`
+  subscriber. Child sessions never acquire a lease (`lease_owned=False`), and
+  `open_session`/`ensure_session` reject `kind="subagent"`; the root lease
+  covers its child tree. Recovery/replay never creates a child or calls a
+  provider, and a half-recorded spawn is paired as interrupted. The configured
+  `agent.subagents.tool_name` is reserved at assembly and is never registered
+  in a child's tool table (`max_depth=1`).
 - `bus.publish` marks the event deduped and assigns `seq` before the WAL append
   (`bus/bus.py`). A WAL failure can drop a retry or leave a `seq` gap. On a
   reopened store the bus seeds `seq`/dedup from the WAL before the first publish.

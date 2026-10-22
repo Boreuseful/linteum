@@ -121,6 +121,7 @@ enum SegmentKind {
     Usd,
     Cache,
     Approvals,
+    Subagents,
     Queue,
 }
 
@@ -161,6 +162,13 @@ impl SegmentKind {
             }
             Self::Approvals => (!state.approvals.pending.is_empty())
                 .then(|| format!("⚠ {}", state.approvals.pending.len())),
+            Self::Subagents => (!state.subagents.is_empty()).then(|| {
+                format!(
+                    "agents {}/{}",
+                    state.subagents.running_count(),
+                    state.subagents.entries.len()
+                )
+            }),
             Self::Queue => (!state.queue.entries.is_empty())
                 .then(|| format!("queued {}", state.queue.entries.len())),
         }
@@ -192,6 +200,7 @@ pub fn status_bar(state: &TuiState, width: u16) -> String {
         SegmentKind::Usd,
         SegmentKind::Cache,
         SegmentKind::Approvals,
+        SegmentKind::Subagents,
         SegmentKind::Queue,
     ];
     let mut segments: Vec<(SegmentKind, String)> = kinds
@@ -206,6 +215,7 @@ pub fn status_bar(state: &TuiState, width: u16) -> String {
         SegmentKind::Tokens,
         SegmentKind::Model,
         SegmentKind::Round,
+        SegmentKind::Subagents,
     ];
     for kind in drop_order {
         if total <= width as usize {

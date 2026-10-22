@@ -22,13 +22,23 @@ from .spec import ToolSpec
 
 
 class ToolRegistry:
-    """In-process name → :class:`ToolSpec` table with per-tool semaphores."""
+    """In-process name → :class:`ToolSpec` table with per-tool semaphores.
 
-    def __init__(self) -> None:
+    ``reserved`` names belong to a host capability that is not a real tool (the
+    subagent ``spawn_subagent`` routing name).  Registering one is a conflict:
+    the model must never see two schemas with the same name.
+    """
+
+    def __init__(self, *, reserved: Iterable[str] = ()) -> None:
         self._specs: dict[str, ToolSpec] = {}
         self._sem: dict[str, asyncio.Semaphore] = {}
         self._draining: set[str] = set()
+        self._reserved: set[str] = set(reserved)
         self._lock = asyncio.Lock()
+
+    def reserve(self, name: str) -> None:
+        """Mark ``name`` as host-reserved (assembly-time assertion, not a spec)."""
+        self._reserved.add(name)
 
     # -- mutation (atomic) --------------------------------------------------
     async def register_many(self, specs: Iterable[ToolSpec]) -> None:
@@ -37,7 +47,7 @@ class ToolRegistry:
         async with self._lock:
             seen: set[str] = set()
             for spec in batch:
-                if spec.name in self._specs or spec.name in seen:
+                if spec.name in self._specs or spec.name in seen or spec.name in self._reserved:
                     raise DuplicateTool(spec.name)
                 seen.add(spec.name)
             for spec in batch:

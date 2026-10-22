@@ -34,7 +34,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         id: "split",
         label: "Split panels",
-        description: "Split the sidebar into three blocks",
+        description: "Split the sidebar into files, preview, and subagents",
         action: UiAction::SidebarSplit,
     },
     SlashCommand {
@@ -60,6 +60,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         label: "Info panel",
         description: "Show the info placeholder",
         action: UiAction::SidebarShowPanel(SidebarPanel::Info),
+    },
+    SlashCommand {
+        id: "subagents",
+        label: "Subagent status",
+        description: "Show subagent status in the sidebar",
+        action: UiAction::SidebarShowPanel(SidebarPanel::Subagents),
     },
     SlashCommand {
         id: "refresh",

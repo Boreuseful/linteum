@@ -24,6 +24,7 @@ from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, get_args, get_origin, get_type_hints
 
+from ..bus.event import INLINE_LIMIT
 from ..runtime.llm.config import (
     LLMConfig,
     PROVIDER_DEFAULTS,
@@ -161,6 +162,39 @@ class SkillsSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class SubagentSettings:
+    """Host-owned execution boundary for delegated child sessions (§9.1).
+
+    ``enabled`` defaults to ``False``: a root session only sees the reserved
+    ``spawn_subagent`` tool schema when the host explicitly opts in.  The
+    model may narrow ``tools`` / ``model_profile`` / ``timeout_ms`` but never
+    widen them; an out-of-allowlist request fails instead of degrading.
+    """
+
+    enabled: bool = False
+    tool_name: str = "spawn_subagent"
+    max_depth: int = 1
+    max_concurrent_per_session: int = 4
+    max_queued_per_session: int = 32
+    default_timeout_ms: int = 30 * 60 * 1000
+    max_timeout_ms: int = 60 * 60 * 1000
+    cancel_grace_ms: int = 5_000
+    max_prompt_bytes: int = 16 * 1024
+    max_summary_bytes: int = 7 * 1024
+    progress_interval_ms: int = 1_000
+    default_tools: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()
+    default_model_profile: str = "default"
+    allowed_model_profiles: tuple[str, ...] = ()
+    approval_policy: str = "allow"       # allow | deny | inherit
+    inherit_skills: bool = True
+    max_tokens: int = 0
+    max_usd: float = 0.0
+    max_rounds: int = 0
+    max_wall_ms: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class BudgetSettings:
     """Session budget limits (0 = unlimited)."""
 
@@ -201,6 +235,7 @@ class AgentSettings:
     context: ContextSettings = field(default_factory=ContextSettings)
     tools: ToolSettings = field(default_factory=ToolSettings)
     skills: SkillsSettings = field(default_factory=SkillsSettings)
+    subagents: SubagentSettings = field(default_factory=SubagentSettings)
     budget: BudgetSettings = field(default_factory=BudgetSettings)
     session: SessionSettings = field(default_factory=SessionSettings)
 
@@ -775,6 +810,70 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
             if not isinstance(path, str) or not path.strip():
                 _issue(issues, f"agent.skills.{name}.{index}", "E_CONFIG_RANGE",
                        "must be a non-empty string")
+
+    # -- agent.subagents ------------------------------------------------
+    subagents = config.agent.subagents
+    if subagents.max_depth < 1:
+        _issue(issues, "agent.subagents.max_depth", "E_CONFIG_RANGE", "must be >= 1")
+    if subagents.max_concurrent_per_session < 1:
+        _issue(issues, "agent.subagents.max_concurrent_per_session",
+               "E_CONFIG_RANGE", "must be >= 1")
+    if subagents.max_queued_per_session < 0:
+        _issue(issues, "agent.subagents.max_queued_per_session",
+               "E_CONFIG_RANGE", "must be >= 0")
+    if subagents.default_timeout_ms <= 0:
+        _issue(issues, "agent.subagents.default_timeout_ms",
+               "E_CONFIG_RANGE", "must be > 0")
+    if subagents.max_timeout_ms <= 0:
+        _issue(issues, "agent.subagents.max_timeout_ms",
+               "E_CONFIG_RANGE", "must be > 0")
+    elif subagents.default_timeout_ms > subagents.max_timeout_ms:
+        _issue(issues, "agent.subagents.default_timeout_ms", "E_CONFIG_RANGE",
+               "must be <= max_timeout_ms")
+    if subagents.cancel_grace_ms < 0:
+        _issue(issues, "agent.subagents.cancel_grace_ms",
+               "E_CONFIG_RANGE", "must be >= 0")
+    if subagents.progress_interval_ms < 0:
+        _issue(issues, "agent.subagents.progress_interval_ms",
+               "E_CONFIG_RANGE", "must be >= 0")
+    if subagents.max_prompt_bytes <= 0:
+        _issue(issues, "agent.subagents.max_prompt_bytes",
+               "E_CONFIG_RANGE", "must be > 0")
+    elif subagents.max_prompt_bytes + 4096 > INLINE_LIMIT:
+        _issue(issues, "agent.subagents.max_prompt_bytes", "E_CONFIG_RANGE",
+               "must leave 4 KiB of inline headroom below INLINE_LIMIT")
+    if subagents.max_summary_bytes <= 0 or subagents.max_summary_bytes >= INLINE_LIMIT:
+        _issue(issues, "agent.subagents.max_summary_bytes", "E_CONFIG_RANGE",
+               f"must be within (0, {INLINE_LIMIT})")
+    if not isinstance(subagents.tool_name, str) or not subagents.tool_name.strip():
+        _issue(issues, "agent.subagents.tool_name", "E_CONFIG_RANGE",
+               "must be a non-empty string")
+    if subagents.approval_policy not in ("allow", "deny", "inherit"):
+        _issue(issues, "agent.subagents.approval_policy", "E_CONFIG_ENUM",
+               f"unknown approval policy {subagents.approval_policy!r}")
+    profile_names = agent.profile_names()
+    if subagents.default_model_profile not in profile_names:
+        _issue(issues, "agent.subagents.default_model_profile",
+               "E_CONFIG_PROFILE_NOT_FOUND",
+               f"profile {subagents.default_model_profile!r} is not defined",
+               hint=f"available profiles: {', '.join(profile_names)}")
+    for index, profile in enumerate(subagents.allowed_model_profiles):
+        if profile not in profile_names:
+            _issue(issues, f"agent.subagents.allowed_model_profiles.{index}",
+                   "E_CONFIG_PROFILE_NOT_FOUND",
+                   f"profile {profile!r} is not defined",
+                   hint=f"available profiles: {', '.join(profile_names)}")
+    for name in ("default_tools", "allowed_tools"):
+        for index, tool in enumerate(getattr(subagents, name)):
+            if not isinstance(tool, str) or not tool.strip():
+                _issue(issues, f"agent.subagents.{name}.{index}",
+                       "E_CONFIG_RANGE", "must be a non-empty string")
+    for name in ("max_tokens", "max_rounds", "max_wall_ms"):
+        if getattr(subagents, name) < 0:
+            _issue(issues, f"agent.subagents.{name}", "E_CONFIG_RANGE",
+                   "must be >= 0")
+    if subagents.max_usd < 0:
+        _issue(issues, "agent.subagents.max_usd", "E_CONFIG_RANGE", "must be >= 0")
 
     # -- agent.budget ---------------------------------------------------
     budget = config.agent.budget

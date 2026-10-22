@@ -30,6 +30,7 @@ CORE_DOMAINS: tuple = (
     "tool",
     "approval",
     "agent",
+    "subagent",
     "hook",
     "context",
     "retrieval",

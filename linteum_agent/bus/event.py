@@ -71,6 +71,13 @@ KNOWN_TYPES: frozenset = frozenset(
         "approval.denied",
         "agent.plan.updated",
         "agent.handoff",
+        # §7.1 subagent task domain (core-only; see bus/namespace.py)
+        "subagent.spawn.requested",
+        "subagent.started",
+        "subagent.progress",
+        "subagent.completed",
+        "subagent.failed",
+        "subagent.cancel.requested",
         "agent.paused",
         "agent.resumed",
         "agent.completed",
