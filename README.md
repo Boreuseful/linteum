@@ -79,6 +79,12 @@ linteum serve --ws                         # ws://127.0.0.1:8765
 
 Run `linteum-tui --help` for the full client option list.
 
+In `--spawn` mode the session picker is filtered to the current directory, so
+sessions created for other workspaces are hidden. Press `a` in the picker to
+show all workspaces, or pass `--session <ID>`. `--continue` is not implemented
+yet. See [`linteum-tui/README.md`](linteum-tui/README.md#sessions-and-workspaces)
+for details.
+
 ## Configuration
 
 The semi-permanent configuration lives in `~/.linteum/config.yaml`.

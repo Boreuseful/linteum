@@ -76,6 +76,11 @@ linteum serve --ws                         # ws://127.0.0.1:8765
 
 运行 `linteum-tui --help` 查看客户端完整选项。
 
+`--spawn` 模式下会话列表会按当前目录过滤，其他 workspace 的会话不会显示。
+在 picker 中按 `a` 可列出全部 workspace，或使用 `--session <ID>` 直接连接。
+`--continue` 尚未实现。参数、键位和细节详见
+[`linteum-tui/README_zh_CN.md`](linteum-tui/README_zh_CN.md)。
+
 ## 配置
 
 半永久配置默认位于 `~/.linteum/config.yaml`。`LINTEUM_HOME` 会移动整个状态目录
