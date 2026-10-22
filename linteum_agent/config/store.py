@@ -1,355 +1,310 @@
-"""Config file read/write: YAML format, saved to the user home directory's ``~/.agent`` directory by default.
+"""Read/write the semi-permanent YAML configuration file.
 
-Usage::
+Default location: ``~/.linteum/config.yaml`` (override with ``LINTEUM_CONFIG``).
+The directory intentionally uses the ``.linteum`` name; this is a fresh config
+layer and does **not** read or migrate the legacy ``~/.agent`` file.
 
-    from linteum_agent.config import ConfigStore, LLMConfig
+Write semantics:
 
-    store = ConfigStore()             # default -> ~/.agent/config.yaml
-    config = store.load(create=True)  # write the default config first if the file is missing, then read
-
-    config.set_llm(
-        LLMConfig(
-            provider="openai_compatible",
-            model="deepseek-chat",
-            base_url="https://api.deepseek.com",
-            api_key="sk-xxx",
-        )
-    )
-    store.save()
-
-    store.llm()            # the only LLM (already normalized to LLMConfig)
-
-Path priority: ``ConfigStore(path=...)`` > the environment variable ``linteum_agent_CONFIG`` >
-``~/.agent/config.yaml``. Writing uses "temp file + ``os.replace``" for an atomic replace; when the
-config contains ``api_key``, the file permissions are tightened to ``0600`` as much as possible
-(ignored on failure).
+* validate first, then write;
+* write a temp file in the same directory, ``fsync`` it and ``os.replace`` it
+  (a crash never leaves a half-written config);
+* tighten permissions to ``0600`` when the file contains a literal API key;
+* keep a small number of timestamped backups;
+* detect concurrent writers with ``expected_revision`` (sha256 of the file);
+* serialise writers with an advisory file lock (``fcntl`` where available).
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from threading import RLock
-from typing import Any
+from typing import Any, Iterator, Mapping, Optional
 
 import yaml
 
-try:  # intra-package import
-    from .schema import (CONFIG_VERSION, Config, ConfigError, LLMConfig,
-                         empty_config)
-except ImportError:  # supports adding /workspace/linteum_agent to sys.path directly
-    from schema import (CONFIG_VERSION, Config, ConfigError, LLMConfig,
-                        empty_config)
+from .paths import (
+    AGENT_DIRNAME,
+    CONFIG_PATH_ENV,
+    DEFAULT_CONFIG_FILENAME,
+    HOME_ENV,
+    default_config_path,
+    linteum_home,
+)
+from .schema import (
+    AppConfig,
+    ConfigError,
+    app_from_dict,
+    app_to_dict,
+    default_config,
+    raise_for_issues,
+    validate_config,
+)
 
-
-# User-level state directory name (config / snapshot / sessions all live under this directory in the
-# user home directory, i.e. ``~/.agent``).
-AGENT_DIRNAME = ".agent"
-# Default config file name (under ``.agent`` in the user home directory).
-DEFAULT_CONFIG_FILENAME = "config.yaml"
-# Environment variable: overrides the default config file path.
-CONFIG_PATH_ENV = "linteum_agent_CONFIG"
-# Tighten file permissions (0600) when these fields are present.
-_SECRET_FIELDS = ("api_key",)
-
-# Comment header written when creating a new config file, for easy manual editing.
 CONFIG_HEADER = """\
-# linteum_agent project config file (YAML)
+# linteum_agent configuration (YAML)
 #
-# llm:       the single LLM config; api_key / base_url may be left empty and fall back to
-#            environment variables via the provider
-#            (OPENAI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY, etc.).
-#            All LLM config must be normalizable by LLMConfig; multiple configs (llms) are not supported.
+# This file stores SEMI-PERMANENT settings only: model/credentials, gateway
+# limits, storage paths, logging and UI preferences.
 #
-# Supported providers: openai / openai_compatible / anthropic / deepseek / deepseek_compatible
-# Tip: this file may store an API Key; keep it in .gitignore, or use environment variables instead.
+# The workspace is NOT configured here. It is supplied per conversation when a
+# session is created (session.create {workspace}), so every conversation can
+# use a different directory.
+#
+# Multiple providers/models: agent.profiles + agent.default_profile, with an
+# optional agent.fallbacks chain for automatic failover.
+#
+# agent.llm.api_key may be a literal value (the file is then chmod 0600) or a
+# ${ENV_VAR} reference. Without it, the provider's default key variable is used
+# (OPENAI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY / ...).
+#
+# Edit this file directly, or use:
+#   linteum config list / get / set / unset / edit / validate
+# `linteum config edit` validates the file on save. Map/list values accept JSON,
+# e.g. linteum config set agent.profiles '{"fast": {...}}'.
 """
 
 
-def project_root() -> Path:
-    """Return the project root: the parent directory of the ``linteum_agent`` package.
-
-    Note: this is only the code repository / install location and is **no longer** the storage
-    location for user state (config / snapshots / sessions have all moved to :func:`agent_home`); it
-    is kept only for display and for migrating old locations.
-    """
-    return Path(__file__).resolve().parents[2]
-
-
-def agent_home() -> Path:
-    """User-level agent home directory: ``~/.agent``.
-
-    The config (``config.yaml``), CLI snapshot (``snapshot.json``), current-session pointer
-    (``current_session``), and user-level session copies (``sessions/``) all live here, and are no
-    longer written into the project repository / install directory.
-    """
-    return Path.home() / AGENT_DIRNAME
+def to_yaml(config: AppConfig) -> str:
+    """Serialize a config into YAML text (stable field order, UTF-8)."""
+    try:
+        return yaml.safe_dump(
+            app_to_dict(config),
+            allow_unicode=True,
+            sort_keys=False,
+            default_flow_style=False,
+        )
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"cannot serialize config: {exc}", key="",
+                          code="E_CONFIG_SERIALIZE") from exc
 
 
-def default_config_path() -> Path:
-    """Return the default config file path.
-
-    Priority: the environment variable ``linteum_agent_CONFIG`` > ``~/.agent/config.yaml``.
-
-    It defaults to the ``.agent`` directory (user-level state directory) under the user home
-    directory, alongside sessions / snapshots; generated on first use by ``linteum setup``.
-    """
-    override = os.getenv(CONFIG_PATH_ENV)
-    if override and override.strip():
-        return Path(override).expanduser()
-    return agent_home() / DEFAULT_CONFIG_FILENAME
+def default_config_yaml(config: Optional[AppConfig] = None) -> str:
+    """Return the comment header + serialized default config."""
+    return CONFIG_HEADER + to_yaml(config if config is not None else default_config())
 
 
-def to_yaml(config: Config) -> str:
-    """Serialize ``Config`` into YAML text (preserving field order and allowing non-ASCII)."""
-    return yaml.safe_dump(
-        config.to_dict(),
-        allow_unicode=True,
-        sort_keys=False,
-        default_flow_style=False,
-    )
+_SECRET_LEAVES = frozenset({"api_key", "password", "secret", "token"})
 
 
-def default_config_yaml(config: Config | None = None) -> str:
-    """Generate the default config file content: comment header + default config."""
-    return CONFIG_HEADER + to_yaml(config if config is not None else empty_config())
+def _has_literal_secret(config: AppConfig) -> bool:
+    """True when any profile/fallback contains a literal (non-``${VAR}``) secret."""
+
+    def walk(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                name = str(key)
+                if name.rsplit(".", 1)[-1] in _SECRET_LEAVES:
+                    if isinstance(item, str) and item and not (
+                        item.startswith("${") and item.endswith("}")
+                    ):
+                        return True
+                if walk(item):
+                    return True
+            return False
+        if isinstance(value, (list, tuple)):
+            return any(walk(item) for item in value)
+        return False
+
+    return walk(app_to_dict(config))
+
+
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Best-effort advisory lock; unavailable platforms degrade to a no-op."""
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+", encoding="utf-8")
+    locked = False
+    try:
+        try:
+            import fcntl  # type: ignore[import-not-found]
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+        except (ImportError, OSError):
+            locked = False
+        yield
+    finally:
+        if locked:
+            try:
+                import fcntl  # type: ignore[import-not-found]
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+        handle.close()
+
+
+def _atomic_write(path: Path, text: str, *, secret: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600 if secret else 0o644)
+        except OSError:
+            pass
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 class ConfigStore:
-    """The read/write entry point for the project config file (YAML).
+    """YAML file read/write with validation, backups and conflict detection."""
 
-    An instance is a combination of "config + path": after loading, the current config is accessible
-    via ``store.config``; after modifying, call ``store.save()`` to persist. All operations complete
-    within the same reentrant lock.
-    """
-
-    VERSION = CONFIG_VERSION
-
-    def __init__(self, path: str | Path | None = None, *, autoload: bool = False):
-        self._lock = RLock()
-        self.path = Path(path).expanduser() if path is not None else default_config_path()
-        self._config = empty_config()
-        self._loaded = False
-        if autoload:
-            self.load()
-
-    # ------------------------------------------------------------------
-    # Read/write
-    # ------------------------------------------------------------------
-
-    def exists(self, path: str | Path | None = None) -> bool:
-        """Whether the config file already exists."""
-        return self._target(path).is_file()
-
-    def load(
+    def __init__(
         self,
         path: str | Path | None = None,
         *,
-        create: bool = False,
-    ) -> Config:
-        """Read the config file and cache the result.
+        backup_count: int = 5,
+    ) -> None:
+        self.path = Path(path).expanduser() if path is not None else default_config_path()
+        self.backup_count = max(0, int(backup_count))
 
-        - File missing and ``create=True``: write the default config file first, then read and return;
-        - File missing and ``create=False``: return the in-memory default config without writing;
-        - Empty file: treated as the default config; parse failure / invalid content raises
-          ``ConfigError``.
+    # -- reads --------------------------------------------------------------
+    def exists(self) -> bool:
+        return self.path.is_file()
+
+    def revision(self) -> str:
+        """Content hash used for optimistic concurrency; ``""`` when missing."""
+        try:
+            data = self.path.read_bytes()
+        except OSError:
+            return ""
+        return hashlib.sha256(data).hexdigest()
+
+    def load_raw(self) -> dict:
+        """Return the raw YAML mapping (``{}`` when the file is missing/empty)."""
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            if isinstance(exc, FileNotFoundError):
+                return {}
+            raise ConfigError(f"cannot read config file {self.path}: {exc}",
+                              key="", code="E_CONFIG_IO") from exc
+        if not text.strip():
+            return {}
+        try:
+            raw = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"invalid YAML in {self.path}: {exc}",
+                              key="", code="E_CONFIG_PARSE") from exc
+        if raw is None:
+            return {}
+        if not isinstance(raw, Mapping):
+            raise ConfigError(f"config root in {self.path} must be a mapping",
+                              key="", code="E_CONFIG_PARSE")
+        return dict(raw)
+
+    def load(self, *, create: bool = False) -> AppConfig:
+        """Load and validate the config.
+
+        When the file is missing:
+
+        * ``create=True`` writes the default file first, then returns it;
+        * ``create=False`` returns the in-memory defaults without writing.
         """
-        with self._lock:
-            target = self._target(path)
-            if not target.is_file():
-                config = empty_config()
-                if create:
-                    self._write(target, config)
-                self._assign(target, config)
-                return config
-
-            config = self._read(target)
-            self._assign(target, config)
+        if not self.exists():
+            config = default_config()
+            if create:
+                self.save(config)
             return config
 
-    def reload(self) -> Config:
-        """Re-read the config from the current path."""
-        return self.load(self.path)
+        config = app_from_dict(self.load_raw())
+        issues = validate_config(config)
+        raise_for_issues(issues)
+        return config
 
+    # -- writes -------------------------------------------------------------
     def save(
         self,
-        config: Config | None = None,
-        path: str | Path | None = None,
-    ) -> Path:
-        """Write the config to a YAML file and return the actual written path.
+        config: AppConfig,
+        *,
+        expected_revision: Optional[str] = None,
+    ) -> str:
+        """Validate, then atomically replace the file; return the new revision."""
+        issues = validate_config(config)
+        raise_for_issues(issues)
 
-        When ``config`` is empty, write the currently cached config; when ``path`` is explicitly
-        passed, it takes precedence as the target path.
-        """
-        with self._lock:
-            target = self._target(path)
-            if config is None:
-                if self._loaded and target == self.path:
-                    config = self._config
-                else:
-                    config = self.load(target)
-            else:
-                config = self._coerce_config(config)
-            self._write(target, config)
-            self._assign(target, config)
-            return target
+        with _file_lock(self.path):
+            current = self.revision()
+            if expected_revision is not None and expected_revision != current:
+                raise ConfigError(
+                    "config changed since it was read; reload and retry",
+                    key="", code="E_CONFIG_CONFLICT",
+                    hint=f"current revision is {current or '<missing>'}",
+                )
+            if self.path.is_file():
+                self.backup()
+            _atomic_write(self.path, default_config_yaml(config),
+                          secret=_has_literal_secret(config))
+            return self.revision()
 
-    # ------------------------------------------------------------------
-    # Current config
-    # ------------------------------------------------------------------
-
-    @property
-    def config(self) -> Config:
-        """The current config; auto-loads when not yet loaded (uses the default config if the file is missing)."""
-        with self._lock:
-            if not self._loaded:
-                self.load()
-            return self._config
-
-    def set(self, config: Config) -> Config:
-        """Replace the current in-memory config (does not write to disk)."""
-        with self._lock:
-            self._config = self._coerce_config(config)
-            self._loaded = True
-            return self._config
-
-    # ------------------------------------------------------------------
-    # Convenience access
-    # ------------------------------------------------------------------
-
-    def llm(self) -> LLMConfig:
-        """Return the LLM in the config (``Config.llm``, already a ``LLMConfig``)."""
-        return self.config.llm
-
-    def set_llm(self, config: LLMConfig) -> Config:
-        """Write the (in-memory) LLM config; call ``save()`` when it needs to be persisted."""
-        return self.config.set_llm(config)
-
-    # ------------------------------------------------------------------
-    # Internal implementation
-    # ------------------------------------------------------------------
-
-    def _target(self, path: str | Path | None) -> Path:
-        """Normalize the target path: an explicit path takes precedence, otherwise use the current path."""
-        if path is None:
-            return self.path
-        return Path(path).expanduser()
-
-    def _assign(self, target: Path, config: Config) -> None:
-        """Record "current path + current config"."""
-        self.path = target
-        self._config = config
-        self._loaded = True
-
-    @staticmethod
-    def _coerce_config(config: Any) -> Config:
-        if isinstance(config, Config):
-            return config
-        if isinstance(config, dict):
-            return Config.from_dict(config)
-        raise ConfigError(f"config must be a Config or dict, got {type(config).__name__}")
-
-    @staticmethod
-    def _read(target: Path) -> Config:
+    def backup(self) -> Optional[Path]:
+        """Copy the current file to ``config.yaml.bak.<timestamp>``."""
+        if not self.path.is_file():
+            return None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = self.path.with_name(f"{self.path.name}.bak.{stamp}")
+        suffix = 1
+        while target.exists():
+            target = self.path.with_name(f"{self.path.name}.bak.{stamp}.{suffix}")
+            suffix += 1
         try:
-            raw = target.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ConfigError(f"failed to read config file: {target} ({exc})") from exc
+            shutil.copy2(self.path, target)
+        except OSError:
+            return None
+        self._prune_backups()
+        return target
 
-        if not raw.strip():
-            return empty_config()
-        try:
-            data = yaml.safe_load(raw)
-        except yaml.YAMLError as exc:
-            raise ConfigError(f"failed to parse YAML: {target} ({exc})") from exc
-        if data is None:
-            return empty_config()
-        if not isinstance(data, dict):
-            raise ConfigError(f"config file top level must be a mapping: {target}")
-        return Config.from_dict(data)
-
-    def _write(self, target: Path, config: Config) -> None:
-        """Atomic write: write a temp file in the same directory first, then ``os.replace`` the target.
-
-        File content = comment header (``CONFIG_HEADER``) + YAML body, for easy manual editing; the
-        YAML parser ignores comments.
-        """
-        target = target.expanduser()
-        text = CONFIG_HEADER + to_yaml(config)
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(text)
-            if _has_secret(config):
+    def _prune_backups(self) -> None:
+        if self.backup_count <= 0:
+            backups = sorted(self.path.parent.glob(f"{self.path.name}.bak.*"))
+            for item in backups:
                 try:
-                    os.chmod(tmp_name, 0o600)
-                except OSError:  # e.g. unsupported on Windows
+                    item.unlink()
+                except OSError:
                     pass
-            os.replace(tmp_name, target)
-        except BaseException:
+            return
+        backups = sorted(
+            self.path.parent.glob(f"{self.path.name}.bak.*"),
+            key=lambda item: item.stat().st_mtime if item.exists() else 0.0,
+        )
+        for item in backups[: max(0, len(backups) - self.backup_count)]:
             try:
-                os.unlink(tmp_name)
+                item.unlink()
             except OSError:
                 pass
-            raise
 
-    def __repr__(self) -> str:  # pragma: no cover - for debugging only
-        return f"ConfigStore(path={str(self.path)!r}, loaded={self._loaded})"
-
-
-def _has_secret(config: Config) -> bool:
-    """Whether the config contains an API key (used to tighten file permissions)."""
-    return any(getattr(config.llm, field, None) for field in _SECRET_FIELDS)
+    # -- convenience --------------------------------------------------------
+    def ensure(self) -> AppConfig:
+        """Create the default file if needed and return the loaded config."""
+        return self.load(create=True)
 
 
-# ----------------------------------------------------------------------
-# Default store and module-level convenience functions
-# ----------------------------------------------------------------------
-
-_default_store: ConfigStore | None = None
-_default_store_lock = RLock()
-
-
-def get_config_store(
-    path: str | Path | None = None,
-    *,
-    reload: bool = False,
-) -> ConfigStore:
-    """Return the process-level default ``ConfigStore``; passing ``path`` rebuilds it.
-
-    With ``reload=True`` the config file is re-read from the current path (effective when ``path`` is
-    not given).
-    """
-    global _default_store
-    with _default_store_lock:
-        if _default_store is None or path is not None:
-            _default_store = ConfigStore(path)
-        elif reload:
-            _default_store.reload()
-        return _default_store
-
-
-def set_config_store(store: ConfigStore) -> ConfigStore:
-    """Replace the process-level default ``ConfigStore`` (used in tests or when switching projects)."""
-    global _default_store
-    if not isinstance(store, ConfigStore):
-        raise ConfigError(f"store must be a ConfigStore, got {type(store).__name__}")
-    with _default_store_lock:
-        _default_store = store
-    return store
-
-
-def load_config(path: str | Path | None = None, *, create: bool = True) -> Config:
-    """Read the config (default ``~/.agent/config.yaml``; generates the default config file if missing)."""
-    return get_config_store(path).load(create=create)
-
-
-def save_config(config: Config, path: str | Path | None = None) -> Path:
-    """Write the config and return the actual written path."""
-    return get_config_store(path).save(config)
-
+__all__ = [
+    "AGENT_DIRNAME",
+    "CONFIG_HEADER",
+    "CONFIG_PATH_ENV",
+    "ConfigStore",
+    "DEFAULT_CONFIG_FILENAME",
+    "HOME_ENV",
+    "default_config_path",
+    "default_config_yaml",
+    "linteum_home",
+    "to_yaml",
+]

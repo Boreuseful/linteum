@@ -1,0 +1,43 @@
+[package]
+name = "linteum-tui"
+version = "0.2.0-alpha.1"
+edition = "2024"
+description = "Standalone Rust terminal client for linteum_agent"
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
+lru = "0.12"
+pulldown-cmark = "0.12"
+ratatui = "0.29"
+unicode-width = "0.2"
+serde_yaml_ng = "0.10"
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net", "fs"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Keep the workspace small enough for constrained CI containers.
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

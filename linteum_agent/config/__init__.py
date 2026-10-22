@@ -1,71 +1,146 @@
-"""Project config layer: reading and writing the config file (YAML), saved under the user home directory ``~/.agent`` by default.
+"""Semi-permanent configuration for ``linteum_agent``.
+
+The config layer is intentionally independent of the event bus and the Gateway:
+
+* :mod:`~linteum_agent.config.schema` — dataclasses, YAML round-trip, validation;
+* :mod:`~linteum_agent.config.meta` — :class:`FieldSpec` metadata for UIs;
+* :mod:`~linteum_agent.config.store` — atomic YAML reads/writes and backups;
+* :mod:`~linteum_agent.config.service` — source merging, sources, apply scopes;
+* :mod:`~linteum_agent.config.options` — :class:`SessionOptions` (per-conversation
+  workspace and profile; **not** stored in the config file).
 
 Quick start::
 
-    from linteum_agent.config import ConfigStore, LLMConfig
+    from linteum_agent.config import ConfigService, SessionOptions
 
-    store = ConfigStore()             # default -> ~/.agent/config.yaml
-    config = store.load(create=True)  # write the default config first if the file is missing, then read
+    service = ConfigService()                  # ~/.linteum/config.yaml
+    service.ensure()                           # write defaults on first use
+    effective = service.effective()            # defaults < file < env < overrides
+    service.set("agent.llm.model", "deepseek-chat")
 
-    config.set_llm(LLMConfig(provider="openai", model="gpt-4o-mini", api_key="sk-xxx"))
-    store.save()
+    options = SessionOptions(workspace="/path/to/project", session_id="s-01")
 
-    store.llm().model          # 'gpt-4o-mini' (the only LLM, normalized to LLMConfig)
-
-Module layout:
-
-- ``schema``: the ``Config`` data model and (de)serialization / validation of the LLM config;
-- ``store``: ``ConfigStore`` handles YAML file read/write, plus the module-level
-  ``load_config`` / ``save_config`` / ``get_config_store`` convenience functions.
-
-The config can directly use OpenAI / Anthropic / OpenAI-compatible endpoints (including DeepSeek,
-etc.); ``api_key`` and ``base_url`` are both optional (when omitted, the provider falls back to
-environment variables).
-
-There is only one ``llm`` section in the config file: all LLM config must first be normalized to
-``LLMConfig`` (``llm_from_dict`` + ``validate_llm_config``) before it can be loaded; the ``llms``
-style of "multiple configs fetched by name" is not supported (that key raises an error directly).
+The workspace is a session-level parameter: every conversation can point at a
+different directory, so it is deliberately absent from ``AppConfig``.
 """
 
-from .schema import (CONFIG_VERSION, DEFAULT_MODEL, DEFAULT_PROVIDER,
-                     SUPPORTED_OPENAI_MODES, SUPPORTED_PROVIDERS, Config,
-                     ConfigError, LLMConfig, default_llm_config,
-                     empty_config, llm_from_dict, llm_to_dict,
-                     validate_llm_config)
-from .store import (AGENT_DIRNAME, CONFIG_HEADER, CONFIG_PATH_ENV,
-                    DEFAULT_CONFIG_FILENAME, ConfigStore, agent_home,
-                    default_config_path, default_config_yaml, get_config_store,
-                    load_config, project_root, save_config, set_config_store,
-                    to_yaml)
+from ..runtime.llm.config import LLMConfig
+from ..runtime.observability.config import LogConfig
+from .meta import (
+    FieldSpec,
+    apply_scope,
+    build_schema,
+    coerce_value,
+    field_specs,
+    get_spec,
+)
+from .options import SessionOptions
+from .schema import (
+    CONFIG_VERSION,
+    DEFAULT_HOME,
+    DEFAULT_MODEL,
+    DEFAULT_PROVIDER,
+    AgentSettings,
+    AppConfig,
+    BackpressureSettings,
+    BudgetSettings,
+    CheckpointSettings,
+    ConfigError,
+    ContextSettings,
+    DeltaSettings,
+    GatewayLimits,
+    GatewaySettings,
+    HistorySettings,
+    Issue,
+    SessionSettings,
+    SkillsSettings,
+    StorageSettings,
+    ToolSettings,
+    UiSettings,
+    WebSocketSettings,
+    app_from_dict,
+    app_to_dict,
+    default_config,
+    raise_for_issues,
+    validate_config,
+)
+from .service import (
+    ENV_PREFIX,
+    ApplyResult,
+    ChangeSet,
+    ConfigChange,
+    ConfigService,
+    ConfigValue,
+    EffectiveConfig,
+    env_var_for,
+)
+from .paths import (
+    AGENT_DIRNAME,
+    CONFIG_PATH_ENV,
+    DEFAULT_CONFIG_FILENAME,
+    HOME_ENV,
+    default_config_path,
+    linteum_home,
+)
+from .store import ConfigStore, default_config_yaml, to_yaml
 
 __all__ = [
-    # Data model
-    "Config",
-    "ConfigError",
-    "LLMConfig",
+    # schema
     "CONFIG_VERSION",
+    "DEFAULT_HOME",
     "DEFAULT_MODEL",
     "DEFAULT_PROVIDER",
-    "SUPPORTED_PROVIDERS",
-    "SUPPORTED_OPENAI_MODES",
-    "default_llm_config",
-    "empty_config",
-    "llm_from_dict",
-    "llm_to_dict",
-    "validate_llm_config",
-    # File read/write
-    "ConfigStore",
+    "AgentSettings",
+    "AppConfig",
+    "BackpressureSettings",
+    "BudgetSettings",
+    "CheckpointSettings",
+    "ConfigError",
+    "ContextSettings",
+    "DeltaSettings",
+    "GatewayLimits",
+    "GatewaySettings",
+    "HistorySettings",
+    "Issue",
+    "LLMConfig",
+    "LogConfig",
+    "SessionSettings",
+    "SkillsSettings",
+    "StorageSettings",
+    "ToolSettings",
+    "UiSettings",
+    "WebSocketSettings",
+    "app_from_dict",
+    "app_to_dict",
+    "default_config",
+    "raise_for_issues",
+    "validate_config",
+    # metadata
+    "FieldSpec",
+    "apply_scope",
+    "build_schema",
+    "coerce_value",
+    "field_specs",
+    "get_spec",
+    # store
     "AGENT_DIRNAME",
-    "CONFIG_HEADER",
     "CONFIG_PATH_ENV",
     "DEFAULT_CONFIG_FILENAME",
-    "agent_home",
+    "HOME_ENV",
+    "ConfigStore",
     "default_config_path",
     "default_config_yaml",
-    "get_config_store",
-    "load_config",
-    "project_root",
-    "save_config",
-    "set_config_store",
+    "linteum_home",
     "to_yaml",
+    # service
+    "ENV_PREFIX",
+    "ApplyResult",
+    "ChangeSet",
+    "ConfigChange",
+    "ConfigService",
+    "ConfigValue",
+    "EffectiveConfig",
+    "env_var_for",
+    # per-session options
+    "SessionOptions",
 ]

@@ -6,8 +6,12 @@ wheels/
 *.egg-info
 
 test/
+docs/
 .agent
 .vscode
 .venv
+.kilo
 
 config.yaml
+
+docs/
