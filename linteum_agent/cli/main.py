@@ -56,7 +56,7 @@ def _version() -> str:
     try:
         return package_version("linteum")
     except PackageNotFoundError:  # source tree without an installed distribution
-        return "0.0.0"
+        return "0.2.0-alpha.1"
 
 
 def _parser() -> argparse.ArgumentParser:

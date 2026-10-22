@@ -1,6 +1,6 @@
 [package]
 name = "linteum-tui"
-version = "0.0.0"
+version = "0.2.0-alpha.1"
 edition = "2024"
 description = "Standalone Rust terminal client for linteum_agent"
 license = "MIT"
