@@ -579,6 +579,8 @@ class GatewayServer:
             return {"pong": True, "ts": time.time()}
         if command.name == "session.create":
             return await self._session_create(connection, command)
+        if command.name == "mode.list":
+            return await self._mode_list()
         if command.name == "session.list":
             return await self._session_list(command)
         if command.name == "session.children":
@@ -656,6 +658,7 @@ class GatewayServer:
                 workspace=args["workspace"],
                 session_id=args.get("session_id"),
                 profile=args.get("profile") or self._current_config().agent.default_profile,
+                mode=args.get("mode"),
                 title=args.get("title"),
                 metadata=dict(args.get("metadata") or {}),
             )
@@ -686,6 +689,31 @@ class GatewayServer:
             },
             "snapshot": gateway.snapshot(),
             "warnings": list(handle.warnings),
+        }
+
+    async def _mode_list(self) -> dict:
+        catalog = await self.host.mode_catalog()
+        modes = await self.host.list_modes()
+        return {
+            "modes": [
+                {
+                    "id": mode.id,
+                    "name": mode.name,
+                    "description": mode.description,
+                    "source": mode.source_id,
+                    "builtin": mode.builtin,
+                    "default": mode.default,
+                }
+                for mode in modes
+            ],
+            "invalid": [
+                {
+                    **issue.to_dict(),
+                    "id": f"{issue.source_id}/{issue.name}",
+                }
+                for issue in catalog.invalid
+            ],
+            "warnings": list(catalog.warnings),
         }
 
     async def _session_list(self, command: Command) -> dict:

@@ -15,6 +15,7 @@ pub fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         Line::from("F5 reconnect · F6 subagents"),
         Line::from("Ctrl+N new session · Ctrl+P palette · Ctrl+R reasoning · Ctrl+G resume"),
         Line::from("Ctrl+Q quit · Esc close overlay"),
+        Line::from("/mode · /mode status · /mode <name-or-id>"),
         Line::from(""),
         Line::from(ratatui::text::Span::styled(
             "All actions are available in the command palette.",

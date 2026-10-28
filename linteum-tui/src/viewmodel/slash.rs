@@ -74,6 +74,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         action: UiAction::SidebarRefresh,
     },
     SlashCommand {
+        id: "mode",
+        label: "Session mode",
+        description: "Switch or inspect the session mode",
+        action: UiAction::OpenModePicker,
+    },
+    SlashCommand {
         id: "exit",
         label: "Exit session",
         description: "Leave this session",

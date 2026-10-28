@@ -226,6 +226,7 @@ pub async fn run_loop<T: TerminalOps>(
         .clone()
         .or_else(|| config.python.default_profile.clone())
         .unwrap_or_else(|| "default".to_owned());
+    app.state.new_session.mode = config.default_mode.clone().unwrap_or_default();
     for warning in &config.warnings {
         app.state.activity.push("config", warning.clone());
     }
@@ -287,6 +288,7 @@ pub async fn run_loop<T: TerminalOps>(
                         Event::Paste(text) => match app.state.overlay {
                             Some(Overlay::NewSession) => app.state.new_session.insert_str(&text),
                             Some(Overlay::Palette) => app.state.palette.insert_str(&text),
+                            Some(Overlay::Mode) => app.state.mode.picker.insert_str(&text),
                             Some(_) => {}
                             None if app.state.focus == Focus::Composer => {
                                 let _ = reduce(&mut app.state, Input::Paste(text));
@@ -482,6 +484,45 @@ fn overlay_effects(state: &mut TuiState, key: crossterm::event::KeyEvent) -> Opt
                 Vec::new()
             }
             KeyCode::Char('r') => reduce(state, Input::Action(UiAction::ReloadSubagentContext)),
+            _ => Vec::new(),
+        }),
+        Overlay::Mode => Some(match key.code {
+            KeyCode::Enter => reduce(state, Input::Action(UiAction::ModeSelect)),
+            KeyCode::Down => reduce(state, Input::Action(UiAction::ModeSelectNext)),
+            KeyCode::Up => reduce(state, Input::Action(UiAction::ModeSelectPrevious)),
+            KeyCode::Char('r') => reduce(state, Input::Action(UiAction::ModeRefresh)),
+            KeyCode::Esc => reduce(state, Input::Action(UiAction::CloseOverlay)),
+            KeyCode::Left => {
+                state.mode.picker.move_left();
+                Vec::new()
+            }
+            KeyCode::Right => {
+                state.mode.picker.move_right();
+                Vec::new()
+            }
+            KeyCode::Home => {
+                state.mode.picker.move_home();
+                Vec::new()
+            }
+            KeyCode::End => {
+                state.mode.picker.move_end();
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                state.mode.picker.backspace();
+                Vec::new()
+            }
+            KeyCode::Delete => {
+                state.mode.picker.delete();
+                Vec::new()
+            }
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                state.mode.picker.insert_char(ch);
+                Vec::new()
+            }
             _ => Vec::new(),
         }),
         Overlay::Fatal => Some(match key.code {

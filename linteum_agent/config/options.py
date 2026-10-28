@@ -22,6 +22,7 @@ from .schema import ConfigError
 
 _SESSION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _PROFILE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_MODE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _MAX_TITLE = 512
 
 
@@ -38,6 +39,7 @@ class SessionOptions:
     workspace: Path | str
     session_id: Optional[str] = None
     profile: str = "default"
+    mode: Optional[str] = None
     title: Optional[str] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -69,6 +71,13 @@ class SessionOptions:
                 code="E_SESSION_PROFILE",
                 hint="use 1-64 characters from [A-Za-z0-9._-]",
             )
+        if self.mode is not None and not _MODE.match(self.mode):
+            raise ConfigError(
+                f"invalid mode name: {self.mode!r}",
+                key="mode",
+                code="E_SESSION_MODE",
+                hint="use 1-64 characters from [a-z0-9._-], starting with a letter or digit",
+            )
         if self.title is not None:
             if not isinstance(self.title, str) or not self.title.strip():
                 raise ConfigError("title must be a non-empty string",
@@ -92,6 +101,7 @@ class SessionOptions:
             "session_id": self.session_id,
             "workspace": str(self.workspace),
             "profile": self.profile,
+            "mode": self.mode,
             "title": self.title,
             "metadata": dict(self.metadata),
         }

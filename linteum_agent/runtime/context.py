@@ -134,22 +134,34 @@ class ContextBuilder(Protocol):
 class PassthroughContextBuilder:
     """Minimal builder: state messages in, provider messages + digest out.
 
-    ``system_blocks`` are host-owned, already-rendered system messages (for
-    example the skills L0 index).  They are prepended on every build and are
-    therefore part of the deterministic ``context.digest``; they never enter
-    ``AgentState.messages``.
+    ``system_prompt`` is the mode body (when one is bound); ``system_blocks``
+    are host-owned, already-rendered system messages (the environment block
+    and the skills L0 index).  They are prepended in that order on every build
+    and are therefore part of the deterministic ``context.digest``; they never
+    enter ``AgentState.messages``.
     """
 
-    def __init__(self, *, system_blocks: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        system_prompt: Optional[str] = None,
+        system_blocks: Sequence[str] = (),
+    ) -> None:
+        self.system_prompt = system_prompt
         self.system_blocks = (
             (system_blocks,) if isinstance(system_blocks, str)
             else tuple(system_blocks)
         )
 
     async def build(self, state, *, ev=None, tools: Sequence = ()) -> ContextPlan:
-        messages: list = [
-            {"role": "system", "content": block} for block in self.system_blocks
-        ]
+        messages: list = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.extend(
+            {"role": "system", "content": block}
+            for block in self.system_blocks
+            if block
+        )
         messages.extend(self._normalise(m) for m in state.messages)
         tools_tuple = tuple(tools)
         digest = self.digest(tuple(messages), tools_tuple)
@@ -192,7 +204,9 @@ class CompactingContextBuilder(PassthroughContextBuilder):
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
         messages.extend(
-            {"role": "system", "content": block} for block in self.system_blocks
+            {"role": "system", "content": block}
+            for block in self.system_blocks
+            if block
         )
         records = {
             int(record["from_index"]): record

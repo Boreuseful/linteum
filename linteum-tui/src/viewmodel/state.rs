@@ -15,6 +15,7 @@ use super::approvals::ApprovalState;
 use super::artifacts::ArtifactViewerState;
 use super::cursor::SessionCursor;
 use super::edit;
+use super::modes::ModeState;
 use super::queue::QueueState;
 use super::sessions::{NewSessionForm, SessionPickerState};
 use super::sidebar::SidebarState;
@@ -171,6 +172,7 @@ pub enum Overlay {
     Subagents,
     SubagentContext,
     Palette,
+    Mode,
     Fatal,
 }
 
@@ -286,6 +288,7 @@ pub struct TuiState {
     pub drafts: std::collections::HashMap<String, String>,
     pub artifact: Option<ArtifactViewerState>,
     pub subagents: SubagentsState,
+    pub mode: ModeState,
     pub features: Vec<String>,
     pub overlay: Option<Overlay>,
     pub focus: Focus,
@@ -340,6 +343,7 @@ impl TuiState {
 
         match frame.frame.as_str() {
             "snapshot" => apply_snapshot(self, frame, replay),
+            "mode" => super::modes::apply_frame(self, &frame.payload),
             "user.message" => apply_user_message(self, frame),
             "assistant.started" => apply_assistant_started(self, frame, replay),
             "assistant.delta" => apply_assistant_delta(self, frame, false),
@@ -450,6 +454,7 @@ fn apply_snapshot(state: &mut TuiState, frame: &Frame, replay: bool) {
     if let Some(error) = payload.get("last_error") {
         state.last_error = serde_json::from_value(error.clone()).ok();
     }
+    super::modes::apply_snapshot(state, payload);
     state.connection = if replay {
         ConnectionState::Replaying
     } else {

@@ -84,6 +84,7 @@ KNOWN_TYPES: frozenset = frozenset(
         "system.budget.exceeded",
         "system.provider.degraded",
         "system.provider.quarantined",
+        "system.mode.changed",
         # §7.2 context & storage domain
         "context.assembled",
         "context.compaction.requested",
