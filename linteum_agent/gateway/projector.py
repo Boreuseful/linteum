@@ -343,6 +343,11 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
 
     elif etype in ("tool.call.completed", "tool.call.failed"):
         call_id = payload.get("call_id")
+        # A terminal for a call that has already left ``pending`` belongs to a
+        # round the reducer closed: either an interrupt voided the result
+        # (§16.3) or this is a duplicate.  It must not reopen a thinking round,
+        # because the reducer will never publish the event that closes it again.
+        was_pending = call_id is not None and call_id in pending
         ok = etype == "tool.call.completed" and bool(payload.get("ok", True))
         output = payload.get("output")
         if payload.get("output_ref"):
@@ -368,8 +373,9 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         approvals.pop(call_id, None)
         if not ok:
             last_error = _as_error_info(payload)
-        # Every branch done -> the reducer asks the model again.
-        phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
+        if was_pending:
+            # Every branch done -> the reducer asks the model again.
+            phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
 
     # -- approval domain --------------------------------------------------
     elif etype == "approval.required":
