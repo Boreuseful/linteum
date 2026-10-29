@@ -51,6 +51,37 @@ fn precedence_cli_over_env_over_tui_over_python() {
 }
 
 #[test]
+fn cli_mode_is_resolved_as_the_default_session_mode() {
+    let dir = tempdir().unwrap();
+    let resolved = resolve(cli(&["--mode", "builtin/code"]), &env(dir.path())).unwrap();
+    assert_eq!(resolved.default_mode.as_deref(), Some("builtin/code"));
+}
+
+#[test]
+fn tui_default_mode_is_used_when_cli_is_absent() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("tui.toml"),
+        "[session]\ndefault_mode = \"review\"\n",
+    )
+    .unwrap();
+    let resolved = resolve(cli(&[]), &env(dir.path())).unwrap();
+    assert_eq!(resolved.default_mode.as_deref(), Some("review"));
+}
+
+#[test]
+fn cli_mode_wins_over_the_tui_default_mode() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("tui.toml"),
+        "[session]\ndefault_mode = \"review\"\n",
+    )
+    .unwrap();
+    let resolved = resolve(cli(&["--mode", "code"]), &env(dir.path())).unwrap();
+    assert_eq!(resolved.default_mode.as_deref(), Some("code"));
+}
+
+#[test]
 fn attach_rejects_config_and_no_lease() {
     let dir = tempdir().unwrap();
     let error = resolve(

@@ -17,6 +17,7 @@ Two structural properties fall out of this shape:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import Optional, Sequence
 
@@ -32,6 +33,17 @@ from .state.checkpoint import Checkpointer
 #: written into ``content`` (so it survives into the provider context) and paired
 #: with an ``interrupted`` flag host UIs can read.
 INTERRUPT_TAG = "[interrupted by user]"
+
+#: Sentinel for ``rebind`` arguments whose ``None`` is a meaningful value.
+_UNSET = object()
+
+
+class AgentBusy(RuntimeError):
+    """The reducer surface cannot be replaced in the current phase."""
+
+    def __init__(self, message: str = "agent is busy", *, phase=None) -> None:
+        super().__init__(message)
+        self.phase = phase
 
 
 def _tag_interrupt(content) -> str:
@@ -146,6 +158,64 @@ class Agent:
         for unsubscribe in self._unsubs:
             unsubscribe()
         self._unsubs.clear()
+
+    async def rebind(
+        self,
+        *,
+        ctx_builder: Optional[ContextBuilder] = None,
+        context_policy=_UNSET,
+        schemas=_UNSET,
+        subagent_tools: Optional[frozenset[str]] = None,
+        commit=None,
+    ) -> None:
+        """Replace the host-owned surface under the reducer lock (§10.2).
+
+        Only ``idle`` sessions with no pending call, approval, compaction or
+        interrupt may be rebound.  ``commit`` runs *before* the swap so a
+        metadata/registry failure leaves the old surface intact.
+        """
+        async with self._reducer_lock:
+            if (
+                self.state.phase != phases.IDLE
+                or self.state.pending
+                or self.state.pending_compaction is not None
+                or self.state.interrupt_pending
+            ):
+                raise AgentBusy(
+                    f"cannot rebind while phase={self.state.phase!r}",
+                    phase=self.state.phase,
+                )
+
+            new_builder = (
+                ctx_builder if ctx_builder is not None else self.ctx_builder
+            )
+            new_policy = (
+                self.context_policy
+                if context_policy is _UNSET else context_policy
+            )
+            if (
+                new_policy is not None
+                and getattr(new_policy, "enabled", False)
+                and not hasattr(new_builder, "next_compaction")
+            ):
+                raise ValueError(
+                    "context_policy requires a ContextBuilder with "
+                    "next_compaction()"
+                )
+
+            if commit is not None:
+                result = commit()
+                if inspect.isawaitable(result):
+                    await result
+
+            self.ctx_builder = new_builder
+            self.context_policy = new_policy
+            if schemas is not _UNSET:
+                self._schemas_provider = schemas
+                if schemas is None:
+                    self._static_schemas = ()
+            if subagent_tools is not None:
+                self._subagent_tools = frozenset(subagent_tools)
 
     def close(self) -> None:
         """Release the bus subscriptions (alias of :meth:`unsubscribe`)."""

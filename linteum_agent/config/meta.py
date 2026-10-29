@@ -41,6 +41,7 @@ SECTION_TITLES: dict[str, str] = {
     "agent.skills": "Skills",
     "agent.budget": "预算",
     "agent.session": "会话默认值",
+    "agent.modes": "模式",
     "gateway": "网关",
     "gateway.websocket": "WebSocket",
     "gateway.limits": "网关限制",
@@ -62,6 +63,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "agent.skills",
     "agent.budget",
     "agent.session",
+    "agent.modes",
     "gateway",
     "gateway.websocket",
     "gateway.limits",
@@ -272,6 +274,23 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "title": "空闲回收 ms",
         "type": "int",
         "minimum": 0,
+    },
+    # -- agent.modes ----------------------------------------------------
+    "agent.modes.default": {
+        "title": "默认模式",
+        "description": "session.create 未指定 mode 时使用；模式来源仅 builtin/plugin。",
+    },
+    "agent.modes.max_mode_bytes": {
+        "title": "单模式文件上限 bytes",
+        "type": "int",
+        "minimum": 512,
+        "maximum": 1048576,
+    },
+    "agent.modes.max_modes": {
+        "title": "插件模式上限",
+        "type": "int",
+        "minimum": 1,
+        "maximum": 1024,
     },
     # -- gateway --------------------------------------------------------
     "gateway.transport": {

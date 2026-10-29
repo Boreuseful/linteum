@@ -48,6 +48,7 @@ FEATURES: tuple = (
     "history",
     "subagents",
     "context",
+    "modes",
 )
 
 #: Commands a client may send (§5.2).  Anything else is ``E_UNKNOWN_COMMAND``.
@@ -68,6 +69,8 @@ KNOWN_COMMANDS: frozenset = frozenset(
         "history.read",
         "artifact.read",
         "session.context",
+        "mode.list",
+        "session.mode.set",
         "ping",
     }
 )
@@ -84,6 +87,7 @@ CONTROL_FRAMES: frozenset = frozenset(
 _SESSION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _TRACE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _PROFILE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_MODE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +281,17 @@ def validate_command(cmd: "Command") -> None:
     if cmd.name == "session.context":
         if command_session_id(cmd) is None:
             raise _bad("session.context requires session_id")
+        return
+
+    if cmd.name == "mode.list":
+        return
+
+    if cmd.name == "session.mode.set":
+        if command_session_id(cmd) is None:
+            raise _bad("session.mode.set requires session_id")
+        mode = _string(args, "mode", required=True)
+        if mode is None or not _MODE.match(mode):
+            raise _bad("invalid mode name", mode=mode)
         return
 
     if cmd.name == "artifact.read":

@@ -12,7 +12,7 @@ use super::overlays::{
     render_subagents,
 };
 use super::palette;
-use super::screens::{render_fatal, render_new_session, render_picker};
+use super::screens::{render_fatal, render_mode_picker, render_new_session, render_picker};
 use super::strings;
 use super::theme::Theme;
 use super::widgets::{
@@ -126,6 +126,10 @@ pub fn render(frame: &mut Frame, state: &TuiState, theme: &Theme) {
                 let lines = palette::palette_lines(state, theme);
                 render_lines(area, frame.buffer_mut(), &lines);
                 cursor = palette::palette_cursor(area, state);
+            }
+            Overlay::Mode => {
+                render_mode_picker(area, frame.buffer_mut(), state, theme);
+                cursor = None;
             }
             Overlay::Fatal => {
                 render_fatal(area, frame.buffer_mut(), state, theme);

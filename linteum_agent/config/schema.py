@@ -216,6 +216,22 @@ class SessionSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ModeSettings:
+    """Mode binding policy (semi-permanent).
+
+    Mode sources are builtin + enabled plugins only; there are deliberately no
+    user/project/extra directories (design §6.2).
+    """
+
+    #: Name used when ``session.create`` omits ``mode``.
+    default: str = "standard"
+    #: Maximum bytes per mode file (frontmatter + body).
+    max_mode_bytes: int = 64 * 1024
+    #: Maximum admitted plugin modes (built-ins excluded).
+    max_modes: int = 128
+
+
+@dataclass(frozen=True, slots=True)
 class AgentSettings:
     """Everything that shapes an Agent, except the per-session workspace.
 
@@ -241,6 +257,7 @@ class AgentSettings:
     subagents: SubagentSettings = field(default_factory=SubagentSettings)
     budget: BudgetSettings = field(default_factory=BudgetSettings)
     session: SessionSettings = field(default_factory=SessionSettings)
+    modes: ModeSettings = field(default_factory=ModeSettings)
 
     def profile(self, name: Optional[str] = None) -> LLMConfig:
         """Resolve a profile name; ``"default"`` maps to :attr:`llm`."""
@@ -635,6 +652,7 @@ def _issue(issues: list[Issue], key: str, code: str, message: str,
 
 
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_MODE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -898,6 +916,18 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
     if session.idle_ttl_ms < 0:
         _issue(issues, "agent.session.idle_ttl_ms", "E_CONFIG_RANGE", "must be >= 0")
 
+    # -- agent.modes ----------------------------------------------------
+    modes = config.agent.modes
+    if not isinstance(modes.default, str) or not _MODE_NAME.match(modes.default):
+        _issue(issues, "agent.modes.default", "E_CONFIG_MODE_NAME",
+               f"invalid default mode name {modes.default!r}")
+    if not 512 <= modes.max_mode_bytes <= 1024 * 1024:
+        _issue(issues, "agent.modes.max_mode_bytes", "E_CONFIG_RANGE",
+               "must be within [512, 1048576]")
+    if not 1 <= modes.max_modes <= 1024:
+        _issue(issues, "agent.modes.max_modes", "E_CONFIG_RANGE",
+               "must be within [1, 1024]")
+
     # -- gateway --------------------------------------------------------
     gateway = config.gateway
     if gateway.transport not in ("auto", "inproc", "stdio", "websocket"):
@@ -979,6 +1009,7 @@ __all__ = [
     "GatewaySettings",
     "HistorySettings",
     "Issue",
+    "ModeSettings",
     "SessionSettings",
     "SkillsSettings",
     "StorageSettings",

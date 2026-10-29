@@ -247,6 +247,7 @@ class AgentClient:
         *,
         session_id: Optional[str] = None,
         profile: Optional[str] = None,
+        mode: Optional[str] = None,
         title: Optional[str] = None,
         metadata: Optional[Mapping] = None,
     ) -> dict:
@@ -255,11 +256,23 @@ class AgentClient:
             args["session_id"] = session_id
         if profile is not None:
             args["profile"] = profile
+        if mode is not None:
+            args["mode"] = mode
         if title is not None:
             args["title"] = title
         if metadata is not None:
             args["metadata"] = dict(metadata)
         return await self.command("session.create", args)
+
+    async def list_modes(self) -> dict:
+        return await self.command("mode.list", {})
+
+    async def set_mode(self, session_id: str, mode: str) -> dict:
+        return await self.command(
+            "session.mode.set",
+            {"session_id": session_id, "mode": mode},
+            session_id=session_id,
+        )
 
     async def list_sessions(self, *, limit: int = 50, offset: int = 0,
                             workspace: Optional[str] = None) -> dict:

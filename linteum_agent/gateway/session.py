@@ -25,16 +25,18 @@ import base64
 import contextlib
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Optional
 
 from ..bus.event import Event
+from ..config.schema import ConfigError
 from ..runtime.state import phases
 from .errors import (
     E_APPROVAL_GONE,
     E_BAD_FRAME,
     E_BUSY,
     E_INTERNAL,
+    E_MODE_BUSY,
     E_PROTOCOL,
     E_SESSION_LOCKED,
     E_SESSION_NOT_FOUND,
@@ -218,6 +220,10 @@ class SessionGateway:
                 self._unsub = None
             raise
 
+        if state.mode is None:
+            seeded = await self._seed_initial_mode()
+            if seeded is not None:
+                state = replace(state, mode=seeded)
         self._state = state
         self._expected = (events[-1].seq + 1) if events else 1
         self._started = True
@@ -228,6 +234,36 @@ class SessionGateway:
         if not self.read_only or self.follow:
             self._pump_task = asyncio.create_task(self._pump())
         return self
+
+    async def _seed_initial_mode(self) -> Optional[dict]:
+        """Seed the initial mode before any ``system.mode.changed`` event."""
+        lookup = getattr(self.host, "session", None)
+        handle = lookup(self.session_id) if callable(lookup) else None
+        if handle is not None and getattr(handle, "mode", None) is not None:
+            return {
+                "name": handle.mode.name,
+                "source": handle.mode.source_id,
+                "digest": handle.mode.digest,
+                "from": None,
+                "refresh": False,
+            }
+        get_info = getattr(self.host, "get_session_info", None)
+        if not callable(get_info):
+            return None
+        info = await get_info(self.session_id)
+        if info is None:
+            return None
+        metadata = dict(info.metadata or {})
+        name = metadata.get("mode")
+        if not name:
+            return None
+        return {
+            "name": name,
+            "source": metadata.get("mode_source"),
+            "digest": metadata.get("mode_digest"),
+            "from": None,
+            "refresh": False,
+        }
 
     async def close(self) -> None:
         if self._closed:
@@ -462,6 +498,7 @@ class SessionGateway:
         """Route one validated command; returns the ``result`` payload."""
         if self.read_only and cmd.name in (
             "user.message", "user.interrupt", "agent.resume",
+            "session.mode.set",
         ):
             raise GatewayError(
                 E_SESSION_LOCKED,
@@ -509,6 +546,8 @@ class SessionGateway:
                     )
                 )
                 return _receipt(committed)
+            if cmd.name == "session.mode.set":
+                return await self._mode_set(cmd, connection)
             if cmd.name == "session.subscribe":
                 return await self._subscribe(cmd, connection)
             if cmd.name == "session.unsubscribe":
@@ -679,6 +718,59 @@ class SessionGateway:
             })
 
     # -- approval --------------------------------------------------------
+    async def _mode_set(self, cmd: Command, connection: "ClientConnection") -> dict:
+        """Switch the session mode while its gateway queue is idle."""
+        mode = cmd.args.get("mode")
+        current = self.host.session(self.session_id)
+        before_digest = (
+            current.mode_binding.digest
+            if current is not None and current.mode_binding is not None
+            else ""
+        )
+        async with self._input_lock:
+            busy = (
+                self._state.phase != phases.IDLE
+                or bool(self._input_queue)
+                or self._published_input_pending
+            )
+        if busy:
+            raise GatewayError(
+                E_MODE_BUSY,
+                "session is busy; wait for the current round to finish",
+                location=LOCATION_SESSION,
+                retryable=True,
+            )
+        try:
+            handle = await self.host.set_mode(
+                self.session_id, mode, trace_id=cmd.trace_id,
+            )
+        except ConfigError as exc:
+            raise GatewayError(
+                exc.code, str(exc),
+                location=LOCATION_SESSION,
+                retryable=exc.code == "E_MODE_BUSY",
+                context={"key": exc.key},
+            ) from exc
+        binding = handle.mode_binding
+        if binding is None:
+            raise GatewayError(
+                E_INTERNAL, "session has no mode binding",
+                location=LOCATION_SESSION,
+            )
+        return {
+            "session_id": self.session_id,
+            "changed": binding.digest != before_digest,
+            "mode": {
+                "id": f"{binding.resolution.source_id}/{binding.resolution.name}",
+                "name": binding.resolution.name,
+                "source": binding.resolution.source_id,
+                "digest": binding.digest,
+                "tools": len(binding.resolution.tool_specs),
+                "skills": len(binding.resolution.filtered_skills),
+            },
+            "warnings": list(handle.warnings),
+        }
+
     async def _approval_decide(self, cmd: Command, connection: "ClientConnection") -> dict:
         call_id = cmd.args["call_id"]
         raw_decision = cmd.args["decision"]

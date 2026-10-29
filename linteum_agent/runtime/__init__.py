@@ -11,6 +11,8 @@ Layers, bottom-up:
 * :mod:`linteum_agent.runtime.agent` — the pure, event-driven :class:`Agent` reducer.
 * :mod:`linteum_agent.runtime.host` — :class:`AgentHost`: storage/bus/LLM/tools
   assembly, one agent per session, restore and pending-approval recovery.
+* :mod:`linteum_agent.runtime.modes` — session-scoped mode definitions, catalog,
+  selector resolution and prompt/environment rendering.
 * :mod:`linteum_agent.runtime.interrupt` — trips the LLM cancel token on ``user.interrupt``.
 * :mod:`linteum_agent.runtime.tools` — ToolSpec / ToolRegistry / ToolRuntime / Sandbox.
 * :mod:`linteum_agent.runtime.llm` — canonical types, provider adapters (OpenAI /
@@ -30,6 +32,7 @@ __all__ = [
     "context",
     "compaction",
     "interrupt",
+    "modes",
     "tools",
     "llm",
     "errors",

@@ -37,6 +37,11 @@ from ..config.schema import ConfigError, default_config
 from ..config.service import ConfigService
 from ..config.store import ConfigStore
 from ..runtime.llm.config import PROVIDER_DEFAULTS
+from ..runtime.modes.catalog import load_mode_catalog
+from ..runtime.modes.errors import ModeError
+from ..runtime.modes.model import ModeLimits, ModePackage
+from ..runtime.modes.parsing import read_mode_package
+from ..runtime.modes.source import BuiltinModeSource
 from ..gateway.client import AgentClient, ClientError, ConnectionClosed
 from ..gateway.leases import FileLeaseManager
 from ..gateway.protocol import Frame
@@ -89,6 +94,8 @@ def _parser() -> argparse.ArgumentParser:
                       help="resume an existing session id")
     chat.add_argument("-p", "--profile", default=None,
                       help="agent profile from agent.profiles")
+    chat.add_argument("--mode", default=None,
+                      help="mode name for the new session")
     chat.add_argument("--config", default=None, help="explicit config.yaml path")
     chat.add_argument("--no-lease", action="store_true",
                       help="disable the cross-process single-writer lease")
@@ -96,6 +103,18 @@ def _parser() -> argparse.ArgumentParser:
                       help="print reasoning deltas")
     chat.add_argument("--timeout", type=float, default=None,
                       help="one-shot timeout in seconds (default: none)")
+
+    mode = sub.add_parser("mode", help="inspect mode definitions")
+    mode_sub = mode.add_subparsers(dest="mode_command", required=True)
+    mode_list = mode_sub.add_parser("list", help="list available builtin modes")
+    mode_list.add_argument("--config", default=None, help="explicit config.yaml path")
+    mode_show = mode_sub.add_parser("show", help="show one mode definition")
+    mode_show.add_argument("name")
+    mode_show.add_argument("--config", default=None, help="explicit config.yaml path")
+    mode_validate = mode_sub.add_parser("validate", help="validate one mode file")
+    mode_validate.add_argument("path")
+    mode_validate.add_argument("--config", default=None,
+                               help="explicit config.yaml path")
 
     sessions = sub.add_parser("sessions", help="list sessions in the catalogue")
     sessions.add_argument("--config", default=None, help="explicit config.yaml path")
@@ -414,6 +433,10 @@ class _Renderer:
                 self.print(f"[notice] {kind}")
         elif name == "compaction.applied":
             self.print("[context compacted]")
+        elif name == "mode":
+            self.print(
+                f"[mode] {payload.get('name')} [{payload.get('source')}]"
+            )
         elif name == "history.page":
             self.print(f"[history] {len(payload.get('frames') or [])} frame(s), "
                        f"next_seq={payload.get('next_seq')}")
@@ -496,6 +519,7 @@ async def _chat(args) -> int:
         await client.connect()
         created = await client.create_session(
             str(workspace), session_id=session_id, profile=args.profile,
+            mode=args.mode,
         )
         session_id = created["session"]["session_id"]
         await client.subscribe(session_id, after_seq=0)
@@ -548,6 +572,9 @@ commands:
   /interrupt [reason]           interrupt the current round
   /resume                       resume a paused session
   /history [limit]              read recent history
+  /mode                         list available modes
+  /mode <name>                  switch the session mode (must be idle)
+  /mode status                  show the current mode
   /session                      print the current session id
   /quit                         exit
 anything else is sent as a user message.
@@ -599,12 +626,112 @@ async def _repl(client: AgentClient, renderer: _Renderer, session_id: str) -> No
                 parts = line.split(maxsplit=1)
                 limit = int(parts[1]) if len(parts) > 1 else 30
                 await client.history(session_id, after_seq=0, limit=limit)
+            elif line.startswith("/mode"):
+                parts = line.split()
+                if len(parts) == 1:
+                    result = await client.list_modes()
+                    for item in result.get("modes") or []:
+                        marker = " (default)" if item.get("default") else ""
+                        renderer.print(
+                            f"{item.get('name')} [{item.get('source')}]"
+                            f"{marker} — {item.get('description') or ''}"
+                        )
+                elif parts[1] == "status":
+                    result = await client.command(
+                        "session.get", {"session_id": session_id},
+                        session_id=session_id,
+                    )
+                    mode = (result.get("snapshot") or {}).get("mode")
+                    if mode:
+                        renderer.print(
+                            f"{mode.get('name')} [{mode.get('source')}] "
+                            f"{mode.get('digest') or ''}"
+                        )
+                    else:
+                        renderer.print("no mode in snapshot")
+                else:
+                    result = await client.set_mode(session_id, parts[1])
+                    mode = result.get("mode") or {}
+                    renderer.print(
+                        f"[mode] {mode.get('name')} [{mode.get('source')}] "
+                        f"changed={result.get('changed')}"
+                    )
+                    for warning in result.get("warnings") or []:
+                        renderer.print(f"[mode warning] {warning}")
             elif line.startswith("/"):
                 renderer.print("unknown command; /help for the list")
             else:
                 await client.send_message(session_id, line)
         except ClientError as exc:
             renderer.print(f"[error] {exc.code}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# modes
+# ---------------------------------------------------------------------------
+
+def _run_mode(args) -> int:
+    service = _build_service(args.config)
+    cfg = service.effective(strict=False).config
+    limits = ModeLimits(
+        max_mode_bytes=cfg.agent.modes.max_mode_bytes,
+        max_modes=cfg.agent.modes.max_modes,
+    )
+    if args.mode_command == "validate":
+        path = Path(args.path).expanduser()
+        package = ModePackage(
+            name=path.stem, path=path,
+            source_id="plugin:validate", priority=400,
+        )
+        try:
+            definition = read_mode_package(package, limits)
+        except ModeError as exc:
+            print(f"{exc.code}: {exc}")
+            return 1
+        print(f"ok: {definition.name} ({definition.source_id})")
+        return 0
+
+    catalog = asyncio.run(load_mode_catalog(
+        (BuiltinModeSource(),), limits=limits,
+    ))
+    if args.mode_command == "list":
+        for name in sorted(catalog.entries):
+            entry = catalog.entries[name]
+            marker = " (default)" if name == cfg.agent.modes.default else ""
+            print(
+                f"{name}{marker}\t{entry.source_id}\t"
+                f"{entry.definition.description}"
+            )
+        return 0
+
+    entry = catalog.get(args.name)
+    if entry is None:
+        print(f"mode not found: {args.name}")
+        return 1
+    definition = entry.definition
+    print(f"name: {definition.name}")
+    print(f"source: {entry.source_id}")
+    print(f"description: {definition.description}")
+    print(f"extends: {definition.extends or '-'}")
+    print(f"prompt_mode: {definition.prompt_mode}")
+    print(
+        "tools.include: "
+        + (
+            "all" if definition.tools.include is None
+            else str(list(definition.tools.include))
+        )
+    )
+    print(f"tools.exclude: {list(definition.tools.exclude)}")
+    print(f"skills.enabled: {definition.skills.enabled}")
+    print(
+        "skills.include: "
+        + (
+            "all" if definition.skills.include is None
+            else str(list(definition.skills.include))
+        )
+    )
+    print(f"skills.exclude: {list(definition.skills.exclude)}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1144,6 +1271,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return asyncio.run(_sessions(args))
         if args.command == "config":
             return _run_config(args)
+        if args.command == "mode":
+            return _run_mode(args)
         if args.command == "setup":
             return _run_setup(args)
     except KeyboardInterrupt:

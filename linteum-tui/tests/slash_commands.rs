@@ -31,7 +31,7 @@ fn slash_menu_filters_by_id_and_label() {
     }
     assert_eq!(ids("q"), vec!["quit"]);
     assert_eq!(ids("EXIT"), vec!["exit"]);
-    assert_eq!(ids("session"), vec!["exit"]);
+    assert_eq!(ids("session"), vec!["mode", "exit"]);
     assert!(ids("zzz").is_empty());
     assert_eq!(slash::selected("/", 0).unwrap().id, "files");
     assert_eq!(slash::selected("/q", 99).unwrap().id, "quit");

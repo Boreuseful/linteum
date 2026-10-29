@@ -6,6 +6,7 @@ pub mod approvals;
 pub mod artifacts;
 pub mod cursor;
 pub mod edit;
+pub mod modes;
 pub mod notices;
 pub mod queue;
 pub mod sessions;
@@ -18,6 +19,7 @@ pub mod transcript;
 pub use approvals::{ApprovalDecision, ApprovalState};
 pub use artifacts::{ArtifactError, ArtifactViewerState};
 pub use cursor::SessionCursor;
+pub use modes::{CurrentMode, ModeOption, ModePickerState, ModeState, ModeSwitchResult};
 pub use queue::{QueueEntryState, QueueState, QueuedMessage};
 pub use sessions::{NewSessionForm, SessionInfo, SessionPickerState};
 pub use sidebar::{SidebarLayout, SidebarPanel, SidebarState, TreeRow, WorkspaceEntry};
@@ -83,6 +85,11 @@ pub enum UiAction {
     NewSession,
     OpenPalette,
     OpenHelp,
+    OpenModePicker,
+    ModeSelectNext,
+    ModeSelectPrevious,
+    ModeSelect,
+    ModeRefresh,
     Resume,
     Quit,
     ExitSession,
@@ -288,6 +295,17 @@ fn reduce_action(state: &mut TuiState, action: UiAction) -> Vec<Effect> {
             state.overlay = Some(Overlay::Help);
             Vec::new()
         }
+        UiAction::OpenModePicker => modes::open_picker(state),
+        UiAction::ModeSelectNext => {
+            modes::move_selection(state, 1);
+            Vec::new()
+        }
+        UiAction::ModeSelectPrevious => {
+            modes::move_selection(state, -1);
+            Vec::new()
+        }
+        UiAction::ModeSelect => modes::select_current(state),
+        UiAction::ModeRefresh => modes::refresh(state),
         UiAction::RetryConnection => vec![Effect::ReconnectNow],
         UiAction::Resume => {
             if state.session.as_ref().map(|s| s.phase.as_str()) == Some("paused") {
@@ -547,11 +565,7 @@ fn submit_new_session(state: &mut TuiState) -> Vec<Effect> {
             Value::String(state.new_session.profile.clone()),
         );
     }
-    vec![Effect::SendCommand(CommandSpec {
-        name: "session.create".to_owned(),
-        args,
-        session_id: None,
-    })]
+    modes::submit_create(state, args)
 }
 
 fn session_list_effect(state: &TuiState, offset: usize) -> Vec<Effect> {
@@ -597,7 +611,13 @@ fn unsubscribe_effect(session_id: &str) -> Effect {
 
 fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Effect> {
     let mut effects = Vec::new();
+    let mut mode_effects = Vec::new();
     if result.ok {
+        if result.result.get("modes").is_some() {
+            mode_effects.extend(modes::apply_list(state, &result.result));
+        } else if result.result.get("mode").is_some() && result.result.get("changed").is_some() {
+            mode_effects.extend(modes::apply_set_result(state, &result.result));
+        }
         if let Some(context) = result.result.get("context") {
             state.subagents.apply_context_result(context);
         }
@@ -633,6 +653,9 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
         }
     }
     if let Some(error) = &result.error {
+        if error.code.starts_with("E_MODE_") || error.code == "E_SESSION_SUBAGENT" {
+            modes::apply_error(state, &error.code, &error.message);
+        }
         if state.subagents.loading.take().is_some() {
             state.subagents.error = Some(format!("{}: {}", error.code, error.message));
         }
@@ -678,6 +701,7 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
     if let Some(text) = restored {
         state.composer.text = text;
     }
+    effects.extend(mode_effects);
     effects
 }
 
@@ -945,6 +969,9 @@ fn exit_session(state: &mut TuiState) -> Vec<Effect> {
 }
 
 fn execute_slash_command(state: &mut TuiState) -> Vec<Effect> {
+    if let Some(effects) = modes::execute_slash(state) {
+        return effects;
+    }
     let Some(command) = slash::selected(&state.composer.text, state.slash.selected) else {
         let input = state.composer.text.clone();
         state.composer.text.clear();
