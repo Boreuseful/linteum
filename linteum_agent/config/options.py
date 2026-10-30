@@ -64,6 +64,17 @@ class SessionOptions:
                 code="E_SESSION_ID",
                 hint="use 1-128 characters from [A-Za-z0-9._:-]",
             )
+        if self.session_id is not None and (
+            self.session_id == "host" or self.session_id.startswith("host:")
+        ):
+            # ``host:<uuid>`` is the reserved plugin-lifecycle partition (§9.2).
+            raise ConfigError(
+                f"session_id {self.session_id!r} is reserved for plugin "
+                "lifecycle events",
+                key="session_id",
+                code="E_SESSION_ID",
+                hint="choose a session id that does not start with 'host:'",
+            )
         if not _PROFILE.match(self.profile):
             raise ConfigError(
                 f"invalid profile name: {self.profile!r}",

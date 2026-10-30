@@ -267,6 +267,9 @@ class AgentClient:
     async def list_modes(self) -> dict:
         return await self.command("mode.list", {})
 
+    async def list_plugins(self) -> dict:
+        return await self.command("plugin.list", {})
+
     async def set_mode(self, session_id: str, mode: str) -> dict:
         return await self.command(
             "session.mode.set",

@@ -232,6 +232,30 @@ class ModeSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class PluginSettings:
+    """Third-party capability plugins (plugin-design §10.1).
+
+    ``allow`` is the explicit authorization boundary: an empty tuple means
+    "discover for diagnostics, but import no plugin code".  Every value takes
+    effect on restart (``apply_scope = restart``).
+    """
+
+    enabled: bool = True
+    #: Container directories; each immediate child may be a plugin root.
+    dirs: tuple[str, ...] = field(
+        default_factory=lambda: (str(linteum_home() / "plugins"),)
+    )
+    #: Explicit allowlist of plugin ids.  Empty = load no third-party code.
+    allow: tuple[str, ...] = ()
+    max_plugins: int = 64
+    max_tools_per_plugin: int = 64
+    max_manifest_bytes: int = 64 * 1024
+    load_timeout_ms: int = 10_000
+    drain_grace_ms: int = 5_000
+    unload_timeout_ms: int = 5_000
+
+
+@dataclass(frozen=True, slots=True)
 class AgentSettings:
     """Everything that shapes an Agent, except the per-session workspace.
 
@@ -258,6 +282,7 @@ class AgentSettings:
     budget: BudgetSettings = field(default_factory=BudgetSettings)
     session: SessionSettings = field(default_factory=SessionSettings)
     modes: ModeSettings = field(default_factory=ModeSettings)
+    plugins: PluginSettings = field(default_factory=PluginSettings)
 
     def profile(self, name: Optional[str] = None) -> LLMConfig:
         """Resolve a profile name; ``"default"`` maps to :attr:`llm`."""
@@ -653,6 +678,7 @@ def _issue(issues: list[Issue], key: str, code: str, message: str,
 
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _MODE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_PLUGIN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -928,6 +954,44 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
         _issue(issues, "agent.modes.max_modes", "E_CONFIG_RANGE",
                "must be within [1, 1024]")
 
+    # -- agent.plugins ---------------------------------------------------
+    plugins = config.agent.plugins
+    for index, path in enumerate(plugins.dirs):
+        if not isinstance(path, str) or not path.strip():
+            _issue(issues, f"agent.plugins.dirs.{index}", "E_CONFIG_RANGE",
+                   "must be a non-empty string")
+        elif "\x00" in path:
+            _issue(issues, f"agent.plugins.dirs.{index}", "E_CONFIG_RANGE",
+                   "must not contain NUL")
+    seen_plugins: set[str] = set()
+    for index, plugin_id in enumerate(plugins.allow):
+        if not isinstance(plugin_id, str) or not _PLUGIN_ID.match(plugin_id):
+            _issue(issues, f"agent.plugins.allow.{index}", "E_CONFIG_PLUGIN_ID",
+                   f"invalid plugin id {plugin_id!r}")
+            continue
+        if plugin_id in seen_plugins:
+            _issue(issues, f"agent.plugins.allow.{index}", "E_CONFIG_RANGE",
+                   f"duplicate plugin id {plugin_id!r}")
+        seen_plugins.add(plugin_id)
+    if plugins.max_plugins <= 0:
+        _issue(issues, "agent.plugins.max_plugins", "E_CONFIG_RANGE",
+               "must be > 0")
+    if plugins.max_tools_per_plugin <= 0:
+        _issue(issues, "agent.plugins.max_tools_per_plugin", "E_CONFIG_RANGE",
+               "must be > 0")
+    if not 1024 <= plugins.max_manifest_bytes <= 1024 * 1024:
+        _issue(issues, "agent.plugins.max_manifest_bytes", "E_CONFIG_RANGE",
+               "must be within [1024, 1048576]")
+    if plugins.load_timeout_ms <= 0:
+        _issue(issues, "agent.plugins.load_timeout_ms", "E_CONFIG_RANGE",
+               "must be > 0")
+    if plugins.drain_grace_ms < 0:
+        _issue(issues, "agent.plugins.drain_grace_ms", "E_CONFIG_RANGE",
+               "must be >= 0")
+    if plugins.unload_timeout_ms <= 0:
+        _issue(issues, "agent.plugins.unload_timeout_ms", "E_CONFIG_RANGE",
+               "must be > 0")
+
     # -- gateway --------------------------------------------------------
     gateway = config.gateway
     if gateway.transport not in ("auto", "inproc", "stdio", "websocket"):
@@ -1010,6 +1074,7 @@ __all__ = [
     "HistorySettings",
     "Issue",
     "ModeSettings",
+    "PluginSettings",
     "SessionSettings",
     "SkillsSettings",
     "StorageSettings",

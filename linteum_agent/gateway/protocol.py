@@ -49,6 +49,7 @@ FEATURES: tuple = (
     "subagents",
     "context",
     "modes",
+    "plugins",
 )
 
 #: Commands a client may send (§5.2).  Anything else is ``E_UNKNOWN_COMMAND``.
@@ -71,6 +72,7 @@ KNOWN_COMMANDS: frozenset = frozenset(
         "session.context",
         "mode.list",
         "session.mode.set",
+        "plugin.list",
         "ping",
     }
 )
@@ -103,6 +105,10 @@ def _bad(message: str, **context: Any) -> GatewayError:
 def validate_session_id(session_id: Any) -> str:
     if not isinstance(session_id, str) or not _SESSION_ID.match(session_id):
         raise _bad("invalid session_id", session_id=session_id)
+    if session_id == "host" or session_id.startswith("host:"):
+        # Reserved for the per-process plugin lifecycle partition (§9.2).
+        raise _bad("session_id is reserved for plugin lifecycle events",
+                   session_id=session_id)
     return session_id
 
 
@@ -284,6 +290,13 @@ def validate_command(cmd: "Command") -> None:
         return
 
     if cmd.name == "mode.list":
+        return
+
+    if cmd.name == "plugin.list":
+        # Management stays host-side; the gateway exposes a read-only listing
+        # with no session and no extra arguments (D12 / §11.2).
+        if cmd.session_id is not None or cmd.args:
+            raise _bad("plugin.list takes no session_id or arguments")
         return
 
     if cmd.name == "session.mode.set":

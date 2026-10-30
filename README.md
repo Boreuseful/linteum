@@ -227,6 +227,35 @@ allows only `default_model_profile`. Children cannot spawn further children, are
 hidden from `session.list` unless `include_subagents=true`, and share the root
 session's lease.
 
+### Capability plugins
+
+A plugin is a directory containing `plugin.yaml` under one of
+`agent.plugins.dirs` (default `~/.linteum/plugins`). It can provide tools
+(`capabilities.tools` + a Python `entry`), skill directories
+(`capabilities.skills`) and mode files (`capabilities.modes`). Nothing is
+imported until its id is listed in `agent.plugins.allow`:
+
+```yaml
+agent:
+  plugins:
+    dirs: ["~/.linteum/plugins"]
+    allow: ["acme.search"]
+```
+
+```bash
+linteum plugin list                 # discover/validate without importing code
+linteum plugin show acme.search
+linteum plugin validate ~/.linteum/plugins/acme-search
+```
+
+> **Trust:** in-process plugin tools run with the host's full privileges. Only
+> enable plugins you trust as much as the host itself. Plugins that provide only
+> skills/modes do not execute code.
+
+Plugin loads take effect for new sessions or after `session.mode.set`; they do
+not mutate an already-open tool table. Unloading quiesces new calls, waits for
+in-flight calls (`agent.plugins.drain_grace_ms`), then revokes the tools.
+
 Other sections and limits (`agent.skills` caps, `gateway.limits`,
 `gateway.delta`, `gateway.history`, `gateway.backpressure`,
 `storage.checkpoints`, `logging` rotation) are documented in the generated

@@ -218,6 +218,32 @@ Subagent 默认关闭。设置 `agent.subagents.enabled: true` 后，根会话�
 `default_model_profile`。子会话不能再派生，默认不出现在 `session.list` 中
 （需 `include_subagents=true`），并与根会话共用租约。
 
+### 能力插件
+
+插件是 `agent.plugins.dirs`（默认 `~/.linteum/plugins`）下包含 `plugin.yaml`
+的目录，可提供工具（`capabilities.tools` + Python `entry`）、技能目录
+（`capabilities.skills`）和模式文件（`capabilities.modes`）。只有列入
+`agent.plugins.allow` 的插件才会被 import：
+
+```yaml
+agent:
+  plugins:
+    dirs: ["~/.linteum/plugins"]
+    allow: ["acme.search"]
+```
+
+```bash
+linteum plugin list                 # 只发现/校验，不 import 代码
+linteum plugin show acme.search
+linteum plugin validate ~/.linteum/plugins/acme-search
+```
+
+> **信任边界：** 进程内插件工具拥有宿主权限，只应启用与宿主同等可信的插件。
+> 仅提供 skills/modes 的插件不执行代码。
+
+插件加载对新会话或 `session.mode.set` 后的工具表生效，不会静默修改已开会话；
+卸载会先停止新调用、等待在飞调用（`agent.plugins.drain_grace_ms`）再撤销工具。
+
 其他配置段与限制（`agent.skills` 的各项上限、`gateway.limits`、
 `gateway.delta`、`gateway.history`、`gateway.backpressure`、
 `storage.checkpoints`、`logging` 轮转）会在生成的模板中说明。

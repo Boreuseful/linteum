@@ -71,8 +71,11 @@ from .modes.model import (
     ModeSummary,
 )
 from .modes.selection import resolve_mode
-from .modes.source import BuiltinModeSource
+from .modes.source import BuiltinModeSource, PluginModeSource
 from .observability.run_logger import RunLogger
+from .plugins.host import PluginHost
+from .plugins.model import PluginLimits, PluginSummary
+from .plugins.sources import PluginSkillSource
 from .skills.catalog import build_catalog, filter_catalog, load_catalog
 from .skills.model import SkillCatalog, SkillLimits
 from .skills.source import (
@@ -89,6 +92,7 @@ from .skills.tools import make_skill_tools
 from .state import phases
 from .state.agent_state import Budget
 from .tools.approval import ApprovalGate
+from .tools.errors import ToolUnavailable, UnknownTool
 from .tools.registry import ToolRegistry
 from .tools.results import InMemoryResultStore
 from .tools.runtime import DEFAULT_INLINE_LIMIT, ToolRuntime
@@ -120,6 +124,12 @@ _RESERVED_MODE_METADATA = frozenset({
     "mode_tools_count",
     "mode_skills_count",
 })
+
+#: Plugin inventory keys written by the host; clients cannot forge them (§14.3).
+_RESERVED_PLUGIN_METADATA = frozenset({"plugins_digest", "plugins_count"})
+
+#: Host-owned session metadata (mode + plugin inventory).
+_RESERVED_METADATA = _RESERVED_MODE_METADATA | _RESERVED_PLUGIN_METADATA
 
 
 @runtime_checkable
@@ -267,6 +277,27 @@ class AgentHost:
         # dispatch loop starts.  It degrades to stderr if the configured path
         # is unwritable and never raises into the bus.
         self.run_logger = RunLogger.attach(self.bus, cfg.logging)
+
+        # -- capability plugins (host-side; no bus subscription) -------------
+        plugins_cfg = cfg.agent.plugins
+        self.plugins = PluginHost(
+            self.bus,
+            dirs=[Path(item).expanduser() for item in plugins_cfg.dirs],
+            allow=tuple(plugins_cfg.allow),
+            limits=PluginLimits(
+                max_plugins=plugins_cfg.max_plugins,
+                max_tools_per_plugin=plugins_cfg.max_tools_per_plugin,
+                max_manifest_bytes=plugins_cfg.max_manifest_bytes,
+                load_timeout_ms=plugins_cfg.load_timeout_ms,
+                drain_grace_ms=plugins_cfg.drain_grace_ms,
+                unload_timeout_ms=plugins_cfg.unload_timeout_ms,
+            ),
+            enabled=plugins_cfg.enabled,
+            reserved_tool_names=self._reserved_tool_names(cfg),
+            on_drain=self._drain_plugin_tools,
+            log=self._log,
+        )
+        self._started = False
 
         # -- effect layers (one subscriber per capability) ------------------
         self.cancel_registry = CancelRegistry()
@@ -435,22 +466,77 @@ class AgentHost:
         ), None
 
     # -- modes --------------------------------------------------------------
-    def _mode_sources(self) -> tuple[ModeSource, ...]:
-        return (BuiltinModeSource(), *self._extra_mode_sources)
+    def _mode_sources(self, cfg: Optional[AppConfig] = None) -> tuple[ModeSource, ...]:
+        cfg = cfg or self._current_config()
+        sources: list[ModeSource] = [BuiltinModeSource()]
+        if self.plugins.enabled:
+            sources.append(PluginModeSource(self.plugins))
+        sources.extend(self._extra_mode_sources)
+        return tuple(sources)
 
     async def _build_mode_catalog(self, cfg: AppConfig) -> ModeCatalog:
         limits = ModeLimits(
             max_mode_bytes=cfg.agent.modes.max_mode_bytes,
             max_modes=cfg.agent.modes.max_modes,
         )
-        return await load_mode_catalog(self._mode_sources(), limits=limits)
+        return await load_mode_catalog(self._mode_sources(cfg), limits=limits)
+
+    @staticmethod
+    def _reserved_tool_names(cfg: AppConfig) -> frozenset[str]:
+        """Host-owned tool names a plugin may never provide (§5.6)."""
+        return frozenset({
+            "read_file", "write_file", "edit_file", "list_dir", "bash",
+            "load_skill", "read_skill_resource",
+            cfg.agent.subagents.tool_name,
+        })
 
     def _base_tools(self, workspace: Workspace) -> list:
         cfg = self._tool_factory_cfg
         return [
             *make_file_tools(workspace),
             make_bash_tool(workspace, timeout=cfg.agent.tools.bash_timeout),
+            *self.plugins.tool_specs(),
         ]
+
+    async def _drain_plugin_tools(
+        self, plugin_id: str, names: tuple[str, ...], grace_ms: int,
+    ) -> int:
+        """Mark/quiesce plugin tools in every live registry, then drain (§8.5).
+
+        Returns the total number of still-running calls across registries.
+        Owner filtering is defensive: a quiescing plugin keeps its names until
+        it is fully revoked, so ``owned`` should equal ``names``.
+        """
+        remaining = 0
+        for session_id, handle in list(self._handles.items()):
+            registry = handle.registry
+            owned: list[str] = []
+            for name in names:
+                try:
+                    spec = registry.spec(name)
+                except (UnknownTool, ToolUnavailable):
+                    continue
+                if spec.plugin_id != plugin_id:
+                    self._log({
+                        "kind": "plugin",
+                        "level": "warning",
+                        "msg": f"plugin.tool_owner_mismatch: {name!r} in "
+                               f"session {session_id!r} belongs to "
+                               f"{spec.plugin_id!r}",
+                        "ts": time.time(),
+                        "session_id": session_id,
+                    })
+                    continue
+                owned.append(name)
+            if not owned:
+                continue
+            registry.mark_draining(owned)
+            pending = await self.tool_runtime.drain(
+                owned, timeout=max(0.0, grace_ms / 1000.0),
+            )
+            remaining += pending
+            await registry.unregister_many(owned)
+        return remaining
 
     @staticmethod
     def _mode_summary(
@@ -856,6 +942,8 @@ class AgentHost:
                 workspace.root / settings.project_dir,
                 SOURCE_PROJECT, PRIORITY_PROJECT, missing_ok=True,
             ))
+        if self.plugins.enabled:
+            sources.append(PluginSkillSource(self.plugins))
         return tuple(sources)
 
     async def _build_skill_catalog(
@@ -893,11 +981,7 @@ class AgentHost:
         )
 
     def _make_tools(self, workspace: Workspace) -> list:
-        cfg = self._tool_factory_cfg
-        specs = [
-            *make_file_tools(workspace),
-            make_bash_tool(workspace, timeout=cfg.agent.tools.bash_timeout),
-        ]
+        specs = [*self._base_tools(workspace)]
         catalog = (
             self._active_skill_catalogs.get(workspace.session_id)
             or self._skill_catalogs.get(workspace.session_id)
@@ -920,9 +1004,13 @@ class AgentHost:
 
     # -- lifecycle ----------------------------------------------------------
     async def start(self) -> "AgentHost":
-        """Start the bus dispatch loop and the lease heartbeat (idempotent)."""
+        """Start the bus dispatch loop, plugins and the lease heartbeat (idempotent)."""
         if self._bus_task is None:
             self._bus_task = asyncio.create_task(self.bus.run())
+        if not self._started:
+            # Plugins load before any session can be opened (§13.1).
+            await self.plugins.start()
+            self._started = True
         if self.lease_manager is not None and self._heartbeat_task is None:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         return self
@@ -974,6 +1062,8 @@ class AgentHost:
             await self.orchestrator.close()
         for session_id in list(self._handles):
             self.close_session(session_id)
+        # Plugins unload while the bus can still carry lifecycle events (§13.5).
+        await self.plugins.close()
         self.bus.stop()
         await self.bus.close()
         task, self._bus_task = self._bus_task, None
@@ -1046,7 +1136,7 @@ class AgentHost:
                 user_metadata = {
                     key: value
                     for key, value in dict(options.metadata).items()
-                    if key not in _RESERVED_MODE_METADATA
+                    if key not in _RESERVED_METADATA
                 }
                 metadata = {
                     **user_metadata,
@@ -1201,7 +1291,7 @@ class AgentHost:
             mode_catalog = await self._build_mode_catalog(cfg)
             metadata = dict(info.metadata or {})
             if created_here:
-                for key in _RESERVED_MODE_METADATA:
+                for key in _RESERVED_METADATA:
                     metadata.pop(key, None)
                 persisted_mode = None
                 snapshot = None
@@ -1307,6 +1397,14 @@ class AgentHost:
                             f"{current_digest[:12] or 'none'}); the new snapshot is used")
             metadata["skills_digest"] = current_digest
             metadata["skills_count"] = len(catalog)
+            plugins_digest = self.plugins.inventory_digest()
+            stored_plugins = metadata.get("plugins_digest")
+            if stored_plugins is not None and stored_plugins != plugins_digest:
+                warnings = (*warnings,
+                            "plugin.inventory_changed: active plugins differ "
+                            "from the session snapshot; the current set is used")
+            metadata["plugins_digest"] = plugins_digest
+            metadata["plugins_count"] = len(self.plugins.inventory())
             snapshot_ref = await self._mode_metadata(
                 info.session_id, resolution, cfg, metadata,
             )
@@ -1618,7 +1716,26 @@ class AgentHost:
             if inherit_skills and parent_active is not None:
                 self._active_skill_catalogs[child_id] = parent_active
 
-            available = {spec.name: spec for spec in self._make_tools(workspace)}
+            # D15: a child inherits the parent's live, mode-filtered tool table
+            # (including plugin tools), minus the reserved spawn name.  Rebuilding
+            # from ``_make_tools`` would bypass the parent's mode selection.
+            # Builtin file/bash specs are re-bound to the child workspace so a
+            # read-only child still cannot write through the parent's closure.
+            child_builtins = {
+                spec.name: spec for spec in (
+                    *make_file_tools(workspace),
+                    make_bash_tool(
+                        workspace, timeout=cfg.agent.tools.bash_timeout,
+                    ),
+                )
+            }
+            parent_registry = parent.registry
+            available = {}
+            for name in parent_registry.names():
+                if name == spawn_name or not parent_registry.has(name):
+                    continue
+                spec = parent_registry.spec(name)
+                available[name] = child_builtins.get(name, spec)
             selected = []
             for name in tools:
                 if name == spawn_name:
@@ -1760,6 +1877,30 @@ class AgentHost:
     async def get_session_info(self, session_id: str) -> Optional[SessionInfo]:
         return await self.service.get_session(session_id)
 
+    # -- plugins ------------------------------------------------------------
+    async def list_plugins(self) -> list[PluginSummary]:
+        """Read-only plugin listing; never imports or changes plugin state."""
+        return self.plugins.summaries()
+
+    def plugin_warnings(self) -> tuple[str, ...]:
+        """Discovery-level warnings (allow entries not found, duplicates…)."""
+        return self.plugins.catalog_warnings()
+
+    async def refresh_plugins(self) -> list[PluginSummary]:
+        """Re-scan plugin containers without importing or touching active plugins."""
+        await self.plugins.refresh()
+        return self.plugins.summaries()
+
+    async def load_plugin(self, plugin_id: str) -> PluginSummary:
+        """Load an allowed plugin for this process (host API only, D12)."""
+        return await self.plugins.load(plugin_id)
+
+    async def unload_plugin(
+        self, plugin_id: str, *, grace_ms: Optional[int] = None,
+    ) -> PluginSummary:
+        """Quiesce, drain and revoke an active plugin (§8.5)."""
+        return await self.plugins.unload(plugin_id, grace_ms=grace_ms)
+
     async def history(self, session_id: str, *, include_inflight: bool = True) -> list[dict]:
         return await self.service.history(
             session_id, include_inflight=include_inflight
@@ -1776,6 +1917,7 @@ class AgentHost:
 __all__ = [
     "AgentHost",
     "LeaseManager",
+    "PluginSummary",
     "SessionHandle",
     "SessionLocked",
     "SessionNotFound",

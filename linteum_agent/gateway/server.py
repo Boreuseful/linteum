@@ -581,6 +581,8 @@ class GatewayServer:
             return await self._session_create(connection, command)
         if command.name == "mode.list":
             return await self._mode_list()
+        if command.name == "plugin.list":
+            return await self._plugin_list()
         if command.name == "session.list":
             return await self._session_list(command)
         if command.name == "session.children":
@@ -714,6 +716,37 @@ class GatewayServer:
                 for issue in catalog.invalid
             ],
             "warnings": list(catalog.warnings),
+        }
+
+    async def _plugin_list(self) -> dict:
+        summaries = await self.host.list_plugins()
+        plugins = []
+        invalid = []
+        for summary in summaries:
+            if summary.state == "invalid":
+                error = summary.error or {}
+                invalid.append({
+                    "source": summary.source,
+                    "code": error.get("code", "E_PLUGIN_MANIFEST"),
+                    "error": error.get("message", ""),
+                })
+                continue
+            plugins.append({
+                "id": summary.id,
+                "version": summary.version,
+                "state": summary.state,
+                "trust": summary.trust,
+                "description": summary.description,
+                "source": summary.source,
+                "tools": list(summary.tools),
+                "skills": list(summary.skills),
+                "modes": list(summary.modes),
+                "digest": summary.digest,
+            })
+        return {
+            "plugins": plugins,
+            "invalid": invalid,
+            "warnings": list(self.host.plugin_warnings()),
         }
 
     async def _session_list(self, command: Command) -> dict:

@@ -42,6 +42,7 @@ SECTION_TITLES: dict[str, str] = {
     "agent.budget": "预算",
     "agent.session": "会话默认值",
     "agent.modes": "模式",
+    "agent.plugins": "插件",
     "gateway": "网关",
     "gateway.websocket": "WebSocket",
     "gateway.limits": "网关限制",
@@ -64,6 +65,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "agent.budget",
     "agent.session",
     "agent.modes",
+    "agent.plugins",
     "gateway",
     "gateway.websocket",
     "gateway.limits",
@@ -292,6 +294,55 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "minimum": 1,
         "maximum": 1024,
     },
+    # -- agent.plugins --------------------------------------------------
+    "agent.plugins.enabled": {
+        "title": "启用插件",
+        "type": "bool",
+        "description": "关闭后不发现、不加载插件，也不添加插件 skills/modes 来源。",
+    },
+    "agent.plugins.dirs": {
+        "title": "插件目录",
+        "type": "list",
+        "item_type": "path",
+        "description": "容器目录；每个直接子目录可包含 plugin.yaml。",
+    },
+    "agent.plugins.allow": {
+        "title": "允许的插件 id",
+        "type": "list",
+        "item_type": "str",
+        "description": "显式白名单；为空表示不 import 任何插件代码。",
+    },
+    "agent.plugins.max_plugins": {
+        "title": "插件上限",
+        "type": "int",
+        "minimum": 1,
+    },
+    "agent.plugins.max_tools_per_plugin": {
+        "title": "单插件工具上限",
+        "type": "int",
+        "minimum": 1,
+    },
+    "agent.plugins.max_manifest_bytes": {
+        "title": "manifest 最大字节",
+        "type": "int",
+        "minimum": 1024,
+        "maximum": 1048576,
+    },
+    "agent.plugins.load_timeout_ms": {
+        "title": "加载超时 ms",
+        "type": "int",
+        "minimum": 1,
+    },
+    "agent.plugins.drain_grace_ms": {
+        "title": "卸载 drain 宽限 ms",
+        "type": "int",
+        "minimum": 0,
+    },
+    "agent.plugins.unload_timeout_ms": {
+        "title": "卸载清理超时 ms",
+        "type": "int",
+        "minimum": 1,
+    },
     # -- gateway --------------------------------------------------------
     "gateway.transport": {
         "title": "传输方式",
@@ -361,7 +412,9 @@ FIELD_META: dict[str, dict[str, Any]] = {
     "ui.show_reasoning": {"title": "显示 reasoning", "type": "bool"},
 }
 
-_RESTART_PREFIXES: tuple[str, ...] = ("storage.", "gateway.websocket.")
+_RESTART_PREFIXES: tuple[str, ...] = (
+    "storage.", "gateway.websocket.", "agent.plugins.",
+)
 _RESTART_KEYS = frozenset({
     "gateway.transport",
     "logging.dir",

@@ -42,6 +42,11 @@ from ..runtime.modes.errors import ModeError
 from ..runtime.modes.model import ModeLimits, ModePackage
 from ..runtime.modes.parsing import read_mode_package
 from ..runtime.modes.source import BuiltinModeSource
+from ..runtime.plugins.errors import PluginError
+from ..runtime.plugins.manifest import read_plugin_manifest, scan_plugins
+from ..runtime.plugins.model import PluginLimits
+from ..runtime.skills.model import SkillLimits, SkillPackage
+from ..runtime.skills.parsing import load_package
 from ..gateway.client import AgentClient, ClientError, ConnectionClosed
 from ..gateway.leases import FileLeaseManager
 from ..gateway.protocol import Frame
@@ -115,6 +120,26 @@ def _parser() -> argparse.ArgumentParser:
     mode_validate.add_argument("path")
     mode_validate.add_argument("--config", default=None,
                                help="explicit config.yaml path")
+
+    plugin = sub.add_parser("plugin", help="inspect and validate capability plugins")
+    plugin_sub = plugin.add_subparsers(dest="plugin_command", required=True)
+    plugin_list = plugin_sub.add_parser(
+        "list", help="list discovered plugins (never imports code)"
+    )
+    plugin_list.add_argument("--config", default=None, help="explicit config.yaml path")
+    plugin_list.add_argument("--json", action="store_true")
+    plugin_show = plugin_sub.add_parser(
+        "show", help="show one plugin manifest (never imports code)"
+    )
+    plugin_show.add_argument("id")
+    plugin_show.add_argument("--config", default=None, help="explicit config.yaml path")
+    plugin_show.add_argument("--json", action="store_true")
+    plugin_validate = plugin_sub.add_parser(
+        "validate", help="statically validate a plugin directory"
+    )
+    plugin_validate.add_argument("path")
+    plugin_validate.add_argument("--config", default=None,
+                                 help="explicit config.yaml path")
 
     sessions = sub.add_parser("sessions", help="list sessions in the catalogue")
     sessions.add_argument("--config", default=None, help="explicit config.yaml path")
@@ -735,6 +760,207 @@ def _run_mode(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# plugins
+# ---------------------------------------------------------------------------
+
+def _plugin_limits(settings) -> PluginLimits:
+    return PluginLimits(
+        max_plugins=settings.max_plugins,
+        max_tools_per_plugin=settings.max_tools_per_plugin,
+        max_manifest_bytes=settings.max_manifest_bytes,
+        load_timeout_ms=settings.load_timeout_ms,
+        drain_grace_ms=settings.drain_grace_ms,
+        unload_timeout_ms=settings.unload_timeout_ms,
+    )
+
+
+def _plugin_dirs(settings) -> list:
+    return [Path(item).expanduser() for item in settings.dirs]
+
+
+def _plugin_manifest_dict(manifest) -> dict:
+    return {
+        "id": manifest.id,
+        "version": manifest.version,
+        "description": manifest.description,
+        "source": manifest.source,
+        "api_version": manifest.api_version,
+        "runtime": manifest.runtime,
+        "trust": manifest.trust,
+        "entry": (
+            {
+                "file": manifest.entry.path.name,
+                "callable": manifest.entry.qualname,
+            }
+            if manifest.entry is not None else None
+        ),
+        "tools": [
+            {
+                "name": item.name,
+                "side_effect": item.side_effect,
+                "timeout": item.timeout,
+                "concurrency": item.concurrency,
+                "idempotent": item.idempotent,
+                "requires_approval": item.requires_approval,
+                "backend": item.backend,
+            }
+            for item in manifest.tools
+        ],
+        "skills": [path.name for path in manifest.skill_dirs],
+        "modes": [path.stem for path in manifest.mode_paths],
+        "digest": manifest.digest,
+    }
+
+
+def _run_plugin(args) -> int:
+    """Offline plugin inspection; never imports plugin code (D3 / §11.3)."""
+    service = _build_service(args.config)
+    cfg = service.effective(strict=False).config
+    settings = cfg.agent.plugins
+    limits = _plugin_limits(settings)
+
+    if args.plugin_command == "validate":
+        path = Path(args.path).expanduser()
+        root = path.parent if path.name == "plugin.yaml" else path
+        try:
+            manifest = read_plugin_manifest(
+                root, source=root.name, limits=limits,
+            )
+        except PluginError as exc:
+            print(f"{exc.code}: {exc}")
+            return 1
+        errors: list[str] = []
+        warnings: list[str] = []
+        mode_limits = ModeLimits(
+            max_mode_bytes=cfg.agent.modes.max_mode_bytes,
+            max_modes=cfg.agent.modes.max_modes,
+        )
+        for mode_path in manifest.mode_paths:
+            try:
+                read_mode_package(
+                    ModePackage(
+                        name=mode_path.stem, path=mode_path,
+                        source_id=f"plugin:{manifest.id}", priority=400,
+                    ),
+                    mode_limits,
+                )
+            except ModeError as exc:
+                errors.append(f"mode {mode_path.stem!r}: {exc.code}: {exc}")
+        skill_settings = cfg.agent.skills
+        skill_limits = SkillLimits(
+            max_result_bytes=skill_settings.max_result_bytes,
+            max_skill_bytes=skill_settings.max_skill_bytes,
+            max_resource_bytes=skill_settings.max_resource_bytes,
+            max_resources_per_skill=skill_settings.max_resources_per_skill,
+            max_index_bytes=skill_settings.max_index_bytes,
+            max_skills=skill_settings.max_skills,
+            max_catalog_bytes=skill_settings.max_catalog_bytes,
+        )
+        for skill_dir in manifest.skill_dirs:
+            try:
+                entry, skill_warnings = load_package(
+                    SkillPackage(
+                        source_id=f"plugin:{manifest.id}", priority=400,
+                        root=skill_dir,
+                    ),
+                    skill_limits,
+                    budget_bytes=skill_settings.max_catalog_bytes,
+                )
+            except Exception as exc:  # noqa: BLE001 - report, do not crash
+                errors.append(
+                    f"skill {skill_dir.name!r}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            warnings.extend(skill_warnings)
+            if entry is None:
+                errors.append(f"skill {skill_dir.name!r}: SKILL.md is invalid")
+        for warning in warnings:
+            print(f"[warning] {warning}")
+        for error in errors:
+            print(f"[error] {error}")
+        if errors:
+            return 1
+        print(f"ok: {manifest.id} {manifest.version}")
+        return 0
+
+    catalog = scan_plugins(_plugin_dirs(settings), limits=limits)
+    allow = set(settings.allow)
+    warnings = list(catalog.warnings)
+    found = {manifest.id for manifest in catalog.manifests}
+    for plugin_id in settings.allow:
+        if plugin_id not in found:
+            warnings.append(
+                f"plugin.not_found: {plugin_id!r} from agent.plugins.allow"
+            )
+
+    if args.plugin_command == "list":
+        rows = [
+            {
+                **_plugin_manifest_dict(manifest),
+                "state": "discovered" if manifest.id in allow else "disabled",
+                "enabled": manifest.id in allow,
+            }
+            for manifest in catalog.manifests
+        ]
+        invalid = [issue.to_dict() for issue in catalog.invalid]
+        if args.json:
+            print(json.dumps(
+                {"plugins": rows, "invalid": invalid, "warnings": warnings},
+                ensure_ascii=False, indent=2,
+            ))
+            return 0
+        for row in rows:
+            print(
+                f"{row['id']}\t{row['version']}\t{row['state']}\t"
+                f"tools={len(row['tools'])} skills={len(row['skills'])} "
+                f"modes={len(row['modes'])}"
+            )
+        for item in invalid:
+            print(f"{item['source']}\t-\tinvalid\t{item['code']}: {item['error']}")
+        for warning in warnings:
+            print(f"[warning] {warning}")
+        return 0
+
+    manifest = next(
+        (item for item in catalog.manifests if item.id == args.id), None,
+    )
+    if manifest is None:
+        invalid = catalog.invalid
+        detail = "; ".join(
+            f"{issue.source}: {issue.code}" for issue in invalid
+        )
+        print(f"plugin not found: {args.id}" + (f" ({detail})" if detail else ""))
+        return 1
+    payload = _plugin_manifest_dict(manifest)
+    payload["enabled"] = manifest.id in allow
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print(f"id: {manifest.id}")
+    print(f"version: {manifest.version}")
+    print(f"source: {manifest.source}")
+    print(f"description: {manifest.description or '-'}")
+    print(f"api_version: {manifest.api_version}")
+    print(f"runtime: {manifest.runtime}")
+    print(f"trust: {manifest.trust}")
+    print(f"enabled: {manifest.id in allow}")
+    if manifest.entry is not None:
+        print(f"entry: {manifest.entry.path.name}:{manifest.entry.qualname}")
+    for item in manifest.tools:
+        print(
+            f"tool: {item.name} side_effect={item.side_effect} "
+            f"timeout={item.timeout} concurrency={item.concurrency} "
+            f"idempotent={item.idempotent} "
+            f"requires_approval={item.requires_approval} backend={item.backend}"
+        )
+    for path in manifest.skill_dirs:
+        print(f"skill: {path.name}")
+    for path in manifest.mode_paths:
+        print(f"mode: {path.stem}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # sessions
 # ---------------------------------------------------------------------------
 
@@ -1273,6 +1499,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return _run_config(args)
         if args.command == "mode":
             return _run_mode(args)
+        if args.command == "plugin":
+            return _run_plugin(args)
         if args.command == "setup":
             return _run_setup(args)
     except KeyboardInterrupt:
