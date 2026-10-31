@@ -126,6 +126,13 @@ change requires breaking one, stop and redesign the change.
   in-flight calls, then revokes. Lifecycle events use the reserved per-process
   `session_id="host:<uuid>"` partition, so clients must not create `host` /
   `host:*` sessions. Replay/restore never import plugins or call `setup`.
+- Persistent plugin management (`plugin.enable`/`plugin.disable`) is off unless
+  `gateway.plugins.manage=true`; the flag is captured when `GatewayServer`
+  starts. The commands only rewrite `agent.plugins.allow` through
+  `ConfigService.set` — never hot-load/unload, never restart, never import plugin
+  code. An allowlist supplied by an environment override is rejected with
+  `E_PLUGIN_CONFIG`. The TUI gates `Ctrl+E`/`Ctrl+D` on both the
+  `plugins.manage` feature and `plugin.list.manage`.
 - Cross-session memory, retrieval/RAG and CQRS projections beyond the session
   catalogue are not implemented yet. Do not assume their APIs exist.
 

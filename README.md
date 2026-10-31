@@ -246,7 +246,18 @@ agent:
 linteum plugin list                 # discover/validate without importing code
 linteum plugin show acme.search
 linteum plugin validate ~/.linteum/plugins/acme-search
+linteum plugin enable acme.search   # persist agent.plugins.allow (restart to load)
+linteum plugin disable acme.search
 ```
+
+`plugin enable/disable` only rewrites `agent.plugins.allow`; it never imports
+plugin code and takes effect on the next host start. The CLI always allows it
+because the local user owns the config. The gateway exposes the same commands to
+clients only when `gateway.plugins.manage: true` (default `false`, restart
+required); in `linteum-tui` open `/plugins`, select a row, and press `Ctrl+E` or
+`Ctrl+D` followed by `y`. The command is refused when the allowlist comes from
+an environment override, because writing the file would not change the effective
+value.
 
 > **Trust:** in-process plugin tools run with the host's full privileges. Only
 > enable plugins you trust as much as the host itself. Plugins that provide only

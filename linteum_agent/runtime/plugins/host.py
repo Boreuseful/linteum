@@ -677,7 +677,10 @@ class PluginHost:
         result = [self._summary(record) for record in self._records.values()]
         for issue in self._invalid.values():
             result.append(PluginSummary(
-                id="",
+                # Best-effort id from the invalid manifest; plugin.list still
+                # renders invalid entries by source (§11.2) but management
+                # commands need the id to report E_PLUGIN_MANIFEST (§11.5.4).
+                id=issue.id,
                 version="",
                 description="",
                 state=STATE_INVALID,

@@ -339,6 +339,18 @@ class BackpressureSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class GatewayPluginsSettings:
+    """Client-side plugin management (plugin-design §10.5 / §11.5.8).
+
+    ``manage`` is a local trust switch: when false (the default), the gateway
+    rejects ``plugin.enable`` / ``plugin.disable`` and the TUI stays read-only.
+    Captured at gateway startup, so changing it requires a restart.
+    """
+
+    manage: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class GatewaySettings:
     transport: str = "auto"              # auto | inproc | stdio | websocket
     websocket: WebSocketSettings = field(default_factory=WebSocketSettings)
@@ -346,6 +358,7 @@ class GatewaySettings:
     delta: DeltaSettings = field(default_factory=DeltaSettings)
     history: HistorySettings = field(default_factory=HistorySettings)
     backpressure: BackpressureSettings = field(default_factory=BackpressureSettings)
+    plugins: GatewayPluginsSettings = field(default_factory=GatewayPluginsSettings)
 
 
 @dataclass(frozen=True, slots=True)

@@ -51,6 +51,9 @@ class ErrorCode(str, Enum):
     E_PLUGIN_TOOL_MISSING = "E_PLUGIN_TOOL_MISSING"
     E_PLUGIN_LOAD = "E_PLUGIN_LOAD"
     E_PLUGIN_BUSY = "E_PLUGIN_BUSY"
+    # -- persistent enable/disable (plugin-design v0.3 §11.5) --
+    E_PLUGIN_MANAGE_DISABLED = "E_PLUGIN_MANAGE_DISABLED"
+    E_PLUGIN_CONFIG = "E_PLUGIN_CONFIG"
     E_DENIED = "E_DENIED"
     E_TOOL_ERROR = "E_TOOL_ERROR"
     E_SANDBOX = "E_SANDBOX"

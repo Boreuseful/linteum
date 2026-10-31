@@ -34,7 +34,7 @@ from typing import Optional
 
 from ..config.meta import field_specs, get_spec
 from ..config.schema import ConfigError, default_config
-from ..config.service import ConfigService
+from ..config.service import ConfigService, env_var_for
 from ..config.store import ConfigStore
 from ..runtime.llm.config import PROVIDER_DEFAULTS
 from ..runtime.modes.catalog import load_mode_catalog
@@ -140,6 +140,20 @@ def _parser() -> argparse.ArgumentParser:
     plugin_validate.add_argument("path")
     plugin_validate.add_argument("--config", default=None,
                                  help="explicit config.yaml path")
+    plugin_enable = plugin_sub.add_parser(
+        "enable", help="add a discovered plugin to agent.plugins.allow"
+    )
+    plugin_enable.add_argument("id")
+    plugin_enable.add_argument("--config", default=None,
+                               help="explicit config.yaml path")
+    plugin_enable.add_argument("--json", action="store_true")
+    plugin_disable = plugin_sub.add_parser(
+        "disable", help="remove a plugin from agent.plugins.allow"
+    )
+    plugin_disable.add_argument("id")
+    plugin_disable.add_argument("--config", default=None,
+                                help="explicit config.yaml path")
+    plugin_disable.add_argument("--json", action="store_true")
 
     sessions = sub.add_parser("sessions", help="list sessions in the catalogue")
     sessions.add_argument("--config", default=None, help="explicit config.yaml path")
@@ -812,8 +826,120 @@ def _plugin_manifest_dict(manifest) -> dict:
     }
 
 
+def _plugin_manage_fail(args, code: str, message: str, hint: str = "") -> int:
+    if getattr(args, "json", False):
+        _json_dump({
+            "ok": False,
+            "code": code,
+            "message": message,
+            "hint": hint,
+        })
+    else:
+        suffix = f" ({hint})" if hint else ""
+        print(f"{code}: {message}{suffix}")
+    return 1
+
+
+def _run_plugin_manage(args) -> int:
+    """Persistently edit ``agent.plugins.allow``; never imports plugin code."""
+    service = _build_service(args.config)
+    try:
+        effective = service.effective(strict=False)
+    except ConfigError as exc:
+        return _plugin_manage_fail(
+            args, "E_PLUGIN_CONFIG",
+            f"cannot read configuration ({exc.code})",
+        )
+    cfg = effective.config
+    if effective.sources.get("agent.plugins.allow") == "env":
+        # Writing the file would not change the effective value (D25).
+        return _plugin_manage_fail(
+            args, "E_PLUGIN_CONFIG",
+            "agent.plugins.allow is overridden by the environment",
+            f"unset {env_var_for('agent.plugins.allow')}",
+        )
+    try:
+        file_config = service.store.load(create=False)
+    except ConfigError as exc:
+        return _plugin_manage_fail(
+            args, "E_PLUGIN_CONFIG",
+            f"cannot read configuration ({exc.code})",
+        )
+
+    settings = cfg.agent.plugins
+    catalog = scan_plugins(_plugin_dirs(settings), limits=_plugin_limits(settings))
+    found = {manifest.id for manifest in catalog.manifests}
+    invalid = {issue.id for issue in catalog.invalid if issue.id}
+    plugin_id = args.id
+    enable = args.plugin_command == "enable"
+    warnings: list[str] = []
+
+    if enable and plugin_id not in found:
+        if plugin_id in invalid:
+            return _plugin_manage_fail(
+                args, "E_PLUGIN_MANIFEST",
+                f"invalid plugin manifest: {plugin_id!r}",
+            )
+        return _plugin_manage_fail(
+            args, "E_PLUGIN_NOT_FOUND", f"plugin not found: {plugin_id!r}",
+        )
+    if not enable and plugin_id not in found:
+        # disable is the escape hatch for stale allow entries (§11.3).
+        warnings.append(
+            f"plugin.not_found: {plugin_id!r} is not discovered; "
+            "removing it from agent.plugins.allow"
+        )
+
+    allow = list(file_config.agent.plugins.allow)
+    changed = False
+    if enable and plugin_id not in allow:
+        allow.append(plugin_id)
+        changed = True
+    elif not enable and plugin_id in allow:
+        allow.remove(plugin_id)
+        changed = True
+    if changed:
+        try:
+            service.set(
+                "agent.plugins.allow", allow,
+                expected_revision=service.revision(),
+            )
+        except ConfigError as exc:
+            return _plugin_manage_fail(
+                args, "E_PLUGIN_CONFIG",
+                f"cannot update agent.plugins.allow ({exc.code})",
+            )
+
+    enabled = plugin_id in allow
+    if getattr(args, "json", False):
+        _json_dump({
+            "ok": True,
+            "id": plugin_id,
+            "enabled": enabled,
+            "changed": changed,
+            "persisted": True,
+            # The CLI cannot know whether a host is running; any change (and
+            # even a no-op re-assertion) only affects the next start (§11.3).
+            "restart_required": True,
+            "warnings": warnings,
+        })
+        return 0
+    for warning in warnings:
+        print(f"[warning] {warning}")
+    if not changed:
+        print("no changes")
+    else:
+        print(
+            f"{plugin_id}: {'enabled' if enabled else 'disabled'} "
+            "[restart required]"
+        )
+    return 0
+
+
 def _run_plugin(args) -> int:
     """Offline plugin inspection; never imports plugin code (D3 / §11.3)."""
+    if args.plugin_command in ("enable", "disable"):
+        return _run_plugin_manage(args)
     service = _build_service(args.config)
     cfg = service.effective(strict=False).config
     settings = cfg.agent.plugins

@@ -26,9 +26,12 @@ from ..config.options import SessionOptions
 from ..config.schema import AppConfig, ConfigError, GatewaySettings
 from ..config.service import ConfigService, EffectiveConfig
 from ..runtime.host import AgentHost, SessionLocked, SessionNotFound
+from ..runtime.plugins.errors import PluginManifestError, PluginNotFound
 from .errors import (
     E_INTERNAL,
     E_PAYLOAD_TOO_LARGE,
+    E_PLUGIN_CONFIG,
+    E_PLUGIN_MANAGE_DISABLED,
     E_PROTOCOL,
     E_PROTOCOL_VERSION,
     E_SESSION_LOCKED,
@@ -427,6 +430,8 @@ class GatewayServer:
         self._fixed_settings = _gateway_settings(config)
         self.gap_timeout = gap_timeout
         self.server_name = server_name
+        # §11.5.4: capture at startup (apply_scope=restart), never per command.
+        self._manage_enabled = self._initial_manage_enabled()
 
         self._gateways: dict[str, SessionGateway] = {}
         self._gateway_locks: dict[str, asyncio.Lock] = {}
@@ -447,6 +452,15 @@ class GatewayServer:
         if self.config_service is not None:
             return self.config_service.effective(strict=False).config
         return self.host.current_config()
+
+    def _initial_manage_enabled(self) -> bool:
+        """``gateway.plugins.manage`` as seen when this server started."""
+        if self._fixed_settings is not None:
+            return bool(self._fixed_settings.plugins.manage)
+        try:
+            return bool(self._current_config().gateway.plugins.manage)
+        except Exception:  # noqa: BLE001 - an invalid config is already fatal elsewhere
+            return False
 
     # -- lifecycle ----------------------------------------------------------
     async def serve(self, transport: Transport) -> ClientConnection:
@@ -583,6 +597,10 @@ class GatewayServer:
             return await self._mode_list()
         if command.name == "plugin.list":
             return await self._plugin_list()
+        if command.name == "plugin.enable":
+            return await self._plugin_set_enabled(command, enable=True)
+        if command.name == "plugin.disable":
+            return await self._plugin_set_enabled(command, enable=False)
         if command.name == "session.list":
             return await self._session_list(command)
         if command.name == "session.children":
@@ -718,8 +736,42 @@ class GatewayServer:
             "warnings": list(catalog.warnings),
         }
 
+    def _plugin_allow_env_override(self) -> bool:
+        """True when ``agent.plugins.allow`` comes from an environment override."""
+        if self.config_service is None:
+            return False
+        try:
+            effective = self.config_service.effective(strict=False)
+        except ConfigError:
+            return False
+        return effective.sources.get("agent.plugins.allow") == "env"
+
+    def _plugin_file_config(self) -> Optional[AppConfig]:
+        """The validated file-level config, or ``None`` when unreadable/missing."""
+        if self.config_service is None:
+            return None
+        try:
+            return self.config_service.store.load(create=False)
+        except ConfigError:
+            return None
+
+    def _plugin_manage_state(self) -> tuple[bool, Optional[AppConfig], list[str]]:
+        """(manage, file config, warnings) for ``plugin.list`` (§11.2)."""
+        warnings: list[str] = []
+        if self.config_service is None:
+            return False, None, warnings
+        env_override = self._plugin_allow_env_override()
+        file_config = self._plugin_file_config()
+        if file_config is None:
+            warnings.append("plugin.config_unreadable")
+            return False, None, warnings
+        if env_override:
+            warnings.append("plugin.allow_env_override")
+        return self._manage_enabled and not env_override, file_config, warnings
+
     async def _plugin_list(self) -> dict:
         summaries = await self.host.list_plugins()
+        manage, file_config, config_warnings = self._plugin_manage_state()
         plugins = []
         invalid = []
         for summary in summaries:
@@ -731,10 +783,16 @@ class GatewayServer:
                     "error": error.get("message", ""),
                 })
                 continue
+            enabled = (
+                summary.id in file_config.agent.plugins.allow
+                if file_config is not None
+                else summary.state != "disabled"
+            )
             entry = {
                 "id": summary.id,
                 "version": summary.version,
                 "state": summary.state,
+                "enabled": enabled,
                 "trust": summary.trust,
                 "description": summary.description,
                 "source": summary.source,
@@ -752,7 +810,123 @@ class GatewayServer:
         return {
             "plugins": plugins,
             "invalid": invalid,
-            "warnings": list(self.host.plugin_warnings()),
+            "warnings": [*self.host.plugin_warnings(), *config_warnings],
+            "manage": manage,
+        }
+
+    async def _plugin_set_enabled(self, command: Command, *,
+                                  enable: bool) -> dict:
+        """Persistently add/remove one id from ``agent.plugins.allow`` (§11.5)."""
+        if not self._manage_enabled:
+            raise GatewayError(
+                E_PLUGIN_MANAGE_DISABLED,
+                "plugin management is disabled",
+                location=LOCATION_SERVER,
+            )
+        service = self.config_service
+        if service is None:
+            raise GatewayError(
+                E_PLUGIN_CONFIG,
+                "configuration service is not available",
+                location=LOCATION_SERVER,
+            )
+        if self._plugin_allow_env_override():
+            raise GatewayError(
+                E_PLUGIN_CONFIG,
+                "agent.plugins.allow is overridden by the environment",
+                location=LOCATION_SERVER,
+                context={
+                    "hint": "unset the environment variable and restart the gateway",
+                },
+            )
+        try:
+            file_config = service.store.load(create=False)
+        except ConfigError as exc:
+            raise GatewayError(
+                E_PLUGIN_CONFIG,
+                "cannot read the configuration file",
+                location=LOCATION_SERVER,
+                context={"code": exc.code},
+                exc=exc,
+            ) from exc
+
+        plugin_id = str(command.args.get("id"))
+        summaries = await self.host.list_plugins()
+        summary = next(
+            (item for item in summaries if item.id == plugin_id), None,
+        )
+        if summary is None:
+            raise GatewayError(
+                PluginNotFound.code,
+                f"plugin not found: {plugin_id!r}",
+                location=LOCATION_SERVER,
+            )
+        if summary.state == "invalid":
+            error = summary.error or {}
+            raise GatewayError(
+                PluginManifestError.code,
+                error.get("message")
+                or f"invalid plugin manifest for {plugin_id!r}",
+                location=LOCATION_SERVER,
+            )
+
+        allow = list(file_config.agent.plugins.allow)
+        changed = False
+        if enable and plugin_id not in allow:
+            allow.append(plugin_id)
+            changed = True
+        elif not enable and plugin_id in allow:
+            allow.remove(plugin_id)
+            changed = True
+        if changed:
+            try:
+                service.set(
+                    "agent.plugins.allow", allow,
+                    expected_revision=service.revision(),
+                )
+            except ConfigError as exc:
+                raise GatewayError(
+                    E_PLUGIN_CONFIG,
+                    "cannot update agent.plugins.allow",
+                    location=LOCATION_SERVER,
+                    context={"code": exc.code},
+                    exc=exc,
+                ) from exc
+
+        restart_required = (
+            summary.state in {"disabled", "discovered", "unloaded"}
+            if enable
+            else summary.state in {"active", "loading", "quiescing"}
+        )
+        plugin = {
+            "id": summary.id,
+            "version": summary.version,
+            "state": summary.state,
+            "enabled": enable,
+            "trust": summary.trust,
+            "description": summary.description,
+            "source": summary.source,
+            "tools": list(summary.tools),
+            "skills": list(summary.skills),
+            "modes": list(summary.modes),
+            "digest": summary.digest,
+        }
+        self.host._log({
+            "kind": "plugin",
+            "level": "info",
+            "msg": f"plugin {'enable' if enable else 'disable'} {plugin_id}",
+            "ts": time.time(),
+            "action": "enable" if enable else "disable",
+            "id": plugin_id,
+            "changed": changed,
+            "restart_required": restart_required,
+        })
+        return {
+            "plugin": plugin,
+            "changed": changed,
+            "persisted": True,
+            "restart_required": restart_required,
+            "warnings": [],
         }
 
     async def _session_list(self, command: Command) -> dict:

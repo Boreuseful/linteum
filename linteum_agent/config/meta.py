@@ -49,6 +49,7 @@ SECTION_TITLES: dict[str, str] = {
     "gateway.delta": "流式增量",
     "gateway.history": "历史分页",
     "gateway.backpressure": "背压",
+    "gateway.plugins": "插件管理",
     "storage": "存储",
     "storage.checkpoints": "Checkpoint",
     "logging": "日志",
@@ -72,6 +73,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "gateway.delta",
     "gateway.history",
     "gateway.backpressure",
+    "gateway.plugins",
     "storage",
     "storage.checkpoints",
     "logging",
@@ -373,6 +375,14 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "minimum": 0,
         "maximum": 1,
     },
+    "gateway.plugins.manage": {
+        "title": "允许客户端管理插件",
+        "type": "bool",
+        "description": (
+            "允许本地客户端通过 plugin.enable/plugin.disable 修改 "
+            "agent.plugins.allow；重启网关后生效。默认关闭。"
+        ),
+    },
     # -- storage --------------------------------------------------------
     "storage.state_db": {"title": "SQLite 路径", "type": "path"},
     "storage.artifacts": {"title": "Artifact 目录", "type": "path"},
@@ -413,7 +423,7 @@ FIELD_META: dict[str, dict[str, Any]] = {
 }
 
 _RESTART_PREFIXES: tuple[str, ...] = (
-    "storage.", "gateway.websocket.", "agent.plugins.",
+    "storage.", "gateway.websocket.", "gateway.plugins.", "agent.plugins.",
 )
 _RESTART_KEYS = frozenset({
     "gateway.transport",

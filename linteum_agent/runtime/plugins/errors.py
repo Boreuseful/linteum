@@ -142,6 +142,19 @@ class PluginBusy(PluginError):
     retryable = True
 
 
+class PluginManageDisabled(PluginError):
+    """``gateway.plugins.manage`` is off; clients may only read (§11.5.8)."""
+
+    code = "E_PLUGIN_MANAGE_DISABLED"
+
+
+class PluginConfigError(PluginError):
+    """The configuration file is unreadable, env-overridden, or unwritable."""
+
+    code = "E_PLUGIN_CONFIG"
+    retryable = True
+
+
 def as_plugin_error(exc: BaseException) -> PluginError:
     """Wrap an arbitrary exception without losing its type/details."""
     if isinstance(exc, PluginError):
@@ -155,9 +168,11 @@ def as_plugin_error(exc: BaseException) -> PluginError:
 
 __all__ = [
     "PluginBusy",
+    "PluginConfigError",
     "PluginConflict",
     "PluginDisabled",
     "PluginError",
+    "PluginManageDisabled",
     "PluginLimit",
     "PluginLoadError",
     "PluginManifestError",

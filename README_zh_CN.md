@@ -236,7 +236,16 @@ agent:
 linteum plugin list                 # 只发现/校验，不 import 代码
 linteum plugin show acme.search
 linteum plugin validate ~/.linteum/plugins/acme-search
+linteum plugin enable acme.search   # 持久写入 agent.plugins.allow（重启后加载）
+linteum plugin disable acme.search
 ```
+
+`plugin enable/disable` 只重写 `agent.plugins.allow`，不 import 插件代码，
+下次宿主启动才生效。CLI 始终允许（本地用户拥有配置文件）。网关只有在
+`gateway.plugins.manage: true`（默认 `false`，需重启）时才向客户端开放同名
+命令；在 `linteum-tui` 中打开 `/plugins`，选中行后按 `Ctrl+E` / `Ctrl+D`，
+再按 `y` 确认。若 allow 列表来自环境变量覆盖，命令会被拒绝，因为写文件不会
+改变生效值。
 
 > **信任边界：** 进程内插件工具拥有宿主权限，只应启用与宿主同等可信的插件。
 > 仅提供 skills/modes 的插件不执行代码。

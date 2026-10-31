@@ -50,6 +50,9 @@ FEATURES: tuple = (
     "context",
     "modes",
     "plugins",
+    # v0.3: the gateway understands plugin.enable/disable.  Whether it accepts
+    # them is reported separately by plugin.list.manage (§11.5.4).
+    "plugins.manage",
 )
 
 #: Commands a client may send (§5.2).  Anything else is ``E_UNKNOWN_COMMAND``.
@@ -73,6 +76,8 @@ KNOWN_COMMANDS: frozenset = frozenset(
         "mode.list",
         "session.mode.set",
         "plugin.list",
+        "plugin.enable",
+        "plugin.disable",
         "ping",
     }
 )
@@ -90,6 +95,9 @@ _SESSION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _TRACE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _PROFILE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _MODE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+#: Mirrors ``runtime.plugins.model.PLUGIN_ID_PATTERN``; protocol must stay
+#: runtime-free, so the pattern is duplicated here rather than imported.
+_PLUGIN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +305,18 @@ def validate_command(cmd: "Command") -> None:
         # with no session and no extra arguments (D12 / §11.2).
         if cmd.session_id is not None or cmd.args:
             raise _bad("plugin.list takes no session_id or arguments")
+        return
+
+    if cmd.name in ("plugin.enable", "plugin.disable"):
+        # §11.5.4: exactly {"id": str}; no session and no other arguments.
+        if cmd.session_id is not None:
+            raise _bad(f"{cmd.name} takes no session_id")
+        extra = set(cmd.args) - {"id"}
+        if extra:
+            raise _bad(f"{cmd.name} takes only 'id'")
+        plugin_id = _string(args, "id", required=True)
+        if plugin_id is None or not _PLUGIN_ID.match(plugin_id):
+            raise _bad("invalid plugin id", id=plugin_id)
         return
 
     if cmd.name == "session.mode.set":
