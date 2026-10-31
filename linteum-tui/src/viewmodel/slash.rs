@@ -80,6 +80,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         action: UiAction::OpenModePicker,
     },
     SlashCommand {
+        id: "plugins",
+        label: "Plugins",
+        description: "Inspect loaded capability plugins",
+        action: UiAction::OpenPlugins,
+    },
+    SlashCommand {
         id: "exit",
         label: "Exit session",
         description: "Leave this session",

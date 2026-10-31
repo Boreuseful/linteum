@@ -203,7 +203,10 @@ fn reconnect_resends_unconfirmed_once() {
     s.composer.text = "hello".into();
     reduce(&mut s, Input::Action(UiAction::Send));
     let id = s.queue.entries[0].client_message_id.clone();
-    let effects = reduce(&mut s, Input::Connection(ConnectionEvent::Reconnected));
+    let effects = reduce(
+        &mut s,
+        Input::Connection(ConnectionEvent::Reconnected { features: vec![] }),
+    );
     let sends: Vec<_> = effects
         .into_iter()
         .filter_map(|effect| match effect {

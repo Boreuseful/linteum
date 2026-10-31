@@ -16,6 +16,7 @@ use super::artifacts::ArtifactViewerState;
 use super::cursor::SessionCursor;
 use super::edit;
 use super::modes::ModeState;
+use super::plugins::PluginsState;
 use super::queue::QueueState;
 use super::sessions::{NewSessionForm, SessionPickerState};
 use super::sidebar::SidebarState;
@@ -59,7 +60,9 @@ pub enum ConnectionEvent {
         features: Vec<String>,
         limits: Limits,
     },
-    Reconnected,
+    Reconnected {
+        features: Vec<String>,
+    },
     Disconnected {
         reason: String,
         retryable: bool,
@@ -173,6 +176,7 @@ pub enum Overlay {
     SubagentContext,
     Palette,
     Mode,
+    Plugins,
     Fatal,
 }
 
@@ -289,6 +293,7 @@ pub struct TuiState {
     pub artifact: Option<ArtifactViewerState>,
     pub subagents: SubagentsState,
     pub mode: ModeState,
+    pub plugins: PluginsState,
     pub features: Vec<String>,
     pub overlay: Option<Overlay>,
     pub focus: Focus,

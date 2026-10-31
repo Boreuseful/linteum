@@ -8,6 +8,7 @@ pub mod cursor;
 pub mod edit;
 pub mod modes;
 pub mod notices;
+pub mod plugins;
 pub mod queue;
 pub mod sessions;
 pub mod sidebar;
@@ -20,6 +21,7 @@ pub use approvals::{ApprovalDecision, ApprovalState};
 pub use artifacts::{ArtifactError, ArtifactViewerState};
 pub use cursor::SessionCursor;
 pub use modes::{CurrentMode, ModeOption, ModePickerState, ModeState, ModeSwitchResult};
+pub use plugins::{InvalidPlugin, PluginEntry, PluginError, PluginRow, PluginsState};
 pub use queue::{QueueEntryState, QueueState, QueuedMessage};
 pub use sessions::{NewSessionForm, SessionInfo, SessionPickerState};
 pub use sidebar::{SidebarLayout, SidebarPanel, SidebarState, TreeRow, WorkspaceEntry};
@@ -90,6 +92,10 @@ pub enum UiAction {
     ModeSelectPrevious,
     ModeSelect,
     ModeRefresh,
+    OpenPlugins,
+    PluginSelectNext,
+    PluginSelectPrevious,
+    PluginRefresh,
     Resume,
     Quit,
     ExitSession,
@@ -211,7 +217,7 @@ pub fn reduce(state: &mut TuiState, input: Input) -> Vec<Effect> {
         Input::CommandResult(result) => reduce_command_result(state, &result),
         Input::Connection(event) => {
             let connected = matches!(event, ConnectionEvent::Connected { .. });
-            let reconnected = matches!(event, ConnectionEvent::Reconnected);
+            let reconnected = matches!(event, ConnectionEvent::Reconnected { .. });
             apply_connection(state, event);
             if reconnected {
                 let mut effects = subscribe_effect(state, state.cursor.after_seq());
@@ -306,6 +312,16 @@ fn reduce_action(state: &mut TuiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::ModeSelect => modes::select_current(state),
         UiAction::ModeRefresh => modes::refresh(state),
+        UiAction::OpenPlugins => plugins::open(state),
+        UiAction::PluginSelectNext => {
+            plugins::move_selection(state, 1);
+            Vec::new()
+        }
+        UiAction::PluginSelectPrevious => {
+            plugins::move_selection(state, -1);
+            Vec::new()
+        }
+        UiAction::PluginRefresh => plugins::refresh(state),
         UiAction::RetryConnection => vec![Effect::ReconnectNow],
         UiAction::Resume => {
             if state.session.as_ref().map(|s| s.phase.as_str()) == Some("paused") {
@@ -612,7 +628,11 @@ fn unsubscribe_effect(session_id: &str) -> Effect {
 fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Effect> {
     let mut effects = Vec::new();
     let mut mode_effects = Vec::new();
+    let mut plugin_effects = Vec::new();
     if result.ok {
+        if result.result.get("plugins").is_some() && result.result.get("invalid").is_some() {
+            plugin_effects.extend(plugins::apply_list(state, &result.result));
+        }
         if result.result.get("modes").is_some() {
             mode_effects.extend(modes::apply_list(state, &result.result));
         } else if result.result.get("mode").is_some() && result.result.get("changed").is_some() {
@@ -623,6 +643,7 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
         }
         if result.result.get("subscribed").and_then(Value::as_bool) == Some(true) {
             state.connection = ConnectionState::Live;
+            plugin_effects.extend(plugins::on_live(state));
         }
         if result.result.get("sessions").is_some() {
             state.picker.apply_list(result);
@@ -658,6 +679,9 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
         }
         if state.subagents.loading.take().is_some() {
             state.subagents.error = Some(format!("{}: {}", error.code, error.message));
+        }
+        if state.plugins.loading {
+            plugins::apply_error(state, error);
         }
         if error.code == "E_SESSION_LOCKED" {
             state.connection = ConnectionState::ReadOnly;
@@ -701,6 +725,7 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
     if let Some(text) = restored {
         state.composer.text = text;
     }
+    effects.extend(plugin_effects);
     effects.extend(mode_effects);
     effects
 }
@@ -969,6 +994,9 @@ fn exit_session(state: &mut TuiState) -> Vec<Effect> {
 }
 
 fn execute_slash_command(state: &mut TuiState) -> Vec<Effect> {
+    if let Some(effects) = plugins::execute_slash(state) {
+        return effects;
+    }
     if let Some(effects) = modes::execute_slash(state) {
         return effects;
     }
@@ -1015,22 +1043,33 @@ fn session_id(state: &TuiState) -> Option<String> {
 
 fn apply_connection(state: &mut TuiState, event: ConnectionEvent) {
     match event {
-        ConnectionEvent::Connecting => state.connection = ConnectionState::Connecting,
+        ConnectionEvent::Connecting => {
+            state.connection = ConnectionState::Connecting;
+            plugins::on_disconnect(state);
+        }
         ConnectionEvent::Connected { features, .. } => {
             state.connection = ConnectionState::Live;
             state.features = features;
         }
-        ConnectionEvent::Reconnected => state.connection = ConnectionState::Replaying,
+        ConnectionEvent::Reconnected { features } => {
+            state.connection = ConnectionState::Replaying;
+            state.features = features;
+            state.plugins.stale = true;
+        }
         ConnectionEvent::Disconnected {
             retryable: true, ..
         } => {
             state.connection = ConnectionState::Reconnecting {
                 retry_in: Duration::from_secs(1),
-            }
+            };
+            plugins::on_disconnect(state);
         }
         ConnectionEvent::Disconnected {
             retryable: false, ..
-        } => state.connection = ConnectionState::Offline,
+        } => {
+            state.connection = ConnectionState::Offline;
+            plugins::on_disconnect(state);
+        }
         ConnectionEvent::ChildExited {
             status: _,
             stderr_tail,
@@ -1038,11 +1077,13 @@ fn apply_connection(state: &mut TuiState, event: ConnectionEvent) {
             state.connection = ConnectionState::Fatal;
             state.child_stderr_tail = stderr_tail;
             state.overlay = Some(Overlay::Fatal);
+            plugins::on_disconnect(state);
         }
         ConnectionEvent::Fatal { error } => {
             state.connection = ConnectionState::Fatal;
             state.last_error = Some(error);
             state.overlay = Some(Overlay::Fatal);
+            plugins::on_disconnect(state);
         }
     }
 }

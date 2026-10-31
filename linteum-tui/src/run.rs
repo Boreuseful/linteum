@@ -525,6 +525,54 @@ fn overlay_effects(state: &mut TuiState, key: crossterm::event::KeyEvent) -> Opt
             }
             _ => Vec::new(),
         }),
+        Overlay::Plugins => Some(match key.code {
+            KeyCode::Up => reduce(state, Input::Action(UiAction::PluginSelectPrevious)),
+            KeyCode::Down => reduce(state, Input::Action(UiAction::PluginSelectNext)),
+            KeyCode::PageUp => {
+                state.plugins.move_selection(-10);
+                Vec::new()
+            }
+            KeyCode::PageDown => {
+                state.plugins.move_selection(10);
+                Vec::new()
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reduce(state, Input::Action(UiAction::PluginRefresh))
+            }
+            KeyCode::Esc => reduce(state, Input::Action(UiAction::CloseOverlay)),
+            KeyCode::Left => {
+                state.plugins.move_left();
+                Vec::new()
+            }
+            KeyCode::Right => {
+                state.plugins.move_right();
+                Vec::new()
+            }
+            KeyCode::Home => {
+                state.plugins.move_home();
+                Vec::new()
+            }
+            KeyCode::End => {
+                state.plugins.move_end();
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                state.plugins.backspace();
+                Vec::new()
+            }
+            KeyCode::Delete => {
+                state.plugins.delete();
+                Vec::new()
+            }
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                state.plugins.insert_char(ch);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }),
         Overlay::Fatal => Some(match key.code {
             KeyCode::Char('q') => vec![Effect::Quit {
                 mode: state.quit_mode,
@@ -663,5 +711,32 @@ mod tests {
         assert_eq!(state.new_session.title, "y");
         state.new_session.backspace();
         assert_eq!(state.new_session.title, "");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn plugin_overlay_typing_r_filters_and_ctrl_r_refreshes() {
+        let mut state = TuiState::default();
+        state.connection = crate::viewmodel::ConnectionState::Live;
+        state.features = vec!["plugins".into()];
+        state.overlay = Some(Overlay::Plugins);
+
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(effects.is_empty());
+        assert_eq!(state.plugins.filter, "r");
+
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendCommand(command) if command.name == "plugin.list"
+        )));
     }
 }

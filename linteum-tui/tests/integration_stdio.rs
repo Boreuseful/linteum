@@ -116,3 +116,64 @@ async fn spawn_handshake_create_and_subscribe() {
     drop(handle);
     let _ = timeout(Duration::from_secs(10), task).await;
 }
+
+#[tokio::test]
+#[ignore = "requires the linteum CLI"]
+async fn plugin_list_round_trips_over_stdio() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config_path = write_config(dir.path());
+    let bin = resolve_linteum_bin(None, None)
+        .or_else(|_| resolve_linteum_bin(Some(PathBuf::from("/root/.local/bin/linteum")), None));
+    let Ok(bin) = bin else {
+        eprintln!("skipping: linteum CLI not found");
+        return;
+    };
+
+    let transport = spawn_stdio(SpawnConfig {
+        linteum_bin: bin,
+        config_path: Some(config_path),
+        no_lease: true,
+        cwd: Some(workspace),
+        stderr_log: dir.path().join("gateway.log"),
+        teardown_grace: Duration::from_secs(5),
+        term_grace: Duration::from_secs(2),
+    })
+    .await
+    .unwrap();
+
+    let (broker, handle) = CommandBroker::new(Box::new(transport), Duration::from_secs(30));
+    let (input_tx, _input_rx) = mpsc::channel(256);
+    let task = tokio::spawn(broker.run(input_tx));
+
+    let hello = handle
+        .send(spec(
+            "hello",
+            json!({
+                "protocol": 1,
+                "client": {"name": "linteum-tui-test"},
+                "features": ["view", "replay"]
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    let features = hello.result["features"].as_array().unwrap();
+    assert!(
+        features.iter().any(|feature| feature == "plugins"),
+        "gateway did not advertise plugins: {features:?}"
+    );
+
+    let result = handle
+        .send(spec("plugin.list", json!({}), None))
+        .await
+        .unwrap();
+    assert!(result.ok, "plugin.list failed: {:?}", result.error);
+    assert!(result.result["plugins"].is_array());
+    assert!(result.result["invalid"].is_array());
+    assert!(result.result["warnings"].is_array());
+
+    drop(handle);
+    let _ = timeout(Duration::from_secs(10), task).await;
+}

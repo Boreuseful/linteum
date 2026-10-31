@@ -219,6 +219,7 @@ command, `Enter` runs it, `Tab` completes it, and `Esc` closes the menu.
 | `/info` | Show the info panel. |
 | `/subagents` | Show subagent status in the sidebar. |
 | `/refresh` | Reload the workspace tree. |
+| `/plugins` | Inspect loaded capability plugins (read-only). |
 | `/exit` | Leave the current session. |
 | `/quit` | Exit `linteum-tui`. |
 

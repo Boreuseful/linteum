@@ -1,0 +1,412 @@
+//! Plugin panel: read-only snapshot of the host's plugin catalog.
+//!
+//! The panel never mutates plugin state; it only sends `plugin.list` and
+//! renders the returned summary. The host partition (`host:<uuid>`) is not a
+//! session partition, so lifecycle events are deliberately not subscribed to
+//! (plugin design §11.4.6).
+
+use serde_json::{Map, Value};
+
+use super::edit;
+use super::{CommandSpec, ConnectionState, Effect, Overlay, Toast, TuiState};
+use crate::protocol::ErrorInfo;
+
+pub const USAGE: &str = "/plugins";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginEntry {
+    pub id: String,
+    pub version: String,
+    pub description: String,
+    pub state: String,
+    pub trust: String,
+    pub source: String,
+    pub tools: Vec<String>,
+    pub skills: Vec<String>,
+    pub modes: Vec<String>,
+    pub digest: String,
+    pub error: Option<PluginError>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginError {
+    pub code: String,
+    pub message: String,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InvalidPlugin {
+    pub source: String,
+    pub code: String,
+    pub error: String,
+}
+
+impl PluginEntry {
+    fn from_json(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        Some(Self {
+            id: string(object, "id"),
+            version: string(object, "version"),
+            description: string(object, "description"),
+            state: string(object, "state"),
+            trust: string(object, "trust"),
+            source: string(object, "source"),
+            tools: string_list(object.get("tools")),
+            skills: string_list(object.get("skills")),
+            modes: string_list(object.get("modes")),
+            digest: string(object, "digest"),
+            error: object.get("error").and_then(PluginError::from_json),
+            warnings: string_list(object.get("warnings")),
+        })
+    }
+}
+
+impl PluginError {
+    fn from_json(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        Some(Self {
+            code: string(object, "code"),
+            message: string(object, "message"),
+            hint: object
+                .get("hint")
+                .and_then(Value::as_str)
+                .filter(|hint| !hint.is_empty())
+                .map(str::to_owned),
+        })
+    }
+}
+
+impl InvalidPlugin {
+    fn from_json(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        Some(Self {
+            source: string(object, "source"),
+            code: string(object, "code"),
+            error: string(object, "error"),
+        })
+    }
+}
+
+fn string(object: &Map<String, Value>, key: &str) -> String {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One rendered row: a real plugin or an invalid manifest directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginRow<'a> {
+    Plugin(&'a PluginEntry),
+    Invalid(&'a InvalidPlugin),
+}
+
+impl<'a> PluginRow<'a> {
+    pub fn id(&self) -> &'a str {
+        match self {
+            Self::Plugin(entry) => &entry.id,
+            Self::Invalid(invalid) => &invalid.source,
+        }
+    }
+
+    pub fn source(&self) -> &'a str {
+        match self {
+            Self::Plugin(entry) => &entry.source,
+            Self::Invalid(invalid) => &invalid.source,
+        }
+    }
+
+    pub fn state(&self) -> &'a str {
+        match self {
+            Self::Plugin(entry) => &entry.state,
+            Self::Invalid(_) => "invalid",
+        }
+    }
+
+    pub fn version(&self) -> &'a str {
+        match self {
+            Self::Plugin(entry) => &entry.version,
+            Self::Invalid(_) => "-",
+        }
+    }
+
+    pub fn trust(&self) -> &'a str {
+        match self {
+            Self::Plugin(entry) => &entry.trust,
+            Self::Invalid(_) => "-",
+        }
+    }
+
+    pub fn caps(&self) -> (usize, usize, usize) {
+        match self {
+            Self::Plugin(entry) => (entry.tools.len(), entry.skills.len(), entry.modes.len()),
+            Self::Invalid(_) => (0, 0, 0),
+        }
+    }
+}
+
+fn state_rank(state: &str) -> u8 {
+    match state {
+        "active" => 0,
+        "loading" => 1,
+        "quiescing" => 2,
+        "failed" => 3,
+        "disabled" => 4,
+        "discovered" => 5,
+        "unloaded" => 6,
+        "invalid" => 7,
+        _ => 8,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PluginsState {
+    pub entries: Vec<PluginEntry>,
+    pub invalid: Vec<InvalidPlugin>,
+    pub warnings: Vec<String>,
+    pub loaded: bool,
+    pub loading: bool,
+    pub stale: bool,
+    pub error: Option<String>,
+    pub filter: String,
+    pub cursor: usize,
+    pub selected: usize,
+}
+
+impl PluginsState {
+    pub fn insert_char(&mut self, ch: char) {
+        edit::insert_char(&mut self.filter, &mut self.cursor, ch);
+        self.selected = 0;
+    }
+
+    pub fn insert_str(&mut self, text: &str) {
+        edit::insert(&mut self.filter, &mut self.cursor, &text.replace('\n', " "));
+        self.selected = 0;
+    }
+
+    pub fn backspace(&mut self) {
+        edit::backspace(&mut self.filter, &mut self.cursor);
+        self.selected = 0;
+    }
+
+    pub fn delete(&mut self) {
+        edit::delete(&mut self.filter, self.cursor);
+        self.selected = 0;
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor = edit::left(&self.filter, self.cursor);
+    }
+
+    pub fn move_right(&mut self) {
+        self.cursor = edit::right(&self.filter, self.cursor);
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = edit::line_start(&self.filter, self.cursor);
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = edit::line_end(&self.filter, self.cursor);
+    }
+
+    pub fn move_selection(&mut self, delta: isize) {
+        let count = self.filtered_rows().len();
+        if count == 0 {
+            self.selected = 0;
+            return;
+        }
+        let current = self.selected.min(count - 1) as isize;
+        self.selected = (current + delta).clamp(0, count as isize - 1) as usize;
+    }
+
+    pub fn clamp_selection(&mut self) {
+        let count = self.filtered_rows().len();
+        self.selected = if count == 0 {
+            0
+        } else {
+            self.selected.min(count - 1)
+        };
+    }
+
+    /// Rows matching the current filter, in stable display order.
+    pub fn filtered_rows(&self) -> Vec<PluginRow<'_>> {
+        let needle = self.filter.trim().to_ascii_lowercase();
+        let mut rows = Vec::with_capacity(self.entries.len() + self.invalid.len());
+        rows.extend(self.entries.iter().map(PluginRow::Plugin));
+        rows.extend(self.invalid.iter().map(PluginRow::Invalid));
+        if !needle.is_empty() {
+            rows.retain(|row| matches(row, &needle));
+        }
+        rows.sort_by(|left, right| {
+            state_rank(left.state())
+                .cmp(&state_rank(right.state()))
+                .then_with(|| {
+                    left.id()
+                        .to_ascii_lowercase()
+                        .cmp(&right.id().to_ascii_lowercase())
+                })
+                .then_with(|| left.id().cmp(right.id()))
+                .then_with(|| left.source().cmp(right.source()))
+        });
+        rows
+    }
+
+    pub fn selected_row(&self) -> Option<PluginRow<'_>> {
+        self.filtered_rows().into_iter().nth(self.selected)
+    }
+}
+
+fn matches(row: &PluginRow<'_>, needle: &str) -> bool {
+    let haystack = match row {
+        PluginRow::Plugin(entry) => format!(
+            "{} {} {} {} {} {} {} {}",
+            entry.id,
+            entry.source,
+            entry.description,
+            entry.state,
+            entry.trust,
+            entry.tools.join(" "),
+            entry.skills.join(" "),
+            entry.modes.join(" "),
+        ),
+        PluginRow::Invalid(invalid) => {
+            format!("{} {} {}", invalid.source, invalid.code, invalid.error)
+        }
+    };
+    haystack.to_ascii_lowercase().contains(needle)
+}
+
+fn toast(text: impl Into<String>) -> Vec<Effect> {
+    vec![Effect::ShowToast(Toast { text: text.into() })]
+}
+
+fn list_effect() -> Effect {
+    Effect::SendCommand(CommandSpec {
+        name: "plugin.list".to_owned(),
+        args: Map::new(),
+        session_id: None,
+    })
+}
+
+fn can_send(state: &TuiState) -> Result<(), Vec<Effect>> {
+    if !matches!(
+        state.connection,
+        ConnectionState::Live | ConnectionState::ReadOnly
+    ) {
+        return Err(toast("gateway not ready"));
+    }
+    if !state.features.iter().any(|feature| feature == "plugins") {
+        return Err(toast("plugins are not supported by this gateway"));
+    }
+    Ok(())
+}
+
+fn begin_request(state: &mut TuiState) -> Vec<Effect> {
+    state.plugins.stale = true;
+    if state.plugins.loading {
+        return Vec::new();
+    }
+    state.plugins.loading = true;
+    vec![list_effect()]
+}
+
+pub fn open(state: &mut TuiState) -> Vec<Effect> {
+    if let Err(effects) = can_send(state) {
+        return effects;
+    }
+    state.overlay = Some(Overlay::Plugins);
+    state.plugins.filter.clear();
+    state.plugins.cursor = 0;
+    state.plugins.selected = 0;
+    state.plugins.error = None;
+    begin_request(state)
+}
+
+pub fn refresh(state: &mut TuiState) -> Vec<Effect> {
+    if let Err(effects) = can_send(state) {
+        return effects;
+    }
+    begin_request(state)
+}
+
+pub fn execute_slash(state: &mut TuiState) -> Option<Vec<Effect>> {
+    let text = state.composer.text.trim().to_owned();
+    let mut parts = text.split_whitespace();
+    if parts.next() != Some("/plugins") {
+        return None;
+    }
+    let args: Vec<&str> = parts.collect();
+    state.composer.text.clear();
+    state.composer.cursor = 0;
+    state.slash = Default::default();
+    if !args.is_empty() {
+        return Some(toast(format!("usage: {USAGE}")));
+    }
+    Some(open(state))
+}
+
+pub fn move_selection(state: &mut TuiState, delta: isize) {
+    state.plugins.move_selection(delta);
+}
+
+pub fn apply_list(state: &mut TuiState, result: &Value) -> Vec<Effect> {
+    state.plugins.entries = result
+        .get("plugins")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(PluginEntry::from_json).collect())
+        .unwrap_or_default();
+    state.plugins.invalid = result
+        .get("invalid")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(InvalidPlugin::from_json).collect())
+        .unwrap_or_default();
+    state.plugins.warnings = string_list(result.get("warnings"));
+    state.plugins.loaded = true;
+    state.plugins.loading = false;
+    state.plugins.stale = false;
+    state.plugins.error = None;
+    state.plugins.clamp_selection();
+    Vec::new()
+}
+
+pub fn apply_error(state: &mut TuiState, error: &ErrorInfo) {
+    state.plugins.loading = false;
+    state.plugins.stale = state.plugins.loaded;
+    state.plugins.error = Some(format!("{}: {}", error.code, error.message));
+}
+
+/// After a reconnect reaches `Live`, refetch if the panel is waiting.
+pub fn on_live(state: &mut TuiState) -> Vec<Effect> {
+    if state.overlay != Some(Overlay::Plugins) || !state.plugins.stale || state.plugins.loading {
+        return Vec::new();
+    }
+    if !state.features.iter().any(|feature| feature == "plugins") {
+        return Vec::new();
+    }
+    state.plugins.loading = true;
+    vec![list_effect()]
+}
+
+pub fn on_disconnect(state: &mut TuiState) {
+    state.plugins.loading = false;
+    if state.plugins.loaded {
+        state.plugins.stale = true;
+    }
+}

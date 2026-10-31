@@ -731,7 +731,7 @@ class GatewayServer:
                     "error": error.get("message", ""),
                 })
                 continue
-            plugins.append({
+            entry = {
                 "id": summary.id,
                 "version": summary.version,
                 "state": summary.state,
@@ -742,7 +742,13 @@ class GatewayServer:
                 "skills": list(summary.skills),
                 "modes": list(summary.modes),
                 "digest": summary.digest,
-            })
+            }
+            # §11.2 v0.2: explain failed/disabled plugins without a new command.
+            if summary.error:
+                entry["error"] = dict(summary.error)
+            if summary.warnings:
+                entry["warnings"] = list(summary.warnings)
+            plugins.append(entry)
         return {
             "plugins": plugins,
             "invalid": invalid,

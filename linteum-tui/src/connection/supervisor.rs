@@ -237,7 +237,7 @@ pub async fn run_supervisor(
         let connected = if first_connection {
             ConnectionEvent::Connected { features, limits }
         } else {
-            ConnectionEvent::Reconnected
+            ConnectionEvent::Reconnected { features }
         };
         let _ = input_tx.send(Input::Connection(connected)).await;
         first_connection = false;

@@ -78,3 +78,19 @@ fn error_frame_deserializes() {
         other => panic!("expected error, got {other:?}"),
     }
 }
+
+#[test]
+fn plugin_list_command_has_no_session_or_args() {
+    let encoded = encode_command(&command(
+        "c-02",
+        "plugin.list",
+        serde_json::Map::new(),
+        None,
+    ))
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(value["kind"], "cmd");
+    assert_eq!(value["name"], "plugin.list");
+    assert_eq!(value["args"], serde_json::json!({}));
+    assert!(value.get("session_id").is_none());
+}

@@ -205,7 +205,7 @@ impl Harness {
                 .unwrap()
             {
                 Input::Connection(ConnectionEvent::Connected { .. })
-                | Input::Connection(ConnectionEvent::Reconnected) => break,
+                | Input::Connection(ConnectionEvent::Reconnected { .. }) => break,
                 _ => {}
             }
         }

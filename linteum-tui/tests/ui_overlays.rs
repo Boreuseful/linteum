@@ -1,10 +1,14 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use linteum_tui::ui::Theme;
 use linteum_tui::ui::overlays::activity::activity_lines;
 use linteum_tui::ui::overlays::approval::{
     approval_modal_lines, approval_popup_area, render_approval_modal,
 };
 use linteum_tui::ui::palette::{execute, palette_actions};
-use linteum_tui::viewmodel::{ApprovalCard, Effect, Item, ToolCard, TuiState};
+use linteum_tui::viewmodel::{
+    ApprovalCard, ConnectionState, Effect, Item, Overlay, ToolCard, TuiState,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -160,6 +164,24 @@ fn palette_contains_every_action() {
     let actions = palette_actions();
     assert!(actions.iter().any(|action| action.id == "quit"));
     assert!(actions.iter().any(|action| action.id == "toggle_reasoning"));
+    assert!(actions.iter().any(|action| action.id == "plugins"));
+}
+
+#[test]
+fn palette_execute_opens_the_plugin_panel() {
+    let mut state = TuiState::default();
+    state.connection = ConnectionState::Live;
+    state.features = vec!["plugins".into()];
+    let action = palette_actions()
+        .into_iter()
+        .find(|action| action.id == "plugins")
+        .unwrap();
+    let effects = execute(action, &mut state);
+    assert_eq!(state.overlay, Some(Overlay::Plugins));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendCommand(command) if command.name == "plugin.list"
+    )));
 }
 
 #[test]
