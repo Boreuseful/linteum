@@ -10,7 +10,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ui::Theme;
 use crate::ui::widgets::render_lines;
-use crate::viewmodel::{ConnectionState, PluginEntry, PluginRow, TuiState};
+use crate::viewmodel::{
+    ConnectionState, PluginAction, PluginEntry, PluginRow, TuiState, pending_restart,
+};
 
 const MAX_NAMES_PER_KIND: usize = 8;
 const MIN_LIST_ROWS: usize = 8;
@@ -23,10 +25,13 @@ pub fn plugin_panel_lines(
     height: u16,
 ) -> Vec<Line<'static>> {
     let rows = state.plugins.filtered_rows();
-    let has_extra = state.plugins.error.is_some() || !state.plugins.warnings.is_empty();
+    let has_extra = state.plugins.error.is_some()
+        || state.plugins.last_manage_error.is_some()
+        || !state.plugins.warnings.is_empty();
     // With no rows the status line already carries the command error; do not
     // repeat it in the extra slot (§11.4.7).
-    let error_in_status = rows.is_empty() && state.plugins.error.is_some();
+    let error_in_status = rows.is_empty()
+        && (state.plugins.error.is_some() || state.plugins.last_manage_error.is_some());
     let show_extra = has_extra && !error_in_status;
     let extra_count = usize::from(show_extra);
     let detail_budget = usize::from(height)
@@ -117,6 +122,20 @@ fn header_line(state: &TuiState, theme: &Theme, width: u16) -> Line<'static> {
             theme.muted
         },
     );
+    let restart = state
+        .plugins
+        .entries
+        .iter()
+        .filter(|entry| pending_restart(entry))
+        .count();
+    if restart > 0 {
+        push_fit(
+            &mut spans,
+            &mut remaining,
+            format!(" · {restart} restart"),
+            theme.warning,
+        );
+    }
     if state.plugins.loading || state.plugins.stale {
         push_fit(
             &mut spans,
@@ -152,7 +171,12 @@ fn filter_line(state: &TuiState, theme: &Theme, width: u16) -> Line<'static> {
 }
 
 fn status_line(state: &TuiState, theme: &Theme, width: u16) -> Line<'static> {
-    let (text, style) = if let Some(error) = &state.plugins.error {
+    let status_error = state
+        .plugins
+        .error
+        .as_ref()
+        .or(state.plugins.last_manage_error.as_ref());
+    let (text, style) = if let Some(error) = status_error {
         (format!("{error} · Ctrl+R retry · Esc close"), theme.danger)
     } else if state.plugins.loading || !state.plugins.loaded {
         ("loading plugins…".to_owned(), theme.muted)
@@ -170,13 +194,23 @@ fn status_line(state: &TuiState, theme: &Theme, width: u16) -> Line<'static> {
 
 fn row_line(row: &PluginRow<'_>, theme: &Theme, width: u16, selected: bool) -> Line<'static> {
     let with_trust = width >= 96;
-    let fixed = 2 + 10 + 1 + 8 + 1 + 9 + 1 + if with_trust { 12 } else { 0 };
+    let fixed = 2 + 1 + 10 + 1 + 8 + 1 + 9 + 1 + if with_trust { 12 } else { 0 };
     let id_width = usize::from(width).saturating_sub(fixed).max(16);
     let (tools, skills, modes) = row.caps();
     let marker = if selected { "› " } else { "  " };
+    let sign = match row.enabled() {
+        Some(true) => '+',
+        Some(false) => '-',
+        None => '?',
+    };
+    let state_text = if matches!(row, PluginRow::Plugin(entry) if pending_restart(entry)) {
+        format!("{}*", row.state())
+    } else {
+        row.state().to_owned()
+    };
     let mut text = format!(
-        "{marker}{:<10} {:<id_width$} {:<8} {:<9}",
-        fit(row.state(), 10),
+        "{marker}{sign}{:<10} {:<id_width$} {:<8} {:<9}",
+        fit(&state_text, 10),
         fit(row.id(), id_width),
         fit(row.version(), 8),
         fit(&format!("{tools}/{skills}/{modes}"), 9),
@@ -236,6 +270,18 @@ fn detail_lines(state: &TuiState, theme: &Theme, budget: usize, width: u16) -> V
                 ),
                 width,
             )));
+            if let Some(enabled) = entry.enabled {
+                // Config vs. runtime are deliberately separate (§11.5.6).
+                let mut line = format!(
+                    "config: {} · runtime: {}",
+                    if enabled { "enabled" } else { "disabled" },
+                    entry.state
+                );
+                if pending_restart(entry) {
+                    line.push_str(" · restart required");
+                }
+                lines.push(Line::from(fit(&line, width)));
+            }
             lines.push(Line::from(fit(&capabilities_line(entry), width)));
             if let Some(status) = status_detail(entry) {
                 lines.push(Line::from(fit(&status, width)));
@@ -287,7 +333,11 @@ fn status_detail(entry: &PluginEntry) -> Option<String> {
     let mut parts = Vec::new();
     match entry.state.as_str() {
         "disabled" => {
-            parts.push("not enabled; add the id to agent.plugins.allow and restart".to_owned())
+            if entry.enabled == Some(true) {
+                parts.push("enabled; restart the host to load".to_owned());
+            } else {
+                parts.push("not enabled; add the id to agent.plugins.allow and restart".to_owned());
+            }
         }
         "discovered" => parts.push("not loaded".to_owned()),
         _ => {}
@@ -307,6 +357,9 @@ fn status_detail(entry: &PluginEntry) -> Option<String> {
 
 fn extra_line(state: &TuiState, theme: &Theme, width: u16) -> Line<'static> {
     if let Some(error) = &state.plugins.error {
+        return Line::from(Span::styled(fit(error, width as usize), theme.danger));
+    }
+    if let Some(error) = &state.plugins.last_manage_error {
         return Line::from(Span::styled(fit(error, width as usize), theme.danger));
     }
     if state.plugins.warnings.is_empty() {
@@ -330,16 +383,44 @@ fn extra_line(state: &TuiState, theme: &Theme, width: u16) -> Line<'static> {
 }
 
 fn footer_line(state: &TuiState, theme: &Theme, width: u16) -> Line<'static> {
+    if let Some(action) = state.plugins.pending {
+        // The confirmation replaces the footer, not the layout (§11.5.6).
+        let entry = match state.plugins.selected_row() {
+            Some(PluginRow::Plugin(entry)) => Some(entry),
+            _ => None,
+        };
+        let (id, trust) = entry
+            .map(|entry| (entry.id.as_str(), entry.trust.as_str()))
+            .unwrap_or(("", ""));
+        let text = match action {
+            PluginAction::Enable => format!(
+                "y/N · Enable {id} [{trust}]? Plugin code loads on the next host \
+                 start. Writes agent.plugins.allow."
+            ),
+            PluginAction::Disable => format!(
+                "y/N · Disable {id}? Running plugin stays active until the host \
+                 restarts. Writes agent.plugins.allow."
+            ),
+        };
+        return Line::from(Span::styled(fit(&text, width as usize), theme.warning));
+    }
     let offline = matches!(
         state.connection,
         ConnectionState::Offline | ConnectionState::Reconnecting { .. } | ConnectionState::Fatal
     );
-    let text = if offline {
-        "offline · type to filter · ↑↓ select · PgUp/PgDn · Ctrl+R refresh · Esc close"
+    let manage = if state.plugins.manage {
+        " · Ctrl+E/Ctrl+D manage"
     } else {
-        "type to filter · ↑↓ select · PgUp/PgDn · Ctrl+R refresh · Esc close"
+        ""
     };
-    Line::from(Span::styled(fit(text, width as usize), theme.muted))
+    let text = if offline {
+        format!(
+            "offline · type to filter · ↑↓ select · PgUp/PgDn · Ctrl+R refresh{manage} · Esc close"
+        )
+    } else {
+        format!("type to filter · ↑↓ select · PgUp/PgDn · Ctrl+R refresh{manage} · Esc close")
+    };
+    Line::from(Span::styled(fit(&text, width as usize), theme.muted))
 }
 
 fn visible_offset(selected: usize, height: usize) -> usize {

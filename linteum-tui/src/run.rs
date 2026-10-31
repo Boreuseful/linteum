@@ -525,6 +525,20 @@ fn overlay_effects(state: &mut TuiState, key: crossterm::event::KeyEvent) -> Opt
             }
             _ => Vec::new(),
         }),
+        Overlay::Plugins if state.plugins.pending.is_some() => Some(match key.code {
+            // The confirmation bar owns the keyboard: `y` sends, `n`/Esc
+            // cancels, everything else is ignored (§11.5.5).
+            KeyCode::Char('y')
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                reduce(state, Input::Action(UiAction::PluginConfirm))
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                reduce(state, Input::Action(UiAction::PluginCancel))
+            }
+            _ => Vec::new(),
+        }),
         Overlay::Plugins => Some(match key.code {
             KeyCode::Up => reduce(state, Input::Action(UiAction::PluginSelectPrevious)),
             KeyCode::Down => reduce(state, Input::Action(UiAction::PluginSelectNext)),
@@ -538,6 +552,12 @@ fn overlay_effects(state: &mut TuiState, key: crossterm::event::KeyEvent) -> Opt
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 reduce(state, Input::Action(UiAction::PluginRefresh))
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reduce(state, Input::Action(UiAction::PluginEnable))
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reduce(state, Input::Action(UiAction::PluginDisable))
             }
             KeyCode::Esc => reduce(state, Input::Action(UiAction::CloseOverlay)),
             KeyCode::Left => {
@@ -738,5 +758,53 @@ mod tests {
             effect,
             Effect::SendCommand(command) if command.name == "plugin.list"
         )));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn ctrl_e_opens_confirmation_and_y_sends_while_esc_cancels() {
+        let mut state = TuiState::default();
+        state.connection = crate::viewmodel::ConnectionState::Live;
+        state.features = vec!["plugins".into(), "plugins.manage".into()];
+        state.plugins.manage = true;
+        state.plugins.loaded = true;
+        state.plugins.entries = vec![crate::viewmodel::PluginEntry {
+            id: "acme.search".into(),
+            state: "disabled".into(),
+            enabled: Some(false),
+            ..Default::default()
+        }];
+        state.overlay = Some(Overlay::Plugins);
+
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(effects.is_empty());
+        assert_eq!(
+            state.plugins.pending,
+            Some(crate::viewmodel::PluginAction::Enable)
+        );
+
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendCommand(command) if command.name == "plugin.enable"
+        )));
+        assert!(state.plugins.managing);
+
+        // Esc while a confirmation is open cancels it instead of closing.
+        state.plugins.managing = false;
+        state.plugins.pending = Some(crate::viewmodel::PluginAction::Disable);
+        let effects =
+            overlay_effects(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(effects.is_empty());
+        assert_eq!(state.plugins.pending, None);
+        assert_eq!(state.overlay, Some(Overlay::Plugins));
     }
 }

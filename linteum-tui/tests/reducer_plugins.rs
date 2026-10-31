@@ -2,8 +2,8 @@
 
 use linteum_tui::protocol::{CommandResult, ErrorInfo};
 use linteum_tui::viewmodel::{
-    CommandSpec, ConnectionEvent, ConnectionState, Effect, Input, Overlay, SessionView, TuiState,
-    UiAction, reduce,
+    CommandSpec, ConnectionEvent, ConnectionState, Effect, Input, Overlay, PluginAction,
+    SessionView, TuiState, UiAction, reduce,
 };
 use serde_json::{Value, json};
 
@@ -99,9 +99,17 @@ fn loaded_state() -> TuiState {
         skills: vec!["web-research".into()],
         modes: vec!["research".into()],
         digest: "sha256:abc".into(),
+        enabled: Some(true),
         error: None,
         warnings: Vec::new(),
     }];
+    state
+}
+
+fn managed_state() -> TuiState {
+    let mut state = loaded_state();
+    state.features = vec!["view".into(), "plugins".into(), "plugins.manage".into()];
+    state.plugins.manage = true;
     state
 }
 
@@ -372,4 +380,216 @@ fn plugin_actions_only_send_plugin_list() {
     let refresh = reduce(&mut state, Input::Action(UiAction::PluginRefresh));
     assert!(commands(&refresh).iter().all(|c| c.name == "plugin.list"));
     assert!(commands(&refresh).iter().all(|c| c.session_id.is_none()));
+}
+
+#[test]
+fn list_parses_enabled_and_manage() {
+    let mut state = state();
+    state.plugins.loading = true;
+    let mut enabled = entry("acme.search", "active");
+    enabled["enabled"] = json!(true);
+    let mut disabled = entry("other.disabled", "disabled");
+    disabled["enabled"] = json!(false);
+
+    reduce(
+        &mut state,
+        Input::CommandResult(ok(json!({
+            "plugins": [enabled, disabled],
+            "invalid": [],
+            "warnings": [],
+            "manage": true,
+        }))),
+    );
+
+    assert!(state.plugins.manage);
+    assert_eq!(state.plugins.entries[0].enabled, Some(true));
+    assert_eq!(state.plugins.entries[1].enabled, Some(false));
+}
+
+#[test]
+fn old_gateway_fields_are_optional() {
+    let mut state = state();
+    state.plugins.loading = true;
+    reduce(
+        &mut state,
+        Input::CommandResult(ok(json!({
+            "plugins": [entry("acme.search", "active")],
+            "invalid": [],
+            "warnings": [],
+        }))),
+    );
+    assert!(!state.plugins.manage);
+    assert_eq!(state.plugins.entries[0].enabled, None);
+}
+
+#[test]
+fn disable_opens_confirmation_and_confirm_sends_the_command() {
+    let mut state = managed_state();
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginDisable));
+
+    assert!(commands(&effects).is_empty());
+    assert_eq!(state.plugins.pending, Some(PluginAction::Disable));
+
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginConfirm));
+    let sent = commands(&effects);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].name, "plugin.disable");
+    assert_eq!(sent[0].args.get("id"), Some(&json!("acme.search")));
+    assert!(sent[0].session_id.is_none());
+    assert!(state.plugins.managing);
+    assert_eq!(state.plugins.pending, None);
+}
+
+#[test]
+fn enable_is_gated_by_feature_and_manage() {
+    let mut state = loaded_state();
+    state.plugins.entries[0].enabled = Some(false);
+    state.features = vec!["plugins".into()];
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginEnable));
+    assert_eq!(state.plugins.pending, None);
+    assert!(commands(&effects).is_empty());
+    assert!(has_toast(&effects, "management is disabled"));
+
+    let mut state = loaded_state();
+    state.plugins.entries[0].enabled = Some(false);
+    state.features = vec!["plugins".into(), "plugins.manage".into()];
+    state.plugins.manage = false;
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginEnable));
+    assert_eq!(state.plugins.pending, None);
+    assert!(has_toast(&effects, "management is disabled"));
+}
+
+#[test]
+fn already_enabled_and_disabled_are_noops() {
+    let mut state = managed_state();
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginEnable));
+    assert_eq!(state.plugins.pending, None);
+    assert!(has_toast(&effects, "already enabled"));
+
+    state.plugins.entries[0].enabled = Some(false);
+    state.plugins.entries[0].state = "disabled".into();
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginDisable));
+    assert_eq!(state.plugins.pending, None);
+    assert!(has_toast(&effects, "already disabled"));
+}
+
+#[test]
+fn invalid_rows_have_no_management_action() {
+    let mut state = state();
+    state.features = vec!["plugins".into(), "plugins.manage".into()];
+    state.plugins.manage = true;
+    state.plugins.loaded = true;
+    state.plugins.invalid = vec![linteum_tui::viewmodel::InvalidPlugin {
+        source: "broken".into(),
+        code: "E_PLUGIN_MANIFEST".into(),
+        error: "bad yaml".into(),
+    }];
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginEnable));
+    assert_eq!(state.plugins.pending, None);
+    assert!(has_toast(&effects, "not a plugin id"));
+}
+
+#[test]
+fn manage_result_updates_the_row_and_pending_restart() {
+    let mut state = managed_state();
+    state.plugins.managing = true;
+    state.plugins.pending = Some(PluginAction::Disable);
+
+    let mut plugin = entry("acme.search", "active");
+    plugin["enabled"] = json!(false);
+    let effects = reduce(
+        &mut state,
+        Input::CommandResult(ok(json!({
+            "plugin": plugin,
+            "changed": true,
+            "persisted": true,
+            "restart_required": true,
+            "warnings": [],
+        }))),
+    );
+
+    assert!(!state.plugins.managing);
+    assert_eq!(state.plugins.pending, None);
+    assert_eq!(state.plugins.entries[0].enabled, Some(false));
+    assert_eq!(state.plugins.entries[0].state, "active");
+    assert!(state.plugins.restart_required);
+    assert!(commands(&effects).is_empty());
+}
+
+#[test]
+fn manage_noop_results_toast() {
+    let mut state = managed_state();
+    state.plugins.managing = true;
+    let mut plugin = entry("acme.search", "active");
+    plugin["enabled"] = json!(true);
+    let effects = reduce(
+        &mut state,
+        Input::CommandResult(ok(json!({
+            "plugin": plugin,
+            "changed": false,
+            "persisted": true,
+            "restart_required": false,
+        }))),
+    );
+    assert!(has_toast(&effects, "no change"));
+}
+
+#[test]
+fn manage_error_clears_managing_and_keeps_rows() {
+    let mut state = managed_state();
+    state.plugins.managing = true;
+    state.plugins.pending = Some(PluginAction::Disable);
+    let effects = reduce(&mut state, Input::CommandResult(err("E_PLUGIN_CONFIG")));
+
+    assert!(!state.plugins.managing);
+    assert_eq!(state.plugins.pending, None);
+    assert_eq!(state.plugins.entries.len(), 1);
+    assert!(
+        state
+            .plugins
+            .last_manage_error
+            .as_deref()
+            .is_some_and(|error| error.contains("E_PLUGIN_CONFIG"))
+    );
+    assert!(has_toast(&effects, "E_PLUGIN_CONFIG"));
+}
+
+#[test]
+fn manage_disabled_error_hides_management_keys() {
+    let mut state = managed_state();
+    state.plugins.managing = true;
+    reduce(
+        &mut state,
+        Input::CommandResult(err("E_PLUGIN_MANAGE_DISABLED")),
+    );
+    assert!(!state.plugins.manage);
+}
+
+#[test]
+fn disconnect_cancels_a_pending_management_action() {
+    let mut state = managed_state();
+    state.plugins.managing = true;
+    state.plugins.pending = Some(PluginAction::Enable);
+    reduce(
+        &mut state,
+        Input::Connection(ConnectionEvent::Disconnected {
+            retryable: true,
+            reason: "eof".into(),
+        }),
+    );
+    assert!(!state.plugins.managing);
+    assert_eq!(state.plugins.pending, None);
+}
+
+#[test]
+fn management_commands_never_carry_a_session() {
+    let mut state = managed_state();
+    state.plugins.entries[0].enabled = Some(false);
+    reduce(&mut state, Input::Action(UiAction::PluginEnable));
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginConfirm));
+    assert!(
+        commands(&effects)
+            .iter()
+            .all(|command| { command.name == "plugin.enable" && command.session_id.is_none() })
+    );
 }

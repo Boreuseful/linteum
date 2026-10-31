@@ -25,6 +25,8 @@ pub struct PluginEntry {
     pub skills: Vec<String>,
     pub modes: Vec<String>,
     pub digest: String,
+    /// File-level `agent.plugins.allow` membership; `None` on old gateways.
+    pub enabled: Option<bool>,
     pub error: Option<PluginError>,
     pub warnings: Vec<String>,
 }
@@ -57,6 +59,7 @@ impl PluginEntry {
             skills: string_list(object.get("skills")),
             modes: string_list(object.get("modes")),
             digest: string(object, "digest"),
+            enabled: object.get("enabled").and_then(Value::as_bool),
             error: object.get("error").and_then(PluginError::from_json),
             warnings: string_list(object.get("warnings")),
         })
@@ -159,6 +162,30 @@ impl<'a> PluginRow<'a> {
             Self::Invalid(_) => (0, 0, 0),
         }
     }
+
+    pub fn enabled(&self) -> Option<bool> {
+        match self {
+            Self::Plugin(entry) => entry.enabled,
+            Self::Invalid(_) => None,
+        }
+    }
+}
+
+/// File-level enablement differs from the runtime state: a saved change only
+/// takes effect after the host restarts (§11.5.4).
+pub fn pending_restart(entry: &PluginEntry) -> bool {
+    match entry.enabled {
+        Some(true) => matches!(entry.state.as_str(), "disabled" | "discovered" | "unloaded"),
+        Some(false) => matches!(entry.state.as_str(), "active" | "loading" | "quiescing"),
+        None => false,
+    }
+}
+
+/// One pending confirmation in the `/plugins` panel (§11.5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginAction {
+    Enable,
+    Disable,
 }
 
 fn state_rank(state: &str) -> u8 {
@@ -187,6 +214,15 @@ pub struct PluginsState {
     pub filter: String,
     pub cursor: usize,
     pub selected: usize,
+    /// Whether the gateway accepts `plugin.enable`/`plugin.disable` right now.
+    pub manage: bool,
+    /// A manage command is in flight (single-flight, like `loading`).
+    pub managing: bool,
+    /// Confirmation bar waiting for `y` / `n`.
+    pub pending: Option<PluginAction>,
+    pub last_manage_error: Option<String>,
+    /// At least one row has a saved change that needs a host restart.
+    pub restart_required: bool,
 }
 
 impl PluginsState {
@@ -378,10 +414,16 @@ pub fn apply_list(state: &mut TuiState, result: &Value) -> Vec<Effect> {
         .map(|items| items.iter().filter_map(InvalidPlugin::from_json).collect())
         .unwrap_or_default();
     state.plugins.warnings = string_list(result.get("warnings"));
+    state.plugins.manage = result
+        .get("manage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     state.plugins.loaded = true;
     state.plugins.loading = false;
     state.plugins.stale = false;
     state.plugins.error = None;
+    state.plugins.last_manage_error = None;
+    state.plugins.restart_required = state.plugins.entries.iter().any(pending_restart);
     state.plugins.clamp_selection();
     Vec::new()
 }
@@ -390,6 +432,126 @@ pub fn apply_error(state: &mut TuiState, error: &ErrorInfo) {
     state.plugins.loading = false;
     state.plugins.stale = state.plugins.loaded;
     state.plugins.error = Some(format!("{}: {}", error.code, error.message));
+}
+
+fn can_manage(state: &TuiState) -> bool {
+    state
+        .features
+        .iter()
+        .any(|feature| feature == "plugins.manage")
+        && state.plugins.manage
+}
+
+fn selected_plugin(state: &TuiState) -> Option<(String, Option<bool>)> {
+    match state.plugins.selected_row()? {
+        PluginRow::Plugin(entry) => Some((entry.id.clone(), entry.enabled)),
+        PluginRow::Invalid(_) => None,
+    }
+}
+
+/// `Ctrl+E` / `Ctrl+D`: open a confirmation bar (never sends by itself).
+pub fn begin_manage(state: &mut TuiState, action: PluginAction) -> Vec<Effect> {
+    if state.plugins.managing || state.plugins.pending.is_some() {
+        return Vec::new();
+    }
+    if !can_manage(state) {
+        return toast("plugin management is disabled");
+    }
+    let Some((_id, enabled)) = selected_plugin(state) else {
+        return toast("not a plugin id");
+    };
+    match (action, enabled) {
+        (PluginAction::Enable, Some(true)) => return toast("already enabled"),
+        (PluginAction::Disable, Some(false)) => return toast("already disabled"),
+        _ => {}
+    }
+    state.plugins.pending = Some(action);
+    Vec::new()
+}
+
+/// `y`: send the confirmed `plugin.enable` / `plugin.disable`.
+pub fn confirm_manage(state: &mut TuiState) -> Vec<Effect> {
+    let Some(action) = state.plugins.pending else {
+        return Vec::new();
+    };
+    if state.plugins.managing {
+        return Vec::new();
+    }
+    let Some((id, _enabled)) = selected_plugin(state) else {
+        state.plugins.pending = None;
+        return toast("not a plugin id");
+    };
+    state.plugins.pending = None;
+    state.plugins.managing = true;
+    state.plugins.last_manage_error = None;
+    let mut args = Map::new();
+    args.insert("id".into(), Value::String(id));
+    vec![Effect::SendCommand(CommandSpec {
+        name: match action {
+            PluginAction::Enable => "plugin.enable".to_owned(),
+            PluginAction::Disable => "plugin.disable".to_owned(),
+        },
+        args,
+        session_id: None,
+    })]
+}
+
+/// `n` / `Esc` while the confirmation bar is open.
+pub fn cancel_manage(state: &mut TuiState) -> Vec<Effect> {
+    state.plugins.pending = None;
+    Vec::new()
+}
+
+pub fn apply_manage_result(state: &mut TuiState, result: &Value) -> Vec<Effect> {
+    state.plugins.managing = false;
+    state.plugins.pending = None;
+    state.plugins.last_manage_error = None;
+    if let Some(plugin) = result.get("plugin").and_then(Value::as_object) {
+        let id = plugin.get("id").and_then(Value::as_str).unwrap_or_default();
+        if let Some(entry) = state
+            .plugins
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+        {
+            entry.enabled = plugin.get("enabled").and_then(Value::as_bool);
+            if let Some(runtime_state) = plugin.get("state").and_then(Value::as_str) {
+                entry.state = runtime_state.to_owned();
+            }
+        }
+    }
+    state.plugins.restart_required = state.plugins.entries.iter().any(pending_restart);
+
+    let changed = result
+        .get("changed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let restart = result
+        .get("restart_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if changed {
+        Vec::new()
+    } else if restart {
+        toast("already saved · restart required")
+    } else {
+        toast("no change")
+    }
+}
+
+pub fn apply_manage_error(state: &mut TuiState, error: &ErrorInfo) -> Vec<Effect> {
+    state.plugins.managing = false;
+    state.plugins.pending = None;
+    state.plugins.last_manage_error = Some(format!("{}: {}", error.code, error.message));
+    if error.code == "E_PLUGIN_MANAGE_DISABLED" {
+        state.plugins.manage = false;
+        return Vec::new();
+    }
+    if error.code == "E_PLUGIN_NOT_FOUND" {
+        // The row was stale; refresh the snapshot (§11.5.5).
+        return refresh(state);
+    }
+    Vec::new()
 }
 
 /// After a reconnect reaches `Live`, refetch if the panel is waiting.
@@ -406,6 +568,9 @@ pub fn on_live(state: &mut TuiState) -> Vec<Effect> {
 
 pub fn on_disconnect(state: &mut TuiState) {
     state.plugins.loading = false;
+    // A confirmed action is not retried automatically (§11.5.5).
+    state.plugins.managing = false;
+    state.plugins.pending = None;
     if state.plugins.loaded {
         state.plugins.stale = true;
     }

@@ -80,6 +80,27 @@ fn error_frame_deserializes() {
 }
 
 #[test]
+fn plugin_manage_commands_carry_only_an_id() {
+    for (name, id) in [
+        ("plugin.enable", "acme.search"),
+        ("plugin.disable", "acme.search"),
+    ] {
+        let encoded = encode_command(&command(
+            "c-03",
+            name,
+            serde_json::json!({"id": id}).as_object().unwrap().clone(),
+            None,
+        ))
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["kind"], "cmd");
+        assert_eq!(value["name"], name);
+        assert_eq!(value["args"], serde_json::json!({"id": id}));
+        assert!(value.get("session_id").is_none());
+    }
+}
+
+#[test]
 fn plugin_list_command_has_no_session_or_args() {
     let encoded = encode_command(&command(
         "c-02",

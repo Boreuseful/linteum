@@ -3,7 +3,7 @@
 use linteum_tui::ui::Theme;
 use linteum_tui::ui::screens::plugin_panel::plugin_panel_lines;
 use linteum_tui::viewmodel::{
-    ConnectionState, InvalidPlugin, Overlay, PluginEntry, PluginError, TuiState,
+    ConnectionState, InvalidPlugin, Overlay, PluginAction, PluginEntry, PluginError, TuiState,
 };
 use ratatui::text::Line;
 
@@ -214,4 +214,88 @@ fn overlay_renders_at_80x24() {
     assert!(rendered.contains("Plugins"));
     assert!(rendered.contains("Ctrl+R refresh"));
     assert!(rendered.contains("acme.search"));
+}
+
+fn managed_state() -> TuiState {
+    let mut state = state();
+    state.plugins.manage = true;
+    state.plugins.entries = vec![
+        PluginEntry {
+            enabled: Some(true),
+            ..entry("acme.search", "active")
+        },
+        PluginEntry {
+            enabled: Some(false),
+            state: "disabled".into(),
+            ..entry("other.disabled", "disabled")
+        },
+        PluginEntry {
+            enabled: None,
+            ..entry("legacy.plugin", "active")
+        },
+    ];
+    state
+}
+
+#[test]
+fn rows_show_enabled_markers() {
+    let rendered = joined(&lines(&managed_state()));
+    assert!(rendered.contains("+active"));
+    assert!(rendered.contains("-disabled"));
+    assert!(rendered.contains("?active"));
+}
+
+#[test]
+fn pending_restart_is_marked_on_the_row_and_in_the_header() {
+    let mut state = state();
+    state.plugins.entries = vec![PluginEntry {
+        enabled: Some(false),
+        ..entry("acme.search", "active")
+    }];
+    let rendered = joined(&lines(&state));
+    assert!(rendered.contains("active*"));
+    assert!(rendered.contains("1 restart"));
+    assert!(rendered.contains("config: disabled"));
+    assert!(rendered.contains("runtime: active"));
+    assert!(rendered.contains("restart required"));
+}
+
+#[test]
+fn management_keys_appear_only_when_manage_is_enabled() {
+    let read_only = text(lines(&state()).last().expect("footer"));
+    assert!(!read_only.contains("Ctrl+E"));
+
+    let managed = text(lines(&managed_state()).last().expect("footer"));
+    assert!(managed.contains("Ctrl+E"));
+    assert!(managed.contains("Ctrl+D"));
+}
+
+#[test]
+fn enable_confirmation_replaces_the_footer() {
+    let mut state = managed_state();
+    state.plugins.pending = Some(PluginAction::Enable);
+    let footer = text(lines(&state).last().expect("footer"));
+    assert!(footer.contains("Enable acme.search"));
+    assert!(footer.contains("third-party"));
+    assert!(footer.contains("y/N"));
+    assert!(!footer.contains("Ctrl+R refresh"));
+}
+
+#[test]
+fn disable_confirmation_mentions_restart_semantics() {
+    let mut state = managed_state();
+    state.plugins.pending = Some(PluginAction::Disable);
+    let footer = text(lines(&state).last().expect("footer"));
+    assert!(footer.contains("Disable acme.search"));
+    assert!(footer.contains("host restarts"));
+    assert!(footer.contains("y/N"));
+}
+
+#[test]
+fn manage_error_is_shown_once_when_the_list_is_empty() {
+    let mut state = TuiState::default();
+    state.plugins.loaded = true;
+    state.plugins.last_manage_error = Some("E_PLUGIN_CONFIG: nope".into());
+    let rendered = joined(&lines(&state));
+    assert_eq!(rendered.matches("E_PLUGIN_CONFIG: nope").count(), 1);
 }

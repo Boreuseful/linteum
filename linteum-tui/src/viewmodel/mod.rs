@@ -21,7 +21,9 @@ pub use approvals::{ApprovalDecision, ApprovalState};
 pub use artifacts::{ArtifactError, ArtifactViewerState};
 pub use cursor::SessionCursor;
 pub use modes::{CurrentMode, ModeOption, ModePickerState, ModeState, ModeSwitchResult};
-pub use plugins::{InvalidPlugin, PluginEntry, PluginError, PluginRow, PluginsState};
+pub use plugins::{
+    InvalidPlugin, PluginAction, PluginEntry, PluginError, PluginRow, PluginsState, pending_restart,
+};
 pub use queue::{QueueEntryState, QueueState, QueuedMessage};
 pub use sessions::{NewSessionForm, SessionInfo, SessionPickerState};
 pub use sidebar::{SidebarLayout, SidebarPanel, SidebarState, TreeRow, WorkspaceEntry};
@@ -96,6 +98,10 @@ pub enum UiAction {
     PluginSelectNext,
     PluginSelectPrevious,
     PluginRefresh,
+    PluginEnable,
+    PluginDisable,
+    PluginConfirm,
+    PluginCancel,
     Resume,
     Quit,
     ExitSession,
@@ -322,6 +328,10 @@ fn reduce_action(state: &mut TuiState, action: UiAction) -> Vec<Effect> {
             Vec::new()
         }
         UiAction::PluginRefresh => plugins::refresh(state),
+        UiAction::PluginEnable => plugins::begin_manage(state, PluginAction::Enable),
+        UiAction::PluginDisable => plugins::begin_manage(state, PluginAction::Disable),
+        UiAction::PluginConfirm => plugins::confirm_manage(state),
+        UiAction::PluginCancel => plugins::cancel_manage(state),
         UiAction::RetryConnection => vec![Effect::ReconnectNow],
         UiAction::Resume => {
             if state.session.as_ref().map(|s| s.phase.as_str()) == Some("paused") {
@@ -632,6 +642,11 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
     if result.ok {
         if result.result.get("plugins").is_some() && result.result.get("invalid").is_some() {
             plugin_effects.extend(plugins::apply_list(state, &result.result));
+        } else if result.result.get("plugin").is_some()
+            && result.result.get("changed").is_some()
+            && result.result.get("restart_required").is_some()
+        {
+            plugin_effects.extend(plugins::apply_manage_result(state, &result.result));
         }
         if result.result.get("modes").is_some() {
             mode_effects.extend(modes::apply_list(state, &result.result));
@@ -680,7 +695,9 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
         if state.subagents.loading.take().is_some() {
             state.subagents.error = Some(format!("{}: {}", error.code, error.message));
         }
-        if state.plugins.loading {
+        if state.plugins.managing {
+            plugin_effects.extend(plugins::apply_manage_error(state, error));
+        } else if state.plugins.loading {
             plugins::apply_error(state, error);
         }
         if error.code == "E_SESSION_LOCKED" {
