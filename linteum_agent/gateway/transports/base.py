@@ -19,11 +19,6 @@ from typing import Optional, Protocol, runtime_checkable
 class Transport(Protocol):
     """One bidirectional, message-framed connection."""
 
-    #: ``True`` when the peer is local to this process/machine (embedded
-    #: queues, stdio, loopback WebSocket).  Runtime plugin commands are gated
-    #: on it (§5.6).
-    is_local: bool
-
     async def recv(self) -> Optional[str | bytes]: ...
 
     async def send(self, data: str | bytes) -> None: ...

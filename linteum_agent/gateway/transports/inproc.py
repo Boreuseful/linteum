@@ -19,9 +19,6 @@ from typing import Optional
 class InProcTransport:
     """One end of an in-memory, full-duplex JSON message channel."""
 
-    #: The peer runs in this process (§5.6).
-    is_local = True
-
     def __init__(self, inbox: asyncio.Queue, outbox: asyncio.Queue) -> None:
         self._inbox = inbox
         self._outbox = outbox

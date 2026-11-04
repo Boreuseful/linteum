@@ -41,15 +41,12 @@ SECTION_TITLES: dict[str, str] = {
     "agent.skills": "Skills",
     "agent.budget": "预算",
     "agent.session": "会话默认值",
-    "agent.modes": "模式",
-    "agent.plugins": "插件",
     "gateway": "网关",
     "gateway.websocket": "WebSocket",
     "gateway.limits": "网关限制",
     "gateway.delta": "流式增量",
     "gateway.history": "历史分页",
     "gateway.backpressure": "背压",
-    "gateway.plugins": "插件管理",
     "storage": "存储",
     "storage.checkpoints": "Checkpoint",
     "logging": "日志",
@@ -65,15 +62,12 @@ SECTION_ORDER: tuple[str, ...] = (
     "agent.skills",
     "agent.budget",
     "agent.session",
-    "agent.modes",
-    "agent.plugins",
     "gateway",
     "gateway.websocket",
     "gateway.limits",
     "gateway.delta",
     "gateway.history",
     "gateway.backpressure",
-    "gateway.plugins",
     "storage",
     "storage.checkpoints",
     "logging",
@@ -279,72 +273,6 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "type": "int",
         "minimum": 0,
     },
-    # -- agent.modes ----------------------------------------------------
-    "agent.modes.default": {
-        "title": "默认模式",
-        "description": "session.create 未指定 mode 时使用；模式来源仅 builtin/plugin。",
-    },
-    "agent.modes.max_mode_bytes": {
-        "title": "单模式文件上限 bytes",
-        "type": "int",
-        "minimum": 512,
-        "maximum": 1048576,
-    },
-    "agent.modes.max_modes": {
-        "title": "插件模式上限",
-        "type": "int",
-        "minimum": 1,
-        "maximum": 1024,
-    },
-    # -- agent.plugins --------------------------------------------------
-    "agent.plugins.enabled": {
-        "title": "启用插件",
-        "type": "bool",
-        "description": "关闭后不发现、不加载插件，也不添加插件 skills/modes 来源。",
-    },
-    "agent.plugins.dirs": {
-        "title": "插件目录",
-        "type": "list",
-        "item_type": "path",
-        "description": "容器目录；每个直接子目录可包含 plugin.yaml。",
-    },
-    "agent.plugins.allow": {
-        "title": "允许的插件 id",
-        "type": "list",
-        "item_type": "str",
-        "description": "显式白名单；为空表示不 import 任何插件代码。",
-    },
-    "agent.plugins.max_plugins": {
-        "title": "插件上限",
-        "type": "int",
-        "minimum": 1,
-    },
-    "agent.plugins.max_tools_per_plugin": {
-        "title": "单插件工具上限",
-        "type": "int",
-        "minimum": 1,
-    },
-    "agent.plugins.max_manifest_bytes": {
-        "title": "manifest 最大字节",
-        "type": "int",
-        "minimum": 1024,
-        "maximum": 1048576,
-    },
-    "agent.plugins.load_timeout_ms": {
-        "title": "加载超时 ms",
-        "type": "int",
-        "minimum": 1,
-    },
-    "agent.plugins.drain_grace_ms": {
-        "title": "卸载 drain 宽限 ms",
-        "type": "int",
-        "minimum": 0,
-    },
-    "agent.plugins.unload_timeout_ms": {
-        "title": "卸载清理超时 ms",
-        "type": "int",
-        "minimum": 1,
-    },
     # -- gateway --------------------------------------------------------
     "gateway.transport": {
         "title": "传输方式",
@@ -374,14 +302,6 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "type": "float",
         "minimum": 0,
         "maximum": 1,
-    },
-    "gateway.plugins.manage": {
-        "title": "允许客户端管理插件",
-        "type": "bool",
-        "description": (
-            "允许本地客户端通过 plugin.enable/plugin.disable 修改 "
-            "agent.plugins.allow；重启网关后生效。默认关闭。"
-        ),
     },
     # -- storage --------------------------------------------------------
     "storage.state_db": {"title": "SQLite 路径", "type": "path"},
@@ -422,17 +342,7 @@ FIELD_META: dict[str, dict[str, Any]] = {
     "ui.show_reasoning": {"title": "显示 reasoning", "type": "bool"},
 }
 
-#: Keys that live only in the config file (design v0.4 §4.2).  They are parsed
-#: by ``app_from_dict`` but deliberately get no ``FieldSpec``: no CLI/TUI form,
-#: no ``LINTEUM_*`` env override and no ``${VAR}`` interpolation.
-FILE_ONLY_KEYS: frozenset[str] = frozenset({
-    "agent.plugins.config",
-    "agent.plugins.secrets",
-})
-
-_RESTART_PREFIXES: tuple[str, ...] = (
-    "storage.", "gateway.websocket.", "gateway.plugins.", "agent.plugins.",
-)
+_RESTART_PREFIXES: tuple[str, ...] = ("storage.", "gateway.websocket.")
 _RESTART_KEYS = frozenset({
     "gateway.transport",
     "logging.dir",
@@ -531,8 +441,6 @@ def _walk(prefix: str, value: Any, out: list[tuple[str, Any]]) -> None:
         if f.name in ("extra", "version"):
             continue
         key = f"{prefix}.{f.name}" if prefix else f.name
-        if key in FILE_ONLY_KEYS:
-            continue
         child = getattr(value, f.name)
         if is_dataclass(child) and not isinstance(child, type):
             _walk(key, child, out)
@@ -716,7 +624,6 @@ def coerce_value(spec: FieldSpec, value: Any) -> Any:
 
 __all__ = [
     "FIELD_META",
-    "FILE_ONLY_KEYS",
     "SECTION_ORDER",
     "SECTION_TITLES",
     "FieldSpec",

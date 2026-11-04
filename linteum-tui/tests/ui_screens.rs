@@ -120,16 +120,6 @@ fn fatal_shows_error_and_child_stderr_tail() {
 }
 
 #[test]
-fn fatal_shows_child_exit_status() {
-    let mut state = TuiState::default();
-    state.child_exit_status = Some(7);
-    state.child_stderr_tail = vec!["boom".into()];
-    let rendered = joined(&fatal_lines(&state, &Theme::dark()));
-    assert!(rendered.contains("exit status: 7"));
-    assert!(rendered.contains("boom"));
-}
-
-#[test]
 fn artifact_viewer_marks_binary() {
     let mut state = TuiState::default();
     state.artifact = Some(ArtifactViewerState {

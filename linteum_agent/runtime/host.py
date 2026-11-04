@@ -29,31 +29,22 @@ import asyncio
 import contextlib
 import hashlib
 import json
-import os
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import (
-    Any,
-    Callable,
-    Mapping,
-    Optional,
-    Protocol,
-    Sequence,
-    runtime_checkable,
-)
+from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from ..bus.bus import InMemoryEventBus
-from ..bus.event import Event, uuid7
+from ..bus.event import uuid7
 from ..bus.scheduler.cancel import CancelRegistry
 from ..config.options import SessionOptions
 from ..config.schema import AppConfig, ConfigError
-from ..config.service import ConfigService, EffectiveConfig, env_var_for
+from ..config.service import ConfigService, EffectiveConfig
 from ..storage.artifacts import FileArtifactStore
 from ..storage.base import SessionInfo, StorageBundle
 from ..storage.service import SessionService
 from ..storage.sqlite import SqliteStorage
-from .agent import Agent, AgentBusy
+from .agent import Agent
 from .compaction import ContextCompactor
 from .context import CompactingContextBuilder, ContextPolicy, PassthroughContextBuilder
 from .interrupt import InterruptController
@@ -61,36 +52,8 @@ from .llm.adapters import create_adapter
 from .llm.executor import LLMExecutor
 from .llm.registry import AdapterRegistry
 from .llm.router import LlmRouter
-from .modes.catalog import load_mode_catalog
-from .modes.errors import ModeError, ModeLimit
-from .modes.model import (
-    ModeCatalog,
-    ModeLimits,
-    ModeResolution,
-    ModeSnapshot,
-    ModeSource,
-    ModeSummary,
-)
-from .modes.selection import resolve_mode
-from .modes.source import BuiltinModeSource, PluginModeSource
 from .observability.run_logger import RunLogger
-from .plugins.errors import (
-    PluginConfigError,
-    PluginManifestError,
-    PluginNotFound,
-    as_plugin_error,
-)
-from .plugins.host import PluginHost
-from .plugins.model import (
-    PLUGIN_ID_PATTERN,
-    STATE_DISABLED,
-    STATE_INVALID,
-    PluginAllowResult,
-    PluginLimits,
-    PluginSummary,
-)
-from .plugins.sources import PluginSkillSource
-from .skills.catalog import build_catalog, filter_catalog, load_catalog
+from .skills.catalog import load_catalog
 from .skills.model import SkillCatalog, SkillLimits
 from .skills.source import (
     PRIORITY_EXTRA,
@@ -103,10 +66,8 @@ from .skills.source import (
     SkillSource,
 )
 from .skills.tools import make_skill_tools
-from .state import phases
 from .state.agent_state import Budget
 from .tools.approval import ApprovalGate
-from .tools.errors import ToolUnavailable, UnknownTool
 from .tools.registry import ToolRegistry
 from .tools.results import InMemoryResultStore
 from .tools.runtime import DEFAULT_INLINE_LIMIT, ToolRuntime
@@ -127,23 +88,6 @@ E_SESSION_WORKSPACE = "E_SESSION_WORKSPACE"
 E_PROFILE_NOT_FOUND = "E_CONFIG_PROFILE_NOT_FOUND"
 #: Error code used when another process owns the session lease.
 E_SESSION_LOCKED = "E_SESSION_LOCKED"
-
-#: Metadata keys the host owns; client-supplied values are stripped on create.
-_RESERVED_MODE_METADATA = frozenset({
-    "mode",
-    "mode_digest",
-    "mode_source",
-    "mode_snapshot",
-    "mode_snapshot_inline",
-    "mode_tools_count",
-    "mode_skills_count",
-})
-
-#: Plugin inventory keys written by the host; clients cannot forge them (§14.3).
-_RESERVED_PLUGIN_METADATA = frozenset({"plugins_digest", "plugins_count"})
-
-#: Host-owned session metadata (mode + plugin inventory).
-_RESERVED_METADATA = _RESERVED_MODE_METADATA | _RESERVED_PLUGIN_METADATA
 
 
 @runtime_checkable
@@ -208,26 +152,6 @@ def profile_digest(profile: str, llm) -> str:
 
 
 @dataclass
-class ModeBinding:
-    """Host object tying a resolution to its live registry/context surface.
-
-    Contains callables and a live registry, so it never enters an event
-    payload, WAL or ``AgentState``.
-    """
-
-    resolution: ModeResolution
-    registry: ToolRegistry
-    schemas: Callable[[], list[dict]]
-    ctx_builder: Any
-    context_policy: Optional[ContextPolicy]
-    snapshot_ref: Optional[str] = None
-
-    @property
-    def digest(self) -> str:
-        return self.resolution.digest
-
-
-@dataclass
 class SessionHandle:
     """The host's live view of one session (agent + bound workspace/tools)."""
 
@@ -243,9 +167,6 @@ class SessionHandle:
     #: False for children: the parent session's lease covers the whole tree.
     lease_owned: bool = True
     parent_session_id: Optional[str] = None
-    #: JSON-able mode view (root and child) and the root's live binding.
-    mode: Optional[ModeSummary] = None
-    mode_binding: Optional[ModeBinding] = None
 
 
 class AgentHost:
@@ -266,7 +187,6 @@ class AgentHost:
         interrupt_controller: Optional[InterruptController] = None,
         lease_manager: Optional[LeaseManager] = None,
         endpoint: Optional[str] = None,
-        mode_sources: Optional[Sequence[ModeSource]] = None,
     ) -> None:
         self.config_service = config_service
         self._static_config = config.config if isinstance(config, EffectiveConfig) else config
@@ -292,30 +212,6 @@ class AgentHost:
         # is unwritable and never raises into the bus.
         self.run_logger = RunLogger.attach(self.bus, cfg.logging)
 
-        # -- capability plugins (host-side; no bus subscription) -------------
-        plugins_cfg = cfg.agent.plugins
-        self.plugins = PluginHost(
-            self.bus,
-            dirs=[Path(item).expanduser() for item in plugins_cfg.dirs],
-            allow=tuple(plugins_cfg.allow),
-            limits=PluginLimits(
-                max_plugins=plugins_cfg.max_plugins,
-                max_tools_per_plugin=plugins_cfg.max_tools_per_plugin,
-                max_manifest_bytes=plugins_cfg.max_manifest_bytes,
-                load_timeout_ms=plugins_cfg.load_timeout_ms,
-                drain_grace_ms=plugins_cfg.drain_grace_ms,
-                unload_timeout_ms=plugins_cfg.unload_timeout_ms,
-            ),
-            enabled=plugins_cfg.enabled,
-            reserved_tool_names=self._reserved_tool_names(cfg),
-            on_drain=self._drain_plugin_tools,
-            log=self._log,
-            config=plugins_cfg.config,
-            secrets=plugins_cfg.secrets,
-            environ=os.environ,
-        )
-        self._started = False
-
         # -- effect layers (one subscriber per capability) ------------------
         self.cancel_registry = CancelRegistry()
         self._injected_adapters = dict(adapters or {})
@@ -324,18 +220,12 @@ class AgentHost:
         self.router = LlmRouter(self.llm_registry)
         self._ensure_llm_routing(cfg)
 
-        self.executor = LLMExecutor(
-            self.bus, self.router, cancel=self.cancel_registry, hooks=self.plugins,
-        )
+        self.executor = LLMExecutor(self.bus, self.router, cancel=self.cancel_registry)
         self.results = result_store if result_store is not None else InMemoryResultStore()
         self.sandbox = sandbox if sandbox is not None else Sandbox()
         self.approvals = approvals if approvals is not None else ApprovalGate(self.bus)
         self._workspace_by_session: dict[str, Workspace] = {}
         self._skill_catalogs: dict[str, SkillCatalog] = {}
-        self._active_skill_catalogs: dict[str, SkillCatalog] = {}
-        #: Extra discovery sources (tests/plugin host).  Builtin is always first.
-        self._extra_mode_sources: tuple[ModeSource, ...] = tuple(mode_sources or ())
-        self._mode_locks: dict[str, asyncio.Lock] = {}
         #: Subagent sessions may override the root approval policy (§7.3 / S11).
         self._approval_policies: dict[str, str] = {}
         #: Lazily built in :meth:`_ensure_orchestrator` (Task 8); ``None`` keeps
@@ -459,484 +349,17 @@ class AgentHost:
         cfg: AppConfig,
         skill_index: str = "",
         extra_blocks: Sequence[str] = (),
-        *,
-        system_prompt: str = "",
-        environment_block: str = "",
     ):
-        blocks = tuple(
-            block for block in (
-                environment_block, skill_index, *extra_blocks,
-            ) if block
-        )
+        blocks = (*((skill_index,) if skill_index else ()), *tuple(extra_blocks))
         ctx = cfg.agent.context
         if ctx.policy == "compacting" and ctx.max_tokens > 0:
-            return CompactingContextBuilder(
-                system_prompt=system_prompt or None,
-                system_blocks=blocks,
-            ), ContextPolicy(
+            return CompactingContextBuilder(system_blocks=blocks), ContextPolicy(
                 max_tokens=ctx.max_tokens,
                 compact_to_tokens=ctx.compact_to_tokens,
                 keep_last_messages=ctx.keep_last_messages,
                 max_summary_tokens=ctx.max_summary_tokens,
             )
-        return PassthroughContextBuilder(
-            system_prompt=system_prompt or None,
-            system_blocks=blocks,
-        ), None
-
-    # -- modes --------------------------------------------------------------
-    def _mode_sources(self, cfg: Optional[AppConfig] = None) -> tuple[ModeSource, ...]:
-        cfg = cfg or self._current_config()
-        sources: list[ModeSource] = [BuiltinModeSource()]
-        if self.plugins.enabled:
-            sources.append(PluginModeSource(self.plugins))
-        sources.extend(self._extra_mode_sources)
-        return tuple(sources)
-
-    async def _build_mode_catalog(self, cfg: AppConfig) -> ModeCatalog:
-        limits = ModeLimits(
-            max_mode_bytes=cfg.agent.modes.max_mode_bytes,
-            max_modes=cfg.agent.modes.max_modes,
-        )
-        return await load_mode_catalog(self._mode_sources(cfg), limits=limits)
-
-    @staticmethod
-    def _reserved_tool_names(cfg: AppConfig) -> frozenset[str]:
-        """Host-owned tool names a plugin may never provide (§5.6)."""
-        return frozenset({
-            "read_file", "write_file", "edit_file", "list_dir", "bash",
-            "load_skill", "read_skill_resource",
-            cfg.agent.subagents.tool_name,
-        })
-
-    def _base_tools(self, workspace: Workspace) -> list:
-        cfg = self._tool_factory_cfg
-        return [
-            *make_file_tools(workspace),
-            make_bash_tool(workspace, timeout=cfg.agent.tools.bash_timeout),
-            *self.plugins.tool_specs(),
-        ]
-
-    async def _drain_plugin_tools(
-        self, plugin_id: str, names: tuple[str, ...], grace_ms: int,
-    ) -> int:
-        """Mark/quiesce plugin tools in every live registry, then drain (§8.5).
-
-        Returns the total number of still-running calls across registries.
-        Owner filtering is defensive: a quiescing plugin keeps its names until
-        it is fully revoked, so ``owned`` should equal ``names``.
-        """
-        remaining = 0
-        for session_id, handle in list(self._handles.items()):
-            registry = handle.registry
-            owned: list[str] = []
-            for name in names:
-                try:
-                    spec = registry.spec(name)
-                except (UnknownTool, ToolUnavailable):
-                    continue
-                if spec.plugin_id != plugin_id:
-                    self._log({
-                        "kind": "plugin",
-                        "level": "warning",
-                        "msg": f"plugin.tool_owner_mismatch: {name!r} in "
-                               f"session {session_id!r} belongs to "
-                               f"{spec.plugin_id!r}",
-                        "ts": time.time(),
-                        "session_id": session_id,
-                    })
-                    continue
-                owned.append(name)
-            if not owned:
-                continue
-            registry.mark_draining(owned)
-            pending = await self.tool_runtime.drain(
-                owned, timeout=max(0.0, grace_ms / 1000.0),
-            )
-            remaining += pending
-            await registry.unregister_many(owned)
-        return remaining
-
-    @staticmethod
-    def _mode_summary(
-        resolution: ModeResolution, *, default: bool,
-    ) -> ModeSummary:
-        return ModeSummary(
-            name=resolution.name,
-            description=resolution.description,
-            source_id=resolution.source_id,
-            builtin=resolution.source_id == "builtin",
-            default=default,
-            digest=resolution.digest,
-        )
-
-    async def list_modes(self) -> list[ModeSummary]:
-        """List available modes (builtin + enabled plugins), no prompt text."""
-        cfg = self._current_config()
-        catalog = await self._build_mode_catalog(cfg)
-        default_name = cfg.agent.modes.default
-        result: list[ModeSummary] = []
-        for name in sorted(catalog.entries):
-            entry = catalog.entries[name]
-            result.append(ModeSummary(
-                name=name,
-                description=entry.definition.description,
-                source_id=entry.source_id,
-                builtin=entry.source_id == "builtin",
-                default=name == default_name,
-            ))
-        return result
-
-    async def mode_catalog(self) -> ModeCatalog:
-        """The current catalog (used by Gateway ``mode.list`` diagnostics)."""
-        return await self._build_mode_catalog(self._current_config())
-
-    @staticmethod
-    def _snapshot_digest(snapshot: ModeSnapshot) -> str:
-        blob = json.dumps(
-            snapshot.to_dict(), ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"),
-        )
-        return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
-    async def _mode_metadata(
-        self,
-        session_id: str,
-        resolution: ModeResolution,
-        cfg: AppConfig,
-        metadata: dict,
-    ) -> Optional[str]:
-        """Write the mode snapshot artifact/inline and fill metadata.
-
-        Returns the artifact ref (or ``None`` for the inline fallback).  The
-        artifact write happens before the metadata upsert (I12).
-        """
-        payload = json.dumps(
-            resolution.snapshot.to_dict(), ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"),
-        )
-        encoded = payload.encode("utf-8")
-        cap = cfg.agent.modes.max_mode_bytes + 16 * 1024
-        if len(encoded) > cap:
-            raise ModeLimit(
-                f"mode snapshot exceeds {cap} bytes",
-                key="max_mode_bytes",
-                context={"mode": resolution.name, "bytes": len(encoded)},
-            )
-        snapshot_ref: Optional[str] = None
-        inline: Optional[str] = None
-        artifacts = self.storage.artifacts
-        if getattr(artifacts, "available", False):
-            try:
-                artifact = await artifacts.put(
-                    encoded, mime="application/json", session_id=session_id,
-                )
-                snapshot_ref = artifact.ref
-            except Exception as exc:  # noqa: BLE001 - inline fallback is valid
-                inline = payload
-                self._log({
-                    "kind": "mode",
-                    "level": "warning",
-                    "msg": f"mode snapshot artifact failed; using inline: {exc}",
-                    "ts": time.time(),
-                    "session_id": session_id,
-                })
-        else:
-            inline = payload
-        metadata.update({
-            "mode": resolution.name,
-            "mode_digest": resolution.digest,
-            "mode_source": resolution.source_id,
-            "mode_snapshot": snapshot_ref,
-            "mode_snapshot_inline": inline,
-            "mode_tools_count": len(resolution.tool_specs),
-            "mode_skills_count": len(resolution.filtered_skills),
-        })
-        return snapshot_ref
-
-    async def _load_mode_snapshot(self, info: SessionInfo) -> Optional[ModeSnapshot]:
-        metadata = dict(info.metadata or {})
-        inline = metadata.get("mode_snapshot_inline")
-        if inline:
-            try:
-                return ModeSnapshot.from_dict(json.loads(inline))
-            except (TypeError, ValueError):
-                return None
-        ref = metadata.get("mode_snapshot")
-        if not ref:
-            return None
-        artifacts = self.storage.artifacts
-        if not getattr(artifacts, "available", False):
-            return None
-        key = ref[len("art:"):] if ref.startswith("art:") else ref
-        try:
-            data = await artifacts.get(key)
-            return ModeSnapshot.from_dict(json.loads(data.decode("utf-8")))
-        except Exception:  # noqa: BLE001 - missing/corrupt snapshot falls back
-            return None
-
-    def _resolution_from_snapshot(
-        self,
-        snapshot: ModeSnapshot,
-        *,
-        workspace: Workspace,
-        full_skills: SkillCatalog,
-        cfg: AppConfig,
-        base_tools: Sequence,
-    ) -> ModeResolution:
-        """Rebuild a resolution from a session snapshot (§9.2)."""
-        warnings: list[str] = []
-        if snapshot.skills_enabled:
-            filtered, skill_warnings = filter_catalog(
-                full_skills,
-                include=snapshot.skills_include,
-                exclude=snapshot.skills_exclude,
-            )
-            warnings.extend(skill_warnings)
-        else:
-            filtered = build_catalog((), limits=full_skills.limits)
-
-        loaders = {"load_skill", "read_skill_resource"}
-        has_loaders = loaders.issubset(set(snapshot.resolved_tools))
-        if filtered.entries and has_loaders:
-            skill_specs = list(make_skill_tools(filtered))
-        else:
-            skill_specs = []
-            if filtered.entries:
-                warnings.append(
-                    "skills loaders are not part of the snapshot; the index "
-                    "is suppressed"
-                )
-                filtered = replace(filtered, index_text="")
-
-        available = {spec.name: spec for spec in (*base_tools, *skill_specs)}
-        selected = []
-        for name in snapshot.resolved_tools:
-            spec = available.get(name)
-            if spec is None:
-                warnings.append(f"mode tool {name!r} is no longer available")
-                continue
-            selected.append(spec)
-
-        subagent_tools = (
-            frozenset({cfg.agent.subagents.tool_name})
-            if snapshot.subagent and cfg.agent.subagents.enabled
-            else frozenset()
-        )
-        digest = self._snapshot_digest(snapshot)
-        return ModeResolution(
-            name=snapshot.name,
-            description=snapshot.description,
-            source_id=snapshot.source_id,
-            digest=digest,
-            snapshot=snapshot,
-            system_prompt=snapshot.system_prompt,
-            environment_block=snapshot.environment_block,
-            tool_specs=tuple(selected),
-            subagent_tools=subagent_tools,
-            filtered_skills=filtered,
-            tool_names=tuple(spec.name for spec in selected),
-            skill_names=tuple(entry.name for entry in filtered.entries),
-            warnings=tuple(warnings),
-        )
-
-    async def set_mode(
-        self, session_id: str, mode: str, *, trace_id: Optional[str] = None,
-    ) -> SessionHandle:
-        """Switch one root session while it is idle (§9.3/§10)."""
-        handle = self._handles.get(session_id)
-        if handle is None:
-            handle = await self.ensure_session(session_id)
-        if handle.kind != "root":
-            raise ConfigError(
-                f"session {session_id!r} is a subagent session",
-                key="session_id", code="E_SESSION_SUBAGENT",
-            )
-
-        cfg = self._current_config()
-        lock = self._mode_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            handle = self._handles.get(session_id)
-            if handle is None:
-                raise SessionNotFound(session_id)
-            state = handle.agent.state
-            if (
-                state.phase != phases.IDLE
-                or state.pending
-                or state.pending_compaction is not None
-                or state.interrupt_pending
-                or self.approvals.pending_ids(session_id)
-            ):
-                raise ConfigError(
-                    f"session is busy (phase={state.phase!r}); wait for the "
-                    "round to finish or interrupt it",
-                    key="mode", code="E_MODE_BUSY",
-                    hint="retry after the current round completes",
-                )
-
-            workspace = (
-                self._workspace_by_session.get(session_id)
-                or handle.workspace
-            )
-            full_skills = self._skill_catalogs.get(session_id)
-            if full_skills is None:
-                full_skills = await self._build_skill_catalog(cfg, workspace)
-                self._skill_catalogs[session_id] = full_skills
-            catalog = await self._build_mode_catalog(cfg)
-            entry = catalog.get(mode)
-            if entry is None:
-                raise ConfigError(
-                    f"mode {mode!r} not found",
-                    key="mode", code="E_MODE_NOT_FOUND",
-                    hint=(
-                        "available modes: "
-                        f"{', '.join(sorted(catalog.entries))}"
-                    ),
-                )
-            try:
-                resolution = resolve_mode(
-                    entry.definition,
-                    workspace=workspace,
-                    full_skills=full_skills,
-                    base_tools=self._base_tools(workspace),
-                    subagent_enabled=cfg.agent.subagents.enabled,
-                    subagent_tool_name=cfg.agent.subagents.tool_name,
-                    limits=ModeLimits(
-                        max_mode_bytes=cfg.agent.modes.max_mode_bytes,
-                        max_modes=cfg.agent.modes.max_modes,
-                    ),
-                )
-            except ModeError as exc:
-                raise ConfigError(
-                    str(exc), key=exc.key, code=exc.code, hint=exc.hint,
-                ) from exc
-
-            current = handle.mode_binding
-            if current is not None and current.digest == resolution.digest:
-                self._log({
-                    "kind": "mode",
-                    "level": "debug",
-                    "msg": f"mode refresh is a no-op ({mode})",
-                    "ts": time.time(),
-                    "session_id": session_id,
-                })
-                return handle
-
-            registry = ToolRegistry()
-            await registry.register_many(resolution.tool_specs)
-            builder, policy = self._context_settings(
-                cfg,
-                system_prompt=resolution.system_prompt,
-                environment_block=resolution.environment_block,
-                skill_index=resolution.filtered_skills.index_text,
-            )
-            subagent_tools = resolution.subagent_tools
-            schemas = registry.schemas
-            subagent_settings = cfg.agent.subagents
-            if subagent_tools:
-                from .subagents.catalog import SubagentCatalog
-                if registry.has(subagent_settings.tool_name):
-                    raise ConfigError(
-                        f"tool {subagent_settings.tool_name!r} is reserved "
-                        "for subagent delegation and cannot be registered",
-                        key="agent.subagents.tool_name",
-                        code="E_CONFIG_TOOL_RESERVED",
-                    )
-                registry.reserve(subagent_settings.tool_name)
-                subagent_catalog = SubagentCatalog(subagent_settings)
-
-                def schemas(reg=registry, cat=subagent_catalog):
-                    return [*reg.schemas(), cat.schema()]
-
-            if subagent_tools:
-                self._ensure_orchestrator()
-
-            info = await self.service.get_session(session_id)
-            if info is None:
-                raise SessionNotFound(session_id)
-            metadata = dict(info.metadata or {})
-            try:
-                snapshot_ref = await self._mode_metadata(
-                    session_id, resolution, cfg, metadata,
-                )
-            except ModeError as exc:
-                raise ConfigError(
-                    str(exc), key=exc.key, code=exc.code, hint=exc.hint,
-                ) from exc
-            updated_info = replace(info, metadata=metadata)
-
-            from_digest = current.digest if current is not None else ""
-            from_name = (
-                current.resolution.name if current is not None
-                else (handle.mode.name if handle.mode is not None else "")
-            )
-
-            async def commit() -> None:
-                await self.storage.catalog.upsert_session(updated_info)
-                self.tool_registries.install(session_id, registry)
-
-            try:
-                await handle.agent.rebind(
-                    ctx_builder=builder,
-                    context_policy=policy,
-                    schemas=schemas,
-                    subagent_tools=subagent_tools,
-                    commit=commit,
-                )
-            except AgentBusy as exc:
-                raise ConfigError(
-                    str(exc), key="mode", code="E_MODE_BUSY",
-                ) from exc
-            except ModeError as exc:
-                raise ConfigError(
-                    str(exc), key=exc.key, code=exc.code, hint=exc.hint,
-                ) from exc
-
-            self._active_skill_catalogs[session_id] = (
-                resolution.filtered_skills
-            )
-            mode_summary = self._mode_summary(
-                resolution,
-                default=(resolution.name == cfg.agent.modes.default),
-            )
-            binding = ModeBinding(
-                resolution=resolution,
-                registry=registry,
-                schemas=schemas,
-                ctx_builder=builder,
-                context_policy=policy,
-                snapshot_ref=snapshot_ref,
-            )
-            handle.registry = registry
-            handle.mode = mode_summary
-            handle.mode_binding = binding
-            handle.warnings = resolution.warnings
-
-            payload = {
-                "from": from_name,
-                "to": resolution.name,
-                "from_digest": from_digest,
-                "to_digest": resolution.digest,
-                "source": resolution.source_id,
-                "snapshot_ref": snapshot_ref,
-                "refresh": resolution.name == from_name,
-            }
-            try:
-                await self.bus.publish(Event.create(
-                    "system.mode.changed",
-                    payload,
-                    session_id=session_id,
-                    trace_id=trace_id,
-                ))
-            except Exception as exc:  # noqa: BLE001 - observability only
-                self._log({
-                    "kind": "mode",
-                    "level": "warning",
-                    "msg": f"system.mode.changed publish failed: {exc}",
-                    "ts": time.time(),
-                    "session_id": session_id,
-                })
-            return handle
+        return PassthroughContextBuilder(system_blocks=blocks), None
 
     def _skill_sources(
         self, cfg: AppConfig, workspace: Workspace
@@ -961,8 +384,6 @@ class AgentHost:
                 workspace.root / settings.project_dir,
                 SOURCE_PROJECT, PRIORITY_PROJECT, missing_ok=True,
             ))
-        if self.plugins.enabled:
-            sources.append(PluginSkillSource(self.plugins))
         return tuple(sources)
 
     async def _build_skill_catalog(
@@ -1000,11 +421,12 @@ class AgentHost:
         )
 
     def _make_tools(self, workspace: Workspace) -> list:
-        specs = [*self._base_tools(workspace)]
-        catalog = (
-            self._active_skill_catalogs.get(workspace.session_id)
-            or self._skill_catalogs.get(workspace.session_id)
-        )
+        cfg = self._tool_factory_cfg
+        specs = [
+            *make_file_tools(workspace),
+            make_bash_tool(workspace, timeout=cfg.agent.tools.bash_timeout),
+        ]
+        catalog = self._skill_catalogs.get(workspace.session_id)
         if catalog:
             specs.extend(make_skill_tools(catalog))
         return specs
@@ -1023,13 +445,9 @@ class AgentHost:
 
     # -- lifecycle ----------------------------------------------------------
     async def start(self) -> "AgentHost":
-        """Start the bus dispatch loop, plugins and the lease heartbeat (idempotent)."""
+        """Start the bus dispatch loop and the lease heartbeat (idempotent)."""
         if self._bus_task is None:
             self._bus_task = asyncio.create_task(self.bus.run())
-        if not self._started:
-            # Plugins load before any session can be opened (§13.1).
-            await self.plugins.start()
-            self._started = True
         if self.lease_manager is not None and self._heartbeat_task is None:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         return self
@@ -1081,8 +499,6 @@ class AgentHost:
             await self.orchestrator.close()
         for session_id in list(self._handles):
             self.close_session(session_id)
-        # Plugins unload while the bus can still carry lifecycle events (§13.5).
-        await self.plugins.close()
         self.bus.stop()
         await self.bus.close()
         task, self._bus_task = self._bus_task, None
@@ -1152,13 +568,8 @@ class AgentHost:
                         hint=exc.hint,
                     ) from exc
                 digest = profile_digest(chosen, llm)
-                user_metadata = {
-                    key: value
-                    for key, value in dict(options.metadata).items()
-                    if key not in _RESERVED_METADATA
-                }
                 metadata = {
-                    **user_metadata,
+                    **dict(options.metadata),
                     "profile": chosen,
                     "config_digest": digest,
                 }
@@ -1168,10 +579,7 @@ class AgentHost:
                     workspace=str(options.workspace),
                     metadata=metadata,
                 )
-                return await self._activate(
-                    info, chosen, cfg, digest, (), mode=options.mode,
-                    created_here=True,
-                )
+                return await self._activate(info, chosen, cfg, digest, ())
 
             # -- resume: workspace and profile are session-scoped facts -----
             warnings: list[str] = []
@@ -1206,21 +614,7 @@ class AgentHost:
                     info, metadata={**info.metadata, "profile": chosen}
                 )
                 await self.storage.catalog.upsert_session(info)
-            persisted_mode = info.metadata.get("mode")
-            if (
-                options.mode is not None
-                and persisted_mode is not None
-                and options.mode != persisted_mode
-            ):
-                raise ConfigError(
-                    f"session mode is {persisted_mode!r}; open the session, "
-                    "then call session.mode.set",
-                    key="mode",
-                    code="E_MODE_IMMUTABLE",
-                )
-            return await self._activate(
-                info, chosen, cfg, digest, tuple(warnings), mode=options.mode,
-            )
+            return await self._activate(info, chosen, cfg, digest, tuple(warnings))
 
     async def ensure_session(
         self, session_id: str, *, profile: Optional[str] = None
@@ -1286,9 +680,6 @@ class AgentHost:
         cfg: AppConfig,
         digest: str,
         warnings: tuple[str, ...],
-        *,
-        mode: Optional[str] = None,
-        created_here: bool = False,
     ) -> SessionHandle:
         if info.kind == "subagent":
             raise ConfigError(
@@ -1306,85 +697,10 @@ class AgentHost:
             self._workspace_by_session[info.session_id] = workspace
             catalog = await self._build_skill_catalog(cfg, workspace)
             self._skill_catalogs[info.session_id] = catalog
+            registry = await self.tool_registries.for_session(info.session_id)
 
-            mode_catalog = await self._build_mode_catalog(cfg)
-            metadata = dict(info.metadata or {})
-            if created_here:
-                for key in _RESERVED_METADATA:
-                    metadata.pop(key, None)
-                persisted_mode = None
-                snapshot = None
-            else:
-                persisted_mode = metadata.get("mode")
-                snapshot = await self._load_mode_snapshot(info)
-            if (
-                mode is not None
-                and persisted_mode is not None
-                and mode != persisted_mode
-            ):
-                raise ConfigError(
-                    f"session mode is {persisted_mode!r}; open the session, "
-                    "then call session.mode.set",
-                    key="mode", code="E_MODE_IMMUTABLE",
-                )
-            mode_name = mode or persisted_mode or cfg.agent.modes.default
-            if mode is None and persisted_mode is None:
-                warnings = (
-                    *warnings,
-                    f"legacy session: mode defaulted to {mode_name!r}",
-                )
-            if snapshot is not None:
-                resolution = self._resolution_from_snapshot(
-                    snapshot,
-                    workspace=workspace,
-                    full_skills=catalog,
-                    cfg=cfg,
-                    base_tools=self._base_tools(workspace),
-                )
-            else:
-                entry = mode_catalog.get(mode_name)
-                if entry is None:
-                    invalid = next(
-                        (issue for issue in mode_catalog.invalid
-                         if issue.name == mode_name),
-                        None,
-                    )
-                    detail = (
-                        f" ({invalid.code}: {invalid.error})"
-                        if invalid is not None else ""
-                    )
-                    raise ConfigError(
-                        f"mode {mode_name!r} not found{detail}",
-                        key="mode", code="E_MODE_NOT_FOUND",
-                        hint=(
-                            "available modes: "
-                            f"{', '.join(sorted(mode_catalog.entries))}"
-                        ),
-                    )
-                resolution = resolve_mode(
-                    entry.definition,
-                    workspace=workspace,
-                    full_skills=catalog,
-                    base_tools=self._base_tools(workspace),
-                    subagent_enabled=cfg.agent.subagents.enabled,
-                    subagent_tool_name=cfg.agent.subagents.tool_name,
-                    limits=ModeLimits(
-                        max_mode_bytes=cfg.agent.modes.max_mode_bytes,
-                        max_modes=cfg.agent.modes.max_modes,
-                    ),
-                )
-                stored_mode_digest = metadata.get("mode_digest")
-                if (
-                    stored_mode_digest
-                    and stored_mode_digest != resolution.digest
-                ):
-                    warnings = (
-                        *warnings,
-                        "mode changed since the session was created; the "
-                        "current definition is used",
-                    )
-
-            warnings = (*warnings, *catalog.warnings, *resolution.warnings)
+            builder, policy = self._context_settings(cfg, catalog.index_text)
+            warnings = (*warnings, *catalog.warnings)
             for warning in catalog.warnings:
                 self._log({
                     "kind": "skills_catalog",
@@ -1393,48 +709,25 @@ class AgentHost:
                     "ts": time.time(),
                     "session_id": info.session_id,
                 })
-
-            registry = ToolRegistry()
-            await registry.register_many(resolution.tool_specs)
-            self.tool_registries.install(info.session_id, registry)
-            self._active_skill_catalogs[info.session_id] = (
-                resolution.filtered_skills
-            )
-            builder, policy = self._context_settings(
-                cfg,
-                system_prompt=resolution.system_prompt,
-                environment_block=resolution.environment_block,
-                skill_index=resolution.filtered_skills.index_text,
-            )
-
             current_digest = catalog.digest if catalog.entries else ""
+            metadata = dict(info.metadata or {})
             stored_digest = metadata.get("skills_digest")
             if stored_digest is not None and stored_digest != current_digest:
                 warnings = (*warnings,
                             "skills changed since the session was created "
                             f"({str(stored_digest)[:12] or 'none'} -> "
                             f"{current_digest[:12] or 'none'}); the new snapshot is used")
-            metadata["skills_digest"] = current_digest
-            metadata["skills_count"] = len(catalog)
-            plugins_digest = self.plugins.inventory_digest()
-            stored_plugins = metadata.get("plugins_digest")
-            if stored_plugins is not None and stored_plugins != plugins_digest:
-                warnings = (*warnings,
-                            "plugin.inventory_changed: active plugins differ "
-                            "from the session snapshot; the current set is used")
-            metadata["plugins_digest"] = plugins_digest
-            metadata["plugins_count"] = len(self.plugins.inventory())
-            snapshot_ref = await self._mode_metadata(
-                info.session_id, resolution, cfg, metadata,
-            )
-            info = replace(info, metadata=metadata)
-            await self.storage.catalog.upsert_session(info)
-
+            if (metadata.get("skills_digest") != current_digest
+                    or metadata.get("skills_count") != len(catalog)):
+                metadata["skills_digest"] = current_digest
+                metadata["skills_count"] = len(catalog)
+                info = replace(info, metadata=metadata)
+                await self.storage.catalog.upsert_session(info)
             budget = self._budget(cfg)
-            subagent_tools = resolution.subagent_tools
+            subagent_tools: frozenset[str] = frozenset()
             schemas = registry.schemas
             subagent_settings = cfg.agent.subagents
-            if subagent_tools:
+            if subagent_settings.enabled:
                 from .subagents.catalog import SubagentCatalog
                 if registry.has(subagent_settings.tool_name):
                     raise ConfigError(
@@ -1444,6 +737,7 @@ class AgentHost:
                     )
                 registry.reserve(subagent_settings.tool_name)
                 subagent_catalog = SubagentCatalog(subagent_settings)
+                subagent_tools = frozenset({subagent_settings.tool_name})
 
                 def schemas(reg=registry, cat=subagent_catalog):
                     return [*reg.schemas(), cat.schema()]
@@ -1488,17 +782,6 @@ class AgentHost:
                 agent.state.config_digest = digest
                 agent.subscribe()
 
-            mode_summary = self._mode_summary(
-                resolution, default=(resolution.name == cfg.agent.modes.default),
-            )
-            binding = ModeBinding(
-                resolution=resolution,
-                registry=registry,
-                schemas=schemas,
-                ctx_builder=builder,
-                context_policy=policy,
-                snapshot_ref=snapshot_ref,
-            )
             handle = SessionHandle(
                 session_id=info.session_id,
                 agent=agent,
@@ -1507,53 +790,18 @@ class AgentHost:
                 profile=profile,
                 config_digest=digest,
                 warnings=warnings,
-                mode=mode_summary,
-                mode_binding=binding,
             )
             self._handles[info.session_id] = handle
             if subagent_settings.enabled:
                 self._ensure_orchestrator()
             return handle
-        except ModeError as exc:
-            self._rollback_activation(info.session_id)
-            if created_here:
-                await self._delete_failed_create(info.session_id)
-            raise ConfigError(
-                str(exc), key=exc.key, code=exc.code, hint=exc.hint,
-            ) from exc
         except BaseException:
-            self._rollback_activation(info.session_id)
-            if created_here:
-                await self._delete_failed_create(info.session_id)
+            self._release_lease(info.session_id)
+            self._workspace_by_session.pop(info.session_id, None)
+            self._skill_catalogs.pop(info.session_id, None)
+            self.workspaces.drop(info.session_id)
+            self.tool_registries.drop(info.session_id)
             raise
-
-    async def _delete_failed_create(self, session_id: str) -> None:
-        """Remove a row created by a failed activation (§9.1)."""
-        try:
-            info = await self.service.get_session(session_id)
-            if info is None:
-                return
-            if info.last_seq == 0 and self.storage.checkpointer.latest(
-                session_id
-            ) is None:
-                await self.service.delete_session(session_id)
-        except Exception as exc:  # noqa: BLE001 - best effort cleanup
-            self._log({
-                "kind": "mode",
-                "level": "warning",
-                "msg": f"failed to delete half-created session: {exc}",
-                "ts": time.time(),
-                "session_id": session_id,
-            })
-
-    def _rollback_activation(self, session_id: str) -> None:
-        self._release_lease(session_id)
-        self._workspace_by_session.pop(session_id, None)
-        self._skill_catalogs.pop(session_id, None)
-        self._active_skill_catalogs.pop(session_id, None)
-        self._mode_locks.pop(session_id, None)
-        self.workspaces.drop(session_id)
-        self.tool_registries.drop(session_id)
 
     def session(self, session_id: str) -> Optional[SessionHandle]:
         return self._handles.get(session_id)
@@ -1574,8 +822,6 @@ class AgentHost:
             handle.agent.close()
         self._workspace_by_session.pop(session_id, None)
         self._skill_catalogs.pop(session_id, None)
-        self._active_skill_catalogs.pop(session_id, None)
-        self._mode_locks.pop(session_id, None)
         self.workspaces.drop(session_id)   # a reused id must re-resolve its root
         self.tool_registries.drop(session_id)
         self._approval_policies.pop(session_id, None)
@@ -1720,11 +966,10 @@ class AgentHost:
             root=workspace_root, session_id=child_id, read_only=read_only,
         )
         parent_catalog = self._skill_catalogs.get(parent_session_id)
-        parent_active = self._active_skill_catalogs.get(parent_session_id)
         inherit_skills = cfg.agent.subagents.inherit_skills
         skill_index = (
-            parent_active.index_text
-            if inherit_skills and parent_active is not None else ""
+            parent_catalog.index_text
+            if inherit_skills and parent_catalog is not None else ""
         )
 
         agent = None
@@ -1732,29 +977,8 @@ class AgentHost:
             self._workspace_by_session[child_id] = workspace
             if inherit_skills and parent_catalog is not None:
                 self._skill_catalogs[child_id] = parent_catalog
-            if inherit_skills and parent_active is not None:
-                self._active_skill_catalogs[child_id] = parent_active
 
-            # D15: a child inherits the parent's live, mode-filtered tool table
-            # (including plugin tools), minus the reserved spawn name.  Rebuilding
-            # from ``_make_tools`` would bypass the parent's mode selection.
-            # Builtin file/bash specs are re-bound to the child workspace so a
-            # read-only child still cannot write through the parent's closure.
-            child_builtins = {
-                spec.name: spec for spec in (
-                    *make_file_tools(workspace),
-                    make_bash_tool(
-                        workspace, timeout=cfg.agent.tools.bash_timeout,
-                    ),
-                )
-            }
-            parent_registry = parent.registry
-            available = {}
-            for name in parent_registry.names():
-                if name == spawn_name or not parent_registry.has(name):
-                    continue
-                spec = parent_registry.spec(name)
-                available[name] = child_builtins.get(name, spec)
+            available = {spec.name: spec for spec in self._make_tools(workspace)}
             selected = []
             for name in tools:
                 if name == spawn_name:
@@ -1847,7 +1071,6 @@ class AgentHost:
                 agent.close()
             self._workspace_by_session.pop(child_id, None)
             self._skill_catalogs.pop(child_id, None)
-            self._active_skill_catalogs.pop(child_id, None)
             self.tool_registries.drop(child_id)
             raise
 
@@ -1862,8 +1085,6 @@ class AgentHost:
             parent_session_id=parent_session_id,
             kind="subagent",
             lease_owned=False,
-            mode=parent.mode,
-            mode_binding=None,
         )
         self._handles[child_id] = handle
         return handle
@@ -1896,258 +1117,6 @@ class AgentHost:
     async def get_session_info(self, session_id: str) -> Optional[SessionInfo]:
         return await self.service.get_session(session_id)
 
-    # -- plugins ------------------------------------------------------------
-    async def list_plugins(self) -> list[PluginSummary]:
-        """Read-only plugin listing; never imports or changes plugin state."""
-        return self.plugins.summaries()
-
-    def plugin_warnings(self) -> tuple[str, ...]:
-        """Discovery-level warnings (allow entries not found, duplicates…)."""
-        return self.plugins.catalog_warnings()
-
-    async def refresh_plugins(self) -> list[PluginSummary]:
-        """Re-scan plugin containers without importing or touching active plugins."""
-        await self.plugins.refresh()
-        return self.plugins.summaries()
-
-    async def set_plugin_allowed(
-        self, ids: Sequence[str], *, mode: str = "deferred",
-    ) -> PluginAllowResult:
-        """Persist and apply the runtime allowlist, then audit (§5.4 / §5.8).
-
-        Validation is atomic and happens before any write: the mode, id
-        shape/uniqueness, the presence of a :class:`ConfigService`, every
-        *added* id's record and manifest state, and an environment override of
-        ``agent.plugins.allow`` are all checked first.  The allowlist is then persisted with the
-        current revision, and only after a successful write is
-        ``PluginHost.set_allowed`` applied — a persistence failure never
-        changes the runtime allow.  Exactly one
-        ``system.plugin.management`` audit event is published on the host
-        partition; an audit failure never changes the result.
-        """
-        start = time.monotonic()
-        if mode not in ("deferred", "apply"):
-            raise PluginConfigError(
-                f"invalid set_allowed mode: {mode!r}",
-                key="mode", hint="expected 'deferred' or 'apply'",
-            )
-        requested = tuple(ids)
-        for plugin_id in requested:
-            if (
-                not isinstance(plugin_id, str)
-                or PLUGIN_ID_PATTERN.fullmatch(plugin_id) is None
-            ):
-                raise PluginManifestError(
-                    f"invalid plugin id: {plugin_id!r}",
-                    key="agent.plugins.allow",
-                )
-        if len(set(requested)) != len(requested):
-            raise PluginManifestError(
-                "duplicate plugin id in the allow list",
-                key="agent.plugins.allow",
-            )
-        service = self.config_service
-        if service is None:
-            raise PluginConfigError(
-                "configuration service is not available",
-                key="agent.plugins.allow",
-                hint="plugin management requires a persisted configuration",
-            )
-        # Only *added* ids must be discovered and parseable (§5.3/§5.4); an
-        # id the runtime allow already contains may be stale (container
-        # deleted) or invalid, and must never block management.
-        added = [
-            plugin_id for plugin_id in requested
-            if plugin_id not in set(self.plugins.allow)
-        ]
-        for plugin_id in added:
-            summary = self.plugins.get(plugin_id)
-            if summary is None:
-                raise PluginNotFound(
-                    f"plugin not found: {plugin_id!r}", key="plugin_id",
-                )
-            if summary.state == STATE_INVALID:
-                error = summary.error or {}
-                raise PluginManifestError(
-                    error.get("message")
-                    or f"plugin {plugin_id!r} has an invalid manifest",
-                    key="plugin.yaml",
-                    hint=error.get("hint", ""),
-                )
-        try:
-            effective = service.effective(strict=False)
-        except ConfigError as exc:
-            hint = ""
-            if exc.key == "agent.plugins.allow":
-                hint = (
-                    f"unset or fix {env_var_for('agent.plugins.allow')} "
-                    "and restart the gateway"
-                )
-            raise PluginConfigError(
-                "cannot read the effective configuration",
-                key="agent.plugins.allow",
-                hint=hint,
-                context={"code": exc.code},
-                detail=str(exc),
-            ) from exc
-        if effective.sources.get("agent.plugins.allow") == "env":
-            raise PluginConfigError(
-                "agent.plugins.allow is overridden by the environment",
-                key="agent.plugins.allow",
-                hint=(
-                    f"unset {env_var_for('agent.plugins.allow')} "
-                    "and restart the gateway"
-                ),
-            )
-        try:
-            service.set(
-                "agent.plugins.allow", list(requested),
-                expected_revision=service.revision(),
-            )
-        except ConfigError as exc:
-            raise PluginConfigError(
-                "cannot update agent.plugins.allow",
-                key="agent.plugins.allow",
-                context={"code": exc.code},
-                detail=str(exc),
-            ) from exc
-        result = await self.plugins.set_allowed(requested, mode=mode)
-        await self._audit_plugin(
-            "set_allowed",
-            ids=requested,
-            changes=[change.to_dict() for change in result.changes],
-            mode=mode,
-            persisted=True,
-            restart_required=result.restart_required,
-            duration_ms=int((time.monotonic() - start) * 1000),
-        )
-        return result
-
-    async def _audit_plugin(
-        self,
-        action: str,
-        *,
-        ids: Sequence[str],
-        changes: Sequence[dict],
-        mode: Optional[str] = None,
-        persisted: bool = False,
-        restart_required: bool = False,
-        duration_ms: int,
-    ) -> None:
-        """Publish one ``system.plugin.management`` audit event (§5.8).
-
-        Best-effort observation on the reserved host partition: a publish or
-        log failure is recorded and never changes the management result, and
-        ``CancelledError`` always propagates.
-        """
-        payload = {
-            "action": action,
-            "mode": mode,
-            "ids": list(ids),
-            "changes": [dict(change) for change in changes],
-            "persisted": persisted,
-            "restart_required": restart_required,
-            "duration_ms": duration_ms,
-        }
-        try:
-            await self.bus.publish(Event.create(
-                "system.plugin.management", payload,
-                session_id=self.plugins.host_partition,
-            ))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - audit is observation, not state
-            self._log({
-                "kind": "plugin", "level": "warning",
-                "msg": (
-                    "system.plugin.management publish failed: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
-                "ts": time.time(),
-            })
-        record = {
-            "kind": "plugin", "level": "info", "action": action,
-            "ids": list(ids),
-            "result": (
-                "failed"
-                if any(item.get("action") == "failed" for item in changes)
-                else "ok"
-            ),
-            "duration_ms": duration_ms, "ts": time.time(),
-        }
-        if len(ids) == 1:
-            record["id"] = ids[0]
-        self._log(record)
-
-    def _plugin_state(self, plugin_id: str) -> str:
-        """Current record state, or ``disabled`` for a never-discovered id."""
-        summary = self.plugins.get(plugin_id)
-        return summary.state if summary is not None else STATE_DISABLED
-
-    async def load_plugin(self, plugin_id: str) -> PluginSummary:
-        """Load an allowed plugin for this process, then audit (host API only, D12)."""
-        start = time.monotonic()
-        try:
-            summary = await self.plugins.load(plugin_id)
-        except BaseException as exc:
-            await self._audit_plugin(
-                "load", ids=[plugin_id],
-                changes=[{
-                    "id": plugin_id,
-                    "action": "failed",
-                    "state": self._plugin_state(plugin_id),
-                    "error": as_plugin_error(exc).to_dict(),
-                }],
-                restart_required=False,
-                duration_ms=int((time.monotonic() - start) * 1000),
-            )
-            raise
-        await self._audit_plugin(
-            "load", ids=[plugin_id],
-            changes=[{
-                "id": plugin_id,
-                "action": "load",
-                "state": summary.state,
-                "error": None,
-            }],
-            restart_required=False,
-            duration_ms=int((time.monotonic() - start) * 1000),
-        )
-        return summary
-
-    async def unload_plugin(
-        self, plugin_id: str, *, grace_ms: Optional[int] = None,
-    ) -> PluginSummary:
-        """Quiesce, drain and revoke an active plugin, then audit (§8.5)."""
-        start = time.monotonic()
-        try:
-            summary = await self.plugins.unload(plugin_id, grace_ms=grace_ms)
-        except BaseException as exc:
-            await self._audit_plugin(
-                "unload", ids=[plugin_id],
-                changes=[{
-                    "id": plugin_id,
-                    "action": "failed",
-                    "state": self._plugin_state(plugin_id),
-                    "error": as_plugin_error(exc).to_dict(),
-                }],
-                restart_required=True,
-                duration_ms=int((time.monotonic() - start) * 1000),
-            )
-            raise
-        await self._audit_plugin(
-            "unload", ids=[plugin_id],
-            changes=[{
-                "id": plugin_id,
-                "action": "unload",
-                "state": summary.state,
-                "error": None,
-            }],
-            restart_required=False,
-            duration_ms=int((time.monotonic() - start) * 1000),
-        )
-        return summary
-
     async def history(self, session_id: str, *, include_inflight: bool = True) -> list[dict]:
         return await self.service.history(
             session_id, include_inflight=include_inflight
@@ -2164,8 +1133,6 @@ class AgentHost:
 __all__ = [
     "AgentHost",
     "LeaseManager",
-    "PluginAllowResult",
-    "PluginSummary",
     "SessionHandle",
     "SessionLocked",
     "SessionNotFound",

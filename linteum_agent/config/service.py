@@ -22,14 +22,7 @@ import threading
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Optional
 
-from .meta import (
-    FILE_ONLY_KEYS,
-    apply_scope,
-    build_schema,
-    coerce_value,
-    field_specs,
-    get_spec,
-)
+from .meta import apply_scope, build_schema, coerce_value, field_specs, get_spec
 from .schema import (
     AppConfig,
     ConfigError,
@@ -290,22 +283,17 @@ def _mask_secret_fields(value: Any) -> Any:
     return value
 
 
-def _clear_unresolved_secrets(value: Any, prefix: str = "") -> None:
+def _clear_unresolved_secrets(value: Any) -> None:
     """Turn any remaining ``${VAR}`` secret into ``None`` (never send literals)."""
     if isinstance(value, Mapping):
         for key, item in value.items():
-            path = f"{prefix}.{key}" if prefix else str(key)
-            if path in FILE_ONLY_KEYS:
-                # File-only maps are literal by design (§4.2); never rewrite
-                # their values just because a key looks secret-like.
-                continue
             if _is_secret_key(str(key)) and isinstance(item, str) and "${" in item:
                 value[key] = None
             else:
-                _clear_unresolved_secrets(item, path)
+                _clear_unresolved_secrets(item)
     elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _clear_unresolved_secrets(item, f"{prefix}[{index}]")
+        for item in value:
+            _clear_unresolved_secrets(item)
 
 
 def env_var_for(key: str, prefix: str = ENV_PREFIX) -> str:
@@ -323,10 +311,6 @@ def _interpolate(
     """Resolve ``${ENV_VAR}`` in place (memory only; never written back)."""
     for key in list(data):
         path = f"{prefix}.{key}" if prefix else str(key)
-        if path in FILE_ONLY_KEYS:
-            # File-only maps stay literal (§4.2): their only environment
-            # injection path is the explicit ``env:VAR`` secret reference.
-            continue
         value = data[key]
         if isinstance(value, Mapping):
             _interpolate(value, environ=environ, specs=specs, issues=issues, prefix=path)

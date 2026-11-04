@@ -22,7 +22,6 @@ from .schema import ConfigError
 
 _SESSION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _PROFILE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-_MODE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _MAX_TITLE = 512
 
 
@@ -39,7 +38,6 @@ class SessionOptions:
     workspace: Path | str
     session_id: Optional[str] = None
     profile: str = "default"
-    mode: Optional[str] = None
     title: Optional[str] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -64,30 +62,12 @@ class SessionOptions:
                 code="E_SESSION_ID",
                 hint="use 1-128 characters from [A-Za-z0-9._:-]",
             )
-        if self.session_id is not None and (
-            self.session_id == "host" or self.session_id.startswith("host:")
-        ):
-            # ``host:<uuid>`` is the reserved plugin-lifecycle partition (§9.2).
-            raise ConfigError(
-                f"session_id {self.session_id!r} is reserved for plugin "
-                "lifecycle events",
-                key="session_id",
-                code="E_SESSION_ID",
-                hint="choose a session id that does not start with 'host:'",
-            )
         if not _PROFILE.match(self.profile):
             raise ConfigError(
                 f"invalid profile name: {self.profile!r}",
                 key="profile",
                 code="E_SESSION_PROFILE",
                 hint="use 1-64 characters from [A-Za-z0-9._-]",
-            )
-        if self.mode is not None and not _MODE.match(self.mode):
-            raise ConfigError(
-                f"invalid mode name: {self.mode!r}",
-                key="mode",
-                code="E_SESSION_MODE",
-                hint="use 1-64 characters from [a-z0-9._-], starting with a letter or digit",
             )
         if self.title is not None:
             if not isinstance(self.title, str) or not self.title.strip():
@@ -112,7 +92,6 @@ class SessionOptions:
             "session_id": self.session_id,
             "workspace": str(self.workspace),
             "profile": self.profile,
-            "mode": self.mode,
             "title": self.title,
             "metadata": dict(self.metadata),
         }

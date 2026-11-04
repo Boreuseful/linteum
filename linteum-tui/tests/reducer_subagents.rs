@@ -184,7 +184,6 @@ fn context_result_populates_messages_and_digest() {
             },
         }),
         error: None,
-        name: None,
     };
     reduce(&mut state, Input::CommandResult(result));
     let detail = state.subagents.detail.as_ref().expect("context detail");

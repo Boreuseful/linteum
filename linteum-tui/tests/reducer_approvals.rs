@@ -64,7 +64,6 @@ fn result_err(id: &str, code: &str) -> CommandResult {
             enters_history: false,
             context: serde_json::json!({}),
         }),
-        name: None,
     }
 }
 

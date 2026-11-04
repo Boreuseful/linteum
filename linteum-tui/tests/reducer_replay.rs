@@ -186,13 +186,7 @@ fn reconnected_emits_subscribe_and_resend() {
     );
     s.composer.text = "pending".into();
     reduce(&mut s, Input::Action(UiAction::Send));
-    let effects = reduce(
-        &mut s,
-        Input::Connection(ConnectionEvent::Reconnected {
-            features: vec![],
-            instance_id: None,
-        }),
-    );
+    let effects = reduce(&mut s, Input::Connection(ConnectionEvent::Reconnected));
     let subscribe = effects
         .iter()
         .find_map(|effect| match effect {

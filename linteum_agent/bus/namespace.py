@@ -124,26 +124,13 @@ def _violation(metrics: Optional["Metrics"], origin: str, etype: str) -> None:
 # Subscribe guard (I8)
 # ---------------------------------------------------------------------------
 
-#: Read-only observation types a plugin may subscribe to exactly (D0.4-7,
-#: plugin-design v0.4 §6.2): the tool outcome pair plus the four completion/
-#: failure facts.  Requests, deltas and globs stay denied.
-_PLUGIN_OBSERVATION_TYPES: frozenset = frozenset({
-    "tool.call.completed",
-    "tool.call.failed",
-    "llm.completed",
-    "llm.failed",
-    "agent.completed",
-    "agent.failed",
-})
-
-
 def assert_can_subscribe(origin: str, pattern: str, metrics: Optional["Metrics"] = None) -> None:
     """Capability check for subscriptions (§6 subscribe column, I8).
 
     Core may subscribe to anything.  A plugin is limited to its own namespace,
-    the read-only observation types (exact matches only) and the quota-controlled
-    ``system.*`` observation channel — it can never grab ``tool.call.requested``
-    (which would let it impersonate the runtime) or ``llm.request``.
+    the read-only tool outcome pair (``tool.call.completed`` / ``failed``) and
+    the quota-controlled ``system.*`` observation channel — it can never grab
+    ``tool.call.requested`` (which would let it impersonate the runtime).
     """
     if is_core(origin):
         return
@@ -152,7 +139,7 @@ def assert_can_subscribe(origin: str, pattern: str, metrics: Optional["Metrics"]
         pid = plugin_id(origin)
         allowed = (
             pattern.startswith(f"plugin.{pid}.")
-            or pattern in _PLUGIN_OBSERVATION_TYPES
+            or pattern in ("tool.call.completed", "tool.call.failed")
             or pattern == "system.*"
             or pattern.startswith("system.")
         )

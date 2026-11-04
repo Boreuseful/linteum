@@ -48,14 +48,6 @@ pub fn palette_actions() -> Vec<PaletteAction> {
             label: "Subagents",
         },
         PaletteAction {
-            id: "mode",
-            label: "Session mode",
-        },
-        PaletteAction {
-            id: "plugins",
-            label: "Plugins",
-        },
-        PaletteAction {
             id: "help",
             label: "Help",
         },
@@ -133,8 +125,6 @@ pub fn execute(action: PaletteAction, state: &mut TuiState) -> Vec<Effect> {
             state,
             Input::Action(UiAction::SidebarShowPanel(SidebarPanel::Subagents)),
         ),
-        "mode" => crate::viewmodel::reduce(state, Input::Action(UiAction::OpenModePicker)),
-        "plugins" => crate::viewmodel::reduce(state, Input::Action(UiAction::OpenPlugins)),
         "help" => {
             state.overlay = Some(Overlay::Help);
             Vec::new()
