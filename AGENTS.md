@@ -13,8 +13,6 @@ runtime. Change the library only.
 - `linteum_agent/runtime/compaction.py` — deterministic context summary effect.
 - `linteum_agent/storage/` — SQLite WAL/checkpoints, file artifacts, session history/context reads.
 - `linteum_agent/runtime/tools/` — ToolSpec / Registry / Runtime / Sandbox / approval.
-- `linteum_agent/runtime/plugins/` — capability plugins: manifest validation,
-  two-phase load, quiesce/drain unload, lifecycle events, skill/mode sources.
 - `linteum_agent/runtime/llm/` — canonical types, adapters, executor, router,
   breaker, cache, pricing.
 - `linteum_agent/runtime/observability/` — run-log sidecar.
@@ -77,9 +75,6 @@ change requires breaking one, stop and redesign the change.
   and `astream`/`complete`; register through `AdapterRegistry`.
 - New effect/subscriber: wire it in the host/bootstrap and publish result events.
   Do not call it directly from the Agent.
-- New plugin capability field: extend `runtime/plugins/manifest.py` validation and
-  `PluginHost` materialisation; keep `PluginContext` limited to
-  `provide_tool`/`on_unload`/`log` (no bus/registry/state handles).
 - State change: every new field must be JSON-serialisable, round-trip through
   `AgentState.to_dict/from_dict`, and be covered by `invariant_violations()`.
   Bump checkpoint compatibility if old snapshots cannot load.
@@ -117,24 +112,8 @@ change requires breaking one, stop and redesign the change.
 - `WorkerPool` allows 4 concurrent handlers per session
   (`bus/scheduler/pool.py:20-34`); reducer serialisation and tool parallelism are
   not separated.
-- Capability plugins (`runtime/plugins`) are implemented for tools/skills/modes;
-  hooks, adapters, transport plugins, plugin KV and remote install remain
-  unimplemented. Plugins run **in-process** and are trusted like the host.
-  `agent.plugins.allow` is the authorization boundary; an empty allowlist never
-  imports plugin code. Loading a plugin does not change already-open tool
-  tables (next `session.mode.set` or new session); unloading quiesces, drains
-  in-flight calls, then revokes. Lifecycle events use the reserved per-process
-  `session_id="host:<uuid>"` partition, so clients must not create `host` /
-  `host:*` sessions. Replay/restore never import plugins or call `setup`.
-- Persistent plugin management (`plugin.enable`/`plugin.disable`) is off unless
-  `gateway.plugins.manage=true`; the flag is captured when `GatewayServer`
-  starts. The commands only rewrite `agent.plugins.allow` through
-  `ConfigService.set` — never hot-load/unload, never restart, never import plugin
-  code. An allowlist supplied by an environment override is rejected with
-  `E_PLUGIN_CONFIG`. The TUI gates `Ctrl+E`/`Ctrl+D` on both the
-  `plugins.manage` feature and `plugin.list.manage`.
-- Cross-session memory, retrieval/RAG and CQRS projections beyond the session
-  catalogue are not implemented yet. Do not assume their APIs exist.
+- Plugin host, cross-session memory, retrieval/RAG and CQRS projections beyond the
+  session catalogue are not implemented yet. Do not assume their APIs exist.
 
 ## PR / commit
 

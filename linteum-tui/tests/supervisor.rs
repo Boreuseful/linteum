@@ -16,19 +16,13 @@ use tokio::time::timeout;
 struct FakeTransport {
     out: mpsc::Sender<String>,
     input: mpsc::Receiver<String>,
-    exit_status: Option<i32>,
-    log: Arc<Mutex<Vec<String>>>,
 }
 
 impl Transport for FakeTransport {
     fn split(self: Box<Self>) -> (Box<dyn TransportReader>, Box<dyn TransportWriter>) {
         (
             Box::new(FakeReader { input: self.input }),
-            Box::new(FakeWriter {
-                out: self.out,
-                exit_status: self.exit_status,
-                log: self.log,
-            }),
+            Box::new(FakeWriter { out: self.out }),
         )
     }
 }
@@ -46,8 +40,6 @@ impl TransportReader for FakeReader {
 
 struct FakeWriter {
     out: mpsc::Sender<String>,
-    exit_status: Option<i32>,
-    log: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -60,19 +52,13 @@ impl TransportWriter for FakeWriter {
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
-        self.log.lock().unwrap().push("close".to_owned());
         Ok(())
-    }
-
-    fn exit_status(&self) -> Option<i32> {
-        self.exit_status
     }
 }
 
 struct Script {
     messages: Vec<String>,
     close: bool,
-    fail: bool,
 }
 
 struct FakeConnector {
@@ -81,9 +67,6 @@ struct FakeConnector {
     attempts: AtomicUsize,
     command_tx: mpsc::UnboundedSender<mpsc::Receiver<String>>,
     keepalive: Mutex<Vec<mpsc::Sender<String>>>,
-    log: Arc<Mutex<Vec<String>>>,
-    exit_status: Option<i32>,
-    stderr_tail: Vec<String>,
 }
 
 impl FakeConnector {
@@ -98,18 +81,11 @@ impl FakeConnector {
             attempts: AtomicUsize::new(0),
             command_tx,
             keepalive: Mutex::new(Vec::new()),
-            log: Arc::new(Mutex::new(Vec::new())),
-            exit_status: Some(7),
-            stderr_tail: vec!["stderr-marker-line".to_owned()],
         }
     }
 
     fn attempts(&self) -> usize {
         self.attempts.load(Ordering::SeqCst)
-    }
-
-    fn log(&self) -> Vec<String> {
-        self.log.lock().unwrap().clone()
     }
 }
 
@@ -117,7 +93,6 @@ impl FakeConnector {
 impl Connector for FakeConnector {
     async fn connect(&self) -> Result<Box<dyn Transport>, TransportError> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
-        self.log.lock().unwrap().push("connect".to_owned());
         let script = self
             .scripts
             .lock()
@@ -126,11 +101,7 @@ impl Connector for FakeConnector {
             .unwrap_or_else(|| Script {
                 messages: vec![hello_result(1, &["view", "replay"])],
                 close: false,
-                fail: false,
             });
-        if script.fail {
-            return Err(TransportError::Io("spawn failed".into()));
-        }
         let (out_tx, out_rx) = mpsc::channel(16);
         let (in_tx, in_rx) = mpsc::channel(16);
         for message in script.messages {
@@ -153,17 +124,11 @@ impl Connector for FakeConnector {
         Ok(Box::new(FakeTransport {
             out: out_tx,
             input: in_rx,
-            exit_status: self.exit_status,
-            log: self.log.clone(),
         }))
     }
 
     fn mode(&self) -> Mode {
         self.mode
-    }
-
-    fn stderr_tail(&self) -> Vec<String> {
-        self.stderr_tail.clone()
     }
 }
 
@@ -171,20 +136,6 @@ fn hello_result(protocol: u64, features: &[&str]) -> String {
     serde_json::json!({
         "v": 1, "kind": "result", "id": "r", "reply_to": "c-1", "ok": true,
         "result": {"protocol": protocol, "features": features, "limits": {}}
-    })
-    .to_string()
-}
-
-/// A v0.4 hello result: the gateway stamps its process instance id (§5.6).
-fn hello_result_with_instance(protocol: u64, features: &[&str], instance_id: &str) -> String {
-    serde_json::json!({
-        "v": 1, "kind": "result", "id": "r", "reply_to": "c-1", "ok": true,
-        "result": {
-            "protocol": protocol,
-            "features": features,
-            "limits": {},
-            "instance_id": instance_id,
-        }
     })
     .to_string()
 }
@@ -198,19 +149,7 @@ fn bye_frame(reason: &str) -> String {
 }
 
 fn script(messages: Vec<String>, close: bool) -> Script {
-    Script {
-        messages,
-        close,
-        fail: false,
-    }
-}
-
-fn failing_script() -> Script {
-    Script {
-        messages: Vec::new(),
-        close: false,
-        fail: true,
-    }
+    Script { messages, close }
 }
 
 fn fast_backoff() -> BackoffConfig {
@@ -266,23 +205,8 @@ impl Harness {
                 .unwrap()
             {
                 Input::Connection(ConnectionEvent::Connected { .. })
-                | Input::Connection(ConnectionEvent::Reconnected { .. }) => break,
+                | Input::Connection(ConnectionEvent::Reconnected) => break,
                 _ => {}
-            }
-        }
-    }
-
-    /// Wait for the next `Connected`/`Reconnected` event.
-    async fn wait_for_connected_event(&mut self) -> ConnectionEvent {
-        loop {
-            if let Input::Connection(
-                event @ (ConnectionEvent::Connected { .. } | ConnectionEvent::Reconnected { .. }),
-            ) = timeout(Duration::from_secs(5), self.input_rx.recv())
-                .await
-                .unwrap()
-                .unwrap()
-            {
-                return event;
             }
         }
     }
@@ -296,32 +220,6 @@ impl Harness {
                     .unwrap()
             {
                 break;
-            }
-        }
-    }
-
-    async fn wait_for_child_exited(&mut self) -> ConnectionEvent {
-        loop {
-            if let Input::Connection(event @ ConnectionEvent::ChildExited { .. }) =
-                timeout(Duration::from_secs(5), self.input_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap()
-            {
-                return event;
-            }
-        }
-    }
-
-    async fn wait_for_fatal(&mut self) {
-        loop {
-            if let Input::Connection(ConnectionEvent::Fatal { .. }) =
-                timeout(Duration::from_secs(5), self.input_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap()
-            {
-                return;
             }
         }
     }
@@ -427,71 +325,6 @@ async fn f5_cancels_backoff() {
 }
 
 #[tokio::test]
-async fn hello_instance_id_is_reported() {
-    let mut h = harness(
-        Mode::Attach,
-        vec![script(
-            vec![hello_result_with_instance(1, &["view", "replay"], "gw-1")],
-            false,
-        )],
-        fast_backoff(),
-    );
-    let _commands = h.next_commands().await;
-    match h.wait_for_connected_event().await {
-        ConnectionEvent::Connected { instance_id, .. } => {
-            assert_eq!(instance_id.as_deref(), Some("gw-1"));
-        }
-        other => panic!("expected Connected, got {other:?}"),
-    }
-    assert!(matches!(h.shutdown().await, SupervisorExit::Closed));
-}
-
-#[tokio::test]
-async fn hello_without_instance_id_reports_none() {
-    let mut h = harness(
-        Mode::Attach,
-        vec![script(vec![hello_result(1, &["view", "replay"])], false)],
-        fast_backoff(),
-    );
-    let _commands = h.next_commands().await;
-    match h.wait_for_connected_event().await {
-        ConnectionEvent::Connected { instance_id, .. } => assert_eq!(instance_id, None),
-        other => panic!("expected Connected, got {other:?}"),
-    }
-    assert!(matches!(h.shutdown().await, SupervisorExit::Closed));
-}
-
-#[tokio::test]
-async fn reconnect_reports_the_new_instance_id() {
-    let scripts = vec![
-        script(
-            vec![hello_result_with_instance(1, &["view", "replay"], "gw-1")],
-            true,
-        ),
-        script(
-            vec![hello_result_with_instance(1, &["view", "replay"], "gw-2")],
-            false,
-        ),
-    ];
-    let mut h = harness(Mode::Attach, scripts, fast_backoff());
-    let _first = h.next_commands().await;
-    match h.wait_for_connected_event().await {
-        ConnectionEvent::Connected { instance_id, .. } => {
-            assert_eq!(instance_id.as_deref(), Some("gw-1"));
-        }
-        other => panic!("expected Connected, got {other:?}"),
-    }
-    let _second = h.next_commands().await;
-    match h.wait_for_connected_event().await {
-        ConnectionEvent::Reconnected { instance_id, .. } => {
-            assert_eq!(instance_id.as_deref(), Some("gw-2"));
-        }
-        other => panic!("expected Reconnected, got {other:?}"),
-    }
-    assert!(matches!(h.shutdown().await, SupervisorExit::Closed));
-}
-
-#[tokio::test]
 async fn bye_server_shutdown_reconnects() {
     let scripts = vec![
         script(
@@ -548,66 +381,7 @@ async fn bye_session_deleted_is_forwarded() {
 }
 
 #[tokio::test]
-async fn restart_closes_old_transport_before_respawn() {
-    let scripts = vec![
-        script(vec![hello_result(1, &["view", "replay"])], false),
-        script(vec![hello_result(1, &["view", "replay"])], false),
-    ];
-    let mut h = harness(Mode::Spawn, scripts, fast_backoff());
-    let _first = h.next_commands().await;
-    h.wait_for_connected().await;
-    h.control_tx
-        .send(SupervisorControl::RestartChild)
-        .await
-        .unwrap();
-    let _second = h.next_commands().await;
-    h.wait_for_connected().await;
-    assert_eq!(h.connector.attempts(), 2);
-    // The old transport was closed strictly before the respawn connected.
-    assert_eq!(
-        h.connector.log().as_slice(),
-        &["connect", "close", "connect"]
-    );
-    assert!(matches!(h.shutdown().await, SupervisorExit::Closed));
-}
-
-#[tokio::test]
-async fn spawn_child_exit_keeps_supervisor_alive_and_retries() {
-    let scripts = vec![
-        script(vec![hello_result(1, &["view", "replay"])], true),
-        script(vec![hello_result(1, &["view", "replay"])], false),
-    ];
-    let mut h = harness(Mode::Spawn, scripts, fast_backoff());
-    let _first = h.next_commands().await;
-    h.wait_for_connected().await;
-    match h.wait_for_child_exited().await {
-        ConnectionEvent::ChildExited {
-            status,
-            stderr_tail,
-        } => {
-            assert_eq!(status, Some(7));
-            assert!(
-                stderr_tail.iter().any(|line| line == "stderr-marker-line"),
-                "stderr tail marker missing: {stderr_tail:?}"
-            );
-        }
-        other => panic!("expected ChildExited, got {other:?}"),
-    }
-    // The supervisor stays alive but does not respawn on its own.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(h.connector.attempts(), 1);
-    h.control_tx
-        .send(SupervisorControl::RestartChild)
-        .await
-        .unwrap();
-    let _second = h.next_commands().await;
-    h.wait_for_connected().await;
-    assert_eq!(h.connector.attempts(), 2);
-    assert!(matches!(h.shutdown().await, SupervisorExit::Closed));
-}
-
-#[tokio::test]
-async fn spawn_child_exit_keeps_supervisor_alive_without_auto_respawn() {
+async fn spawn_child_exit_is_fatal_without_auto_respawn() {
     let mut h = harness(
         Mode::Spawn,
         vec![script(vec![hello_result(1, &["view", "replay"])], true)],
@@ -615,53 +389,12 @@ async fn spawn_child_exit_keeps_supervisor_alive_without_auto_respawn() {
     );
     let _first = h.next_commands().await;
     h.wait_for_connected().await;
-    h.wait_for_child_exited().await;
-    // No automatic respawn; the supervisor is still alive and honors control.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(h.connector.attempts(), 1);
-    assert!(matches!(h.shutdown().await, SupervisorExit::Closed));
-}
-
-#[tokio::test]
-async fn spawn_connect_failure_waits_for_restart_then_respawns() {
-    let scripts = vec![
-        failing_script(),
-        script(vec![hello_result(1, &["view", "replay"])], false),
-    ];
-    let mut h = harness(Mode::Spawn, scripts, fast_backoff());
-    h.wait_for_fatal().await;
-    assert_eq!(h.connector.attempts(), 1);
-    // Still alive: `r` on the fatal screen requests a respawn.
-    h.control_tx
-        .send(SupervisorControl::RestartChild)
+    let exit = timeout(Duration::from_secs(5), h.task)
         .await
+        .unwrap()
         .unwrap();
-    let _commands = h.next_commands().await;
-    h.wait_for_connected().await;
-    assert_eq!(h.connector.attempts(), 2);
-    assert!(matches!(h.shutdown().await, SupervisorExit::Closed));
-}
-
-#[tokio::test]
-async fn spawn_protocol_mismatch_closes_transport_and_waits_for_restart() {
-    let scripts = vec![
-        script(vec![hello_result(2, &["view", "replay"])], false),
-        script(vec![hello_result(1, &["view", "replay"])], false),
-    ];
-    let mut h = harness(Mode::Spawn, scripts, fast_backoff());
-    let _first = h.next_commands().await;
-    h.wait_for_fatal().await;
-    // The live transport was closed before the fatal screen was shown.
-    assert_eq!(h.connector.log().as_slice(), &["connect", "close"]);
+    assert!(matches!(exit, SupervisorExit::ChildExited { .. }));
     assert_eq!(h.connector.attempts(), 1);
-    h.control_tx
-        .send(SupervisorControl::RestartChild)
-        .await
-        .unwrap();
-    let _second = h.next_commands().await;
-    h.wait_for_connected().await;
-    assert_eq!(h.connector.attempts(), 2);
-    assert!(matches!(h.shutdown().await, SupervisorExit::Closed));
 }
 
 #[test]

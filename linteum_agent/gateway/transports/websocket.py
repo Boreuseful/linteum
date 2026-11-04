@@ -29,11 +29,8 @@ logger = get_logger("transport.websocket")
 class WebSocketTransport:
     """One ``websockets`` connection exposed as a gateway transport."""
 
-    def __init__(self, websocket: Any, *, is_local: bool = True) -> None:
+    def __init__(self, websocket: Any) -> None:
         self._websocket = websocket
-        #: Whether the peer connected over loopback; the server bootstrap sets
-        #: it from the bind host (§5.6).
-        self.is_local = is_local
         self._closed = False
 
     async def recv(self) -> Optional[str]:

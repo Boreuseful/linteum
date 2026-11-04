@@ -145,7 +145,6 @@ pub struct NewSessionForm {
     pub workspace: String,
     pub title: String,
     pub profile: String,
-    pub mode: String,
     pub focus: usize,
     pub error: Option<String>,
     pub workspace_cursor: usize,

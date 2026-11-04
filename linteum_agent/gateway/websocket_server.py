@@ -89,9 +89,7 @@ async def serve_websocket(
         logger.debug("websocket client connected: %s",
                      getattr(websocket, "remote_address", None))
         try:
-            await gateway_server.serve(WebSocketTransport(
-                websocket, is_local=_is_loopback(host),
-            ))
+            await gateway_server.serve(WebSocketTransport(websocket))
         finally:
             logger.debug("websocket client disconnected: %s",
                          getattr(websocket, "remote_address", None))

@@ -24,9 +24,6 @@ pub struct SpawnConfig {
     pub no_lease: bool,
     pub cwd: Option<PathBuf>,
     pub stderr_log: PathBuf,
-    /// Shared stderr tail. The connector owns one Arc across respawns so the
-    /// supervisor can report recent child stderr on exit (§7.5).
-    pub stderr_tail: Arc<Mutex<VecDeque<String>>>,
     pub teardown_grace: Duration,
     pub term_grace: Duration,
 }
@@ -112,13 +109,14 @@ pub async fn spawn_stdio(config: SpawnConfig) -> Result<StdioChildTransport, Spa
     if let Some(parent) = config.stderr_log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    spawn_stderr_task(stderr, config.stderr_log, config.stderr_tail.clone());
+    let tail = Arc::new(Mutex::new(VecDeque::new()));
+    spawn_stderr_task(stderr, config.stderr_log, tail.clone());
 
     Ok(StdioChildTransport {
         stdin: Some(stdin),
         stdout: BufReader::new(stdout),
         child,
-        stderr_tail: config.stderr_tail,
+        stderr_tail: tail,
         teardown_grace: config.teardown_grace,
         term_grace: config.term_grace,
     })
@@ -158,7 +156,6 @@ impl Transport for StdioChildTransport {
                 child,
                 teardown_grace: self.teardown_grace,
                 term_grace: self.term_grace,
-                exit_status: None,
             }),
         )
     }
@@ -195,23 +192,6 @@ struct StdioChildWriter {
     child: Arc<AsyncMutex<Child>>,
     teardown_grace: Duration,
     term_grace: Duration,
-    exit_status: Option<i32>,
-}
-
-impl StdioChildWriter {
-    /// Record the child's exit status if it has already been reaped. Returns
-    /// true when the child is gone, so `close` can skip the grace periods.
-    async fn already_exited(&mut self) -> bool {
-        let mut child = self.child.lock().await;
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                self.exit_status = status.code();
-                true
-            }
-            Ok(None) => false,
-            Err(_) => false,
-        }
-    }
 }
 
 #[async_trait]
@@ -235,17 +215,9 @@ impl TransportWriter for StdioChildWriter {
 
     async fn close(&mut self) -> Result<(), TransportError> {
         tracing::info!("stopping gateway child");
-        // Idempotent: if the child already exited and was reaped, there is
-        // nothing to tear down — return immediately without the grace sleeps.
-        if self.already_exited().await {
-            return Ok(());
-        }
         // EOF on stdin lets a well-behaved server shut down on its own.
         self.stdin.take();
         tokio::time::sleep(self.teardown_grace).await;
-        if self.already_exited().await {
-            return Ok(());
-        }
 
         let mut child = self.child.lock().await;
         #[cfg(unix)]
@@ -261,34 +233,7 @@ impl TransportWriter for StdioChildWriter {
             let _ = child.start_kill();
         }
         let _ = child.wait().await;
-        self.exit_status = child
-            .try_wait()
-            .ok()
-            .flatten()
-            .and_then(|status| status.code());
         Ok(())
-    }
-
-    fn exit_status(&self) -> Option<i32> {
-        self.exit_status
-    }
-}
-
-impl Drop for StdioChildWriter {
-    fn drop(&mut self) {
-        // Best effort, never await in Drop: if the broker task was aborted or
-        // panicked while the child was still running, kill it so a respawn
-        // never leaves an orphan gateway behind.
-        if self.exit_status.is_some() {
-            return;
-        }
-        let Ok(mut child) = self.child.try_lock() else {
-            // A concurrent `close` owns the child; its teardown path reaps it.
-            return;
-        };
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.start_kill();
-        }
     }
 }
 

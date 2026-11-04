@@ -16,7 +16,6 @@ pub struct TuiPrefs {
     pub no_lease: bool,
     pub theme: Option<ThemeChoice>,
     pub show_reasoning: Option<bool>,
-    pub default_mode: Option<String>,
     pub log_level: Option<String>,
 }
 
@@ -26,8 +25,6 @@ struct TuiFile {
     gateway: GatewayFile,
     #[serde(default)]
     ui: UiFile,
-    #[serde(default)]
-    session: SessionFile,
     #[serde(default)]
     logging: LoggingFile,
 }
@@ -47,11 +44,6 @@ struct UiFile {
     show_reasoning: Option<bool>,
     #[allow(dead_code)]
     language: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct SessionFile {
-    default_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -77,10 +69,6 @@ pub fn load_tui_config(path: &Path) -> Result<TuiPrefs, ConfigError> {
         no_lease: file.gateway.no_lease.unwrap_or(false),
         theme: file.ui.theme.as_deref().and_then(parse_theme),
         show_reasoning: file.ui.show_reasoning,
-        default_mode: file
-            .session
-            .default_mode
-            .filter(|value| !value.trim().is_empty()),
         log_level: file.logging.level,
     })
 }

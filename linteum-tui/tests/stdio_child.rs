@@ -1,10 +1,8 @@
 #![cfg(unix)]
 
-use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use linteum_tui::connection::{
@@ -31,7 +29,6 @@ fn config(bin: PathBuf, stderr_log: PathBuf) -> SpawnConfig {
         no_lease: true,
         cwd: None,
         stderr_log,
-        stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
         teardown_grace: Duration::from_millis(50),
         term_grace: Duration::from_millis(50),
     }
@@ -127,26 +124,4 @@ async fn child_exit_is_reported() {
         .unwrap();
     let status = transport.wait_exit().await.unwrap();
     assert_eq!(status.code(), Some(7));
-}
-
-#[tokio::test]
-async fn stdio_writer_reports_exit_status_and_skips_grace_when_exited() {
-    let dir = tempdir().unwrap();
-    let bin = script(dir.path(), "exit.sh", "#!/bin/sh\nexit 7\n");
-    let mut config = config(bin, dir.path().join("gw.log"));
-    // Huge grace periods: an already-reaped child must skip them entirely.
-    config.teardown_grace = Duration::from_secs(30);
-    config.term_grace = Duration::from_secs(30);
-    let mut transport = spawn_stdio(config).await.unwrap();
-    let status = transport.wait_exit().await.unwrap();
-    assert_eq!(status.code(), Some(7));
-    let (_, mut writer) = Box::new(transport).split();
-    let started = Instant::now();
-    writer.close().await.unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "close did not skip the grace periods: {:?}",
-        started.elapsed()
-    );
-    assert_eq!(writer.exit_status(), Some(7));
 }

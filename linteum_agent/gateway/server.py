@@ -20,19 +20,15 @@ import asyncio
 import contextlib
 import itertools
 import time
-import uuid
 from typing import Optional
 
 from ..config.options import SessionOptions
 from ..config.schema import AppConfig, ConfigError, GatewaySettings
 from ..config.service import ConfigService, EffectiveConfig
 from ..runtime.host import AgentHost, SessionLocked, SessionNotFound
-from ..runtime.plugins.errors import PluginError, PluginManifestError, PluginNotFound
 from .errors import (
     E_INTERNAL,
     E_PAYLOAD_TOO_LARGE,
-    E_PLUGIN_CONFIG,
-    E_PLUGIN_MANAGE_DISABLED,
     E_PROTOCOL,
     E_PROTOCOL_VERSION,
     E_SESSION_LOCKED,
@@ -231,7 +227,7 @@ class ClientConnection:
             result = CommandResult.failure(result.reply_to, GatewayError(
                 E_PAYLOAD_TOO_LARGE, "command result exceeds max_frame_bytes",
                 location=LOCATION_SERVER,
-            ), name=result.name)
+            ))
             text = encode(result)
             size = len(text.encode("utf-8"))
         if self._over_capacity(size):
@@ -425,18 +421,12 @@ class GatewayServer:
         config_service: Optional[ConfigService] = None,
         gap_timeout: float = 0.020,
         server_name: str = "linteum",
-        instance_id: Optional[str] = None,
     ) -> None:
         self.host = host
         self.config_service = config_service or host.config_service
         self._fixed_settings = _gateway_settings(config)
         self.gap_timeout = gap_timeout
         self.server_name = server_name
-        # Stable per-process identity, reported by hello so a client can tell
-        # a restarted gateway from a reconnected one (§5.6).
-        self._instance_id = instance_id or uuid.uuid4().hex
-        # §11.5.4: capture at startup (apply_scope=restart), never per command.
-        self._manage_enabled = self._initial_manage_enabled()
 
         self._gateways: dict[str, SessionGateway] = {}
         self._gateway_locks: dict[str, asyncio.Lock] = {}
@@ -457,15 +447,6 @@ class GatewayServer:
         if self.config_service is not None:
             return self.config_service.effective(strict=False).config
         return self.host.current_config()
-
-    def _initial_manage_enabled(self) -> bool:
-        """``gateway.plugins.manage`` as seen when this server started."""
-        if self._fixed_settings is not None:
-            return bool(self._fixed_settings.plugins.manage)
-        try:
-            return bool(self._current_config().gateway.plugins.manage)
-        except Exception:  # noqa: BLE001 - an invalid config is already fatal elsewhere
-            return False
 
     # -- lifecycle ----------------------------------------------------------
     async def serve(self, transport: Transport) -> ClientConnection:
@@ -560,15 +541,11 @@ class GatewayServer:
                 )
             validate_command(command)
             result = await self._dispatch(connection, command, settings)
-            connection.send_result(
-                CommandResult.success(command.id, result, name=command.name)
-            )
+            connection.send_result(CommandResult.success(command.id, result))
             self._audit_command(connection, command, "ok", started)
         except GatewayError as exc:
             if command is not None:
-                connection.send_result(
-                    CommandResult.failure(command.id, exc, name=command.name)
-                )
+                connection.send_result(CommandResult.failure(command.id, exc))
             elif request_id:
                 connection.send_result(CommandResult.failure(request_id, exc))
             else:
@@ -587,9 +564,7 @@ class GatewayServer:
                 location=LOCATION_SERVER, exc=exc,
             )
             if command is not None:
-                connection.send_result(
-                    CommandResult.failure(command.id, error, name=command.name)
-                )
+                connection.send_result(CommandResult.failure(command.id, error))
             elif request_id:
                 connection.send_result(CommandResult.failure(request_id, error))
             else:
@@ -604,26 +579,6 @@ class GatewayServer:
             return {"pong": True, "ts": time.time()}
         if command.name == "session.create":
             return await self._session_create(connection, command)
-        if command.name == "mode.list":
-            return await self._mode_list()
-        if command.name == "plugin.list":
-            return await self._plugin_list()
-        if command.name == "plugin.enable":
-            return await self._plugin_set_enabled(command, enable=True)
-        if command.name == "plugin.disable":
-            return await self._plugin_set_enabled(command, enable=False)
-        if command.name == "plugin.set_allowed":
-            self._require_plugin_runtime(connection)
-            return await self._plugin_set_allowed(command)
-        if command.name == "plugin.load":
-            self._require_plugin_runtime(connection)
-            return await self._plugin_load(command)
-        if command.name == "plugin.unload":
-            self._require_plugin_runtime(connection)
-            return await self._plugin_unload(command)
-        if command.name == "plugin.reload":
-            self._require_plugin_runtime(connection)
-            return await self._plugin_reload(command)
         if command.name == "session.list":
             return await self._session_list(command)
         if command.name == "session.children":
@@ -690,7 +645,6 @@ class GatewayServer:
                 "history_page_size": settings.history.page_size,
             },
             features=FEATURES,
-            instance_id=self._instance_id,
         )
 
     # -- session catalogue --------------------------------------------------
@@ -702,7 +656,6 @@ class GatewayServer:
                 workspace=args["workspace"],
                 session_id=args.get("session_id"),
                 profile=args.get("profile") or self._current_config().agent.default_profile,
-                mode=args.get("mode"),
                 title=args.get("title"),
                 metadata=dict(args.get("metadata") or {}),
             )
@@ -734,365 +687,6 @@ class GatewayServer:
             "snapshot": gateway.snapshot(),
             "warnings": list(handle.warnings),
         }
-
-    async def _mode_list(self) -> dict:
-        catalog = await self.host.mode_catalog()
-        modes = await self.host.list_modes()
-        return {
-            "modes": [
-                {
-                    "id": mode.id,
-                    "name": mode.name,
-                    "description": mode.description,
-                    "source": mode.source_id,
-                    "builtin": mode.builtin,
-                    "default": mode.default,
-                }
-                for mode in modes
-            ],
-            "invalid": [
-                {
-                    **issue.to_dict(),
-                    "id": f"{issue.source_id}/{issue.name}",
-                }
-                for issue in catalog.invalid
-            ],
-            "warnings": list(catalog.warnings),
-        }
-
-    def _plugin_allow_env_override(self) -> bool:
-        """True when ``agent.plugins.allow`` comes from an environment override."""
-        if self.config_service is None:
-            return False
-        try:
-            effective = self.config_service.effective(strict=False)
-        except ConfigError:
-            return False
-        return effective.sources.get("agent.plugins.allow") == "env"
-
-    def _plugin_file_config(self) -> Optional[AppConfig]:
-        """The validated file-level config, or ``None`` when unreadable/missing."""
-        if self.config_service is None:
-            return None
-        try:
-            return self.config_service.store.load(create=False)
-        except ConfigError:
-            return None
-
-    def _plugin_manage_state(self) -> tuple[bool, Optional[AppConfig], list[str]]:
-        """(manage, file config, warnings) for ``plugin.list`` (§11.2)."""
-        warnings: list[str] = []
-        if self.config_service is None:
-            return False, None, warnings
-        env_override = self._plugin_allow_env_override()
-        file_config = self._plugin_file_config()
-        if file_config is None:
-            warnings.append("plugin.config_unreadable")
-            return False, None, warnings
-        if env_override:
-            warnings.append("plugin.allow_env_override")
-        return self._manage_enabled and not env_override, file_config, warnings
-
-    async def _plugin_list(self) -> dict:
-        summaries = await self.host.list_plugins()
-        manage, file_config, config_warnings = self._plugin_manage_state()
-        plugins = []
-        invalid = []
-        for summary in summaries:
-            if summary.state == "invalid":
-                error = summary.error or {}
-                invalid.append({
-                    "source": summary.source,
-                    "code": error.get("code", "E_PLUGIN_MANIFEST"),
-                    "error": error.get("message", ""),
-                })
-                continue
-            enabled = (
-                summary.id in file_config.agent.plugins.allow
-                if file_config is not None
-                else summary.state != "disabled"
-            )
-            entry = {
-                "id": summary.id,
-                "version": summary.version,
-                "state": summary.state,
-                "enabled": enabled,
-                "trust": summary.trust,
-                "description": summary.description,
-                "source": summary.source,
-                "tools": list(summary.tools),
-                "skills": list(summary.skills),
-                "modes": list(summary.modes),
-                "digest": summary.digest,
-            }
-            # §4.5 v0.4: sources and secret names only (never values).  Only
-            # active records carry them; unloaded/disabled/failed are empty.
-            if summary.config:
-                entry["config"] = dict(summary.config)
-            if summary.secrets:
-                entry["secrets"] = list(summary.secrets)
-            if summary.hooks:
-                entry["hooks"] = list(summary.hooks)
-            if summary.subscribes:
-                entry["subscribes"] = list(summary.subscribes)
-            if summary.publishes:
-                entry["publishes"] = list(summary.publishes)
-            # §11.2 v0.2: explain failed/disabled plugins without a new command.
-            if summary.error:
-                entry["error"] = dict(summary.error)
-            if summary.warnings:
-                entry["warnings"] = list(summary.warnings)
-            plugins.append(entry)
-        result = {
-            "plugins": plugins,
-            "invalid": invalid,
-            "warnings": [*self.host.plugin_warnings(), *config_warnings],
-            "manage": manage,
-        }
-        # Post-v0.4 apply extension: expose the file-level allow so a local
-        # client can submit exactly the saved list back with mode="apply".
-        # The field is omitted when the file config is unavailable.
-        if file_config is not None:
-            result["allow"] = list(file_config.agent.plugins.allow)
-        return result
-
-    # -- plugin management gates (§11.5.4 / §5.6) --------------------------
-    def _require_manage_enabled(self, *, hint: str = "") -> None:
-        """Raise unless ``gateway.plugins.manage`` is enabled.
-
-        The flag is captured when the server starts (apply_scope=restart);
-        ``hint`` is an optional client-facing remedy kept per gate.
-        """
-        if self._manage_enabled:
-            return
-        context = {"hint": hint} if hint else {}
-        raise GatewayError(
-            E_PLUGIN_MANAGE_DISABLED,
-            "plugin management is disabled",
-            location=LOCATION_SERVER,
-            context=context,
-        )
-
-    def _require_config_service(self) -> ConfigService:
-        """Return the :class:`ConfigService`, or raise ``E_PLUGIN_CONFIG``."""
-        service = self.config_service
-        if service is None:
-            raise GatewayError(
-                E_PLUGIN_CONFIG,
-                "configuration service is not available",
-                location=LOCATION_SERVER,
-            )
-        return service
-
-    def _require_allow_not_env_overridden(self) -> None:
-        """Raise ``E_PLUGIN_CONFIG`` when ``agent.plugins.allow`` comes from env."""
-        if self._plugin_allow_env_override():
-            raise GatewayError(
-                E_PLUGIN_CONFIG,
-                "agent.plugins.allow is overridden by the environment",
-                location=LOCATION_SERVER,
-                context={
-                    "hint": "unset the environment variable and restart the gateway",
-                },
-            )
-
-    def _require_config_readable(self, service: ConfigService) -> AppConfig:
-        """Load the config file; a read/parse failure is ``E_PLUGIN_CONFIG``."""
-        try:
-            return service.store.load(create=False)
-        except ConfigError as exc:
-            raise GatewayError(
-                E_PLUGIN_CONFIG,
-                "cannot read the configuration file",
-                location=LOCATION_SERVER,
-                context={"code": exc.code},
-                exc=exc,
-            ) from exc
-
-    async def _plugin_set_enabled(self, command: Command, *,
-                                  enable: bool) -> dict:
-        """Persistently add/remove one id from ``agent.plugins.allow`` (§11.5)."""
-        self._require_manage_enabled()
-        service = self._require_config_service()
-        self._require_allow_not_env_overridden()
-        file_config = self._require_config_readable(service)
-
-        plugin_id = str(command.args.get("id"))
-        summaries = await self.host.list_plugins()
-        summary = next(
-            (item for item in summaries if item.id == plugin_id), None,
-        )
-        if summary is None:
-            raise GatewayError(
-                PluginNotFound.code,
-                f"plugin not found: {plugin_id!r}",
-                location=LOCATION_SERVER,
-            )
-        if summary.state == "invalid":
-            error = summary.error or {}
-            raise GatewayError(
-                PluginManifestError.code,
-                error.get("message")
-                or f"invalid plugin manifest for {plugin_id!r}",
-                location=LOCATION_SERVER,
-            )
-
-        allow = list(file_config.agent.plugins.allow)
-        changed = False
-        if enable and plugin_id not in allow:
-            allow.append(plugin_id)
-            changed = True
-        elif not enable and plugin_id in allow:
-            allow.remove(plugin_id)
-            changed = True
-        if changed:
-            try:
-                service.set(
-                    "agent.plugins.allow", allow,
-                    expected_revision=service.revision(),
-                )
-            except ConfigError as exc:
-                raise GatewayError(
-                    E_PLUGIN_CONFIG,
-                    "cannot update agent.plugins.allow",
-                    location=LOCATION_SERVER,
-                    context={"code": exc.code},
-                    exc=exc,
-                ) from exc
-
-        restart_required = (
-            summary.state in {"disabled", "discovered", "unloaded"}
-            if enable
-            else summary.state in {"active", "loading", "quiescing"}
-        )
-        plugin = {
-            "id": summary.id,
-            "version": summary.version,
-            "state": summary.state,
-            "enabled": enable,
-            "trust": summary.trust,
-            "description": summary.description,
-            "source": summary.source,
-            "tools": list(summary.tools),
-            "skills": list(summary.skills),
-            "modes": list(summary.modes),
-            "digest": summary.digest,
-        }
-        self.host._log({
-            "kind": "plugin",
-            "level": "info",
-            "msg": f"plugin {'enable' if enable else 'disable'} {plugin_id}",
-            "ts": time.time(),
-            "action": "enable" if enable else "disable",
-            "id": plugin_id,
-            "changed": changed,
-            "restart_required": restart_required,
-        })
-        return {
-            "plugin": plugin,
-            "changed": changed,
-            "persisted": True,
-            "restart_required": restart_required,
-            "warnings": [],
-        }
-
-    # -- plugin runtime commands (§5.6) -------------------------------------
-    def _require_plugin_runtime(self, connection: ClientConnection) -> None:
-        """Gate the runtime lifecycle commands (§5.6).
-
-        Checked in spec order: the manage flag, a working configuration
-        service with a readable file, no environment override of
-        ``agent.plugins.allow``, and a local transport.  Only clients that
-        pass all four may touch the running plugin set.  The individual
-        checks are shared with :meth:`_plugin_set_enabled`, which checks the
-        env override before reading the file.
-        """
-        self._require_manage_enabled(
-            hint=(
-                "enable gateway.plugins.manage in the configuration "
-                "and restart the gateway"
-            ),
-        )
-        service = self._require_config_service()
-        self._require_config_readable(service)
-        self._require_allow_not_env_overridden()
-        if not getattr(connection.transport, "is_local", True):
-            raise GatewayError(
-                E_PLUGIN_MANAGE_DISABLED,
-                "plugin runtime management requires a local transport",
-                location=LOCATION_SERVER,
-                context={
-                    "hint": (
-                        "plugin runtime commands are only available to local "
-                        "clients (embedded, stdio or loopback)"
-                    ),
-                },
-            )
-
-    @staticmethod
-    def _plugin_gateway_error(exc: PluginError) -> GatewayError:
-        """Map a runtime :class:`PluginError` onto a gateway command error."""
-        context = {}
-        if exc.key:
-            context["key"] = exc.key
-        if exc.hint:
-            context["hint"] = exc.hint
-        return GatewayError(
-            exc.code, str(exc), retryable=exc.retryable,
-            location=LOCATION_SERVER, context=context,
-        )
-
-    async def _plugin_set_allowed(self, command: Command) -> dict:
-        ids = tuple(command.args["ids"])
-        mode = str(command.args.get("mode", "deferred"))
-        try:
-            result = await self.host.set_plugin_allowed(ids, mode=mode)
-        except PluginError as exc:
-            raise self._plugin_gateway_error(exc) from exc
-        return {
-            "allow": list(result.allow),
-            "mode": result.mode,
-            "changed": result.changed,
-            "restart_required": result.restart_required,
-            "plugins": [summary.to_dict() for summary in result.summaries],
-            "changes": [change.to_dict() for change in result.changes],
-        }
-
-    async def _plugin_load(self, command: Command) -> dict:
-        plugin_id = str(command.args["id"])
-        try:
-            summary = await self.host.load_plugin(plugin_id)
-        except PluginError as exc:
-            raise self._plugin_gateway_error(exc) from exc
-        # A validation/setup/commit failure is data, not a command error: the
-        # host returns the failed summary and the command acknowledges it.
-        return {"plugin": summary.to_dict(), "changed": True}
-
-    async def _plugin_unload(self, command: Command) -> dict:
-        plugin_id = str(command.args["id"])
-        grace_ms = command.args.get("grace_ms")
-        try:
-            summary = await self.host.unload_plugin(
-                plugin_id, grace_ms=grace_ms,
-            )
-        except PluginError as exc:
-            raise self._plugin_gateway_error(exc) from exc
-        return {"plugin": summary.to_dict(), "changed": True}
-
-    async def _plugin_reload(self, command: Command) -> dict:
-        plugin_id = str(command.args["id"])
-        summaries = await self.host.list_plugins()
-        current = next(
-            (summary for summary in summaries if summary.id == plugin_id),
-            None,
-        )
-        try:
-            if current is not None and current.state == "active":
-                await self.host.unload_plugin(plugin_id)
-            summary = await self.host.load_plugin(plugin_id)
-        except PluginError as exc:
-            raise self._plugin_gateway_error(exc) from exc
-        return {"plugin": summary.to_dict(), "changed": True}
 
     async def _session_list(self, command: Command) -> dict:
         limit = int(command.args.get("limit") or 50)

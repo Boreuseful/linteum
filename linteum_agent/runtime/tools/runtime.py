@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import Collection, Iterable
+from collections.abc import Collection
 from typing import Callable, Optional
 
 from ...bus.artifact import NullArtifactStore
@@ -117,8 +117,6 @@ class ToolRuntime:
         self.tokens: dict[str, CancelToken] = {}
         self.inflight: dict[str, asyncio.Task] = {}
         self._sessions: dict[str, str] = {}
-        #: ``call_id -> tool name`` for the drain bookkeeping (§8.10).
-        self._names: dict[str, str] = {}
 
         if auto_subscribe:
             self.subscribe()
@@ -201,15 +199,9 @@ class ToolRuntime:
         token = CancelToken()
         self.tokens[call_id] = token
         self._sessions[call_id] = ev.session_id
-        self._names[call_id] = spec.name
         task = self.pool.spawn(self._execute(ev, spec, token, registry), session_id=ev.session_id)
         self.inflight[call_id] = task
-
-        def _done(_task, cid=call_id):
-            self.inflight.pop(cid, None)
-            self._names.pop(cid, None)
-
-        task.add_done_callback(_done)
+        task.add_done_callback(lambda _t, cid=call_id: self.inflight.pop(cid, None))
 
     async def _effective_approval_policy(self, session_id: str) -> str:
         """Resolve ``ask``/``allow``/``deny`` for one session.
@@ -293,7 +285,6 @@ class ToolRuntime:
         """Externalise oversized output, record the result, publish the outcome."""
         self.tokens.pop(call_id, None)
         self._sessions.pop(call_id, None)
-        self._names.pop(call_id, None)
 
         ok = bool(result.get("ok"))
         if ok:
@@ -342,24 +333,6 @@ class ToolRuntime:
         if task is not None and not task.done():
             task.cancel()                                   # interrupt awaits (I19 re-raises)
         await self.sandbox.kill(call_id)                    # real teardown (p.kill())
-
-    # -- plugin unload (§8.10) ---------------------------------------------
-    async def drain(self, names: Iterable[str], *, timeout: float) -> int:
-        """Wait for in-flight calls of ``names``; return how many are still running.
-
-        Observation only: nothing is cancelled and no event is published.  The
-        plugin host uses this between ``mark_draining`` and ``unregister_many``
-        so a call that already holds its spec may finish normally.
-        """
-        wanted = set(names)
-        tasks = [
-            task for call_id, task in self.inflight.items()
-            if self._names.get(call_id) in wanted and not task.done()
-        ]
-        if not tasks:
-            return 0
-        _, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout))
-        return len(pending)
 
     # -- approval (§24) -----------------------------------------------------
     async def on_approval(self, ev) -> None:
