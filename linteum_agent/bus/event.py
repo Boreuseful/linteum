@@ -102,6 +102,8 @@ KNOWN_TYPES: frozenset = frozenset(
         "system.plugin.unloaded",
         "system.plugin.quarantined",
         "system.plugin.namespace_violation",
+        # §7.3 management audit (§5.8: produced by AgentHost, hence core-origin)
+        "system.plugin.management",
     }
 )
 

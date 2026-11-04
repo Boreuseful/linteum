@@ -1,7 +1,8 @@
 //! Application bootstrap and event loop.
 
+use std::collections::VecDeque;
 use std::io::IsTerminal;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,8 +26,8 @@ use crate::connection::{
 use crate::logging::{LogError, init_logging};
 use crate::ui::{App, TerminalGuard, TerminalOps, Theme, UiError, key_to_action, palette};
 use crate::viewmodel::{
-    ApprovalDecision, CommandSpec, Effect, Focus, Input, Overlay, QuitMode, TuiState, UiAction,
-    reduce,
+    ApprovalDecision, CommandSpec, Effect, Focus, GatewayMode, Input, Overlay, QuitMode, TuiState,
+    UiAction, reduce,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +63,14 @@ impl Connector for SpawnConnector {
 
     fn mode(&self) -> Mode {
         Mode::Spawn
+    }
+
+    fn stderr_tail(&self) -> Vec<String> {
+        self.config
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -155,6 +164,9 @@ pub async fn run_app(cli: Cli) -> Result<(), AppError> {
                 no_lease: config.no_lease,
                 cwd: None,
                 stderr_log: config.log_path.with_file_name("tui-gateway.log"),
+                // One shared tail across respawns so a child exit can report
+                // the most recent stderr (§7.5).
+                stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
                 teardown_grace: Duration::from_secs(5),
                 term_grace: Duration::from_secs(2),
             },
@@ -207,6 +219,10 @@ pub async fn run_loop<T: TerminalOps>(
     app.state.quit_mode = match config.mode {
         Mode::Spawn => QuitMode::Spawn,
         Mode::Attach => QuitMode::Attach,
+    };
+    app.state.gateway_mode = match config.mode {
+        Mode::Spawn => GatewayMode::Spawn,
+        Mode::Attach => GatewayMode::Attach,
     };
 
     let workspace = match config.mode {
@@ -525,7 +541,86 @@ fn overlay_effects(state: &mut TuiState, key: crossterm::event::KeyEvent) -> Opt
             }
             _ => Vec::new(),
         }),
+        Overlay::Plugins if state.plugins.pending.is_some() => Some(match key.code {
+            // The confirmation bar owns the keyboard: `y` sends, `n`/Esc
+            // cancels, everything else is ignored (§11.5.5).
+            KeyCode::Char('y')
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                reduce(state, Input::Action(UiAction::PluginConfirm))
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                reduce(state, Input::Action(UiAction::PluginCancel))
+            }
+            _ => Vec::new(),
+        }),
+        Overlay::Plugins => Some(match key.code {
+            KeyCode::Up => reduce(state, Input::Action(UiAction::PluginSelectPrevious)),
+            KeyCode::Down => reduce(state, Input::Action(UiAction::PluginSelectNext)),
+            KeyCode::PageUp => {
+                state.plugins.move_selection(-10);
+                Vec::new()
+            }
+            KeyCode::PageDown => {
+                state.plugins.move_selection(10);
+                Vec::new()
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reduce(state, Input::Action(UiAction::PluginRefresh))
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reduce(state, Input::Action(UiAction::PluginEnable))
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reduce(state, Input::Action(UiAction::PluginDisable))
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reduce(state, Input::Action(UiAction::PluginApply))
+            }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reduce(state, Input::Action(UiAction::PluginRestart))
+            }
+            KeyCode::Esc => reduce(state, Input::Action(UiAction::CloseOverlay)),
+            KeyCode::Left => {
+                state.plugins.move_left();
+                Vec::new()
+            }
+            KeyCode::Right => {
+                state.plugins.move_right();
+                Vec::new()
+            }
+            KeyCode::Home => {
+                state.plugins.move_home();
+                Vec::new()
+            }
+            KeyCode::End => {
+                state.plugins.move_end();
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                state.plugins.backspace();
+                Vec::new()
+            }
+            KeyCode::Delete => {
+                state.plugins.delete();
+                Vec::new()
+            }
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                state.plugins.insert_char(ch);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }),
         Overlay::Fatal => Some(match key.code {
+            // Only a spawned child can be respawned; an attached gateway is
+            // restarted externally (§12.2).
+            KeyCode::Char('r') if state.gateway_mode == GatewayMode::Spawn => {
+                vec![Effect::RestartChild]
+            }
             KeyCode::Char('q') => vec![Effect::Quit {
                 mode: state.quit_mode,
             }],
@@ -663,5 +758,118 @@ mod tests {
         assert_eq!(state.new_session.title, "y");
         state.new_session.backspace();
         assert_eq!(state.new_session.title, "");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn plugin_overlay_typing_r_filters_and_ctrl_r_refreshes() {
+        let mut state = TuiState::default();
+        state.connection = crate::viewmodel::ConnectionState::Live;
+        state.features = vec!["plugins".into()];
+        state.overlay = Some(Overlay::Plugins);
+
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(effects.is_empty());
+        assert_eq!(state.plugins.filter, "r");
+
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendCommand(command) if command.name == "plugin.list"
+        )));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn ctrl_e_opens_confirmation_and_y_sends_while_esc_cancels() {
+        let mut state = TuiState::default();
+        state.connection = crate::viewmodel::ConnectionState::Live;
+        state.features = vec!["plugins".into(), "plugins.manage".into()];
+        state.plugins.manage = true;
+        state.plugins.loaded = true;
+        state.plugins.entries = vec![crate::viewmodel::PluginEntry {
+            id: "acme.search".into(),
+            state: "disabled".into(),
+            enabled: Some(false),
+            ..Default::default()
+        }];
+        state.overlay = Some(Overlay::Plugins);
+
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(effects.is_empty());
+        assert_eq!(
+            state.plugins.pending,
+            Some(crate::viewmodel::PluginAction::Enable)
+        );
+
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendCommand(command) if command.name == "plugin.enable"
+        )));
+        assert!(state.plugins.managing);
+
+        // Esc while a confirmation is open cancels it instead of closing.
+        state.plugins.managing = false;
+        state.plugins.pending = Some(crate::viewmodel::PluginAction::Disable);
+        let effects =
+            overlay_effects(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(effects.is_empty());
+        assert_eq!(state.plugins.pending, None);
+        assert_eq!(state.overlay, Some(Overlay::Plugins));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn fatal_screen_retries_only_when_the_tui_spawned_the_gateway() {
+        let mut state = TuiState::default();
+        state.overlay = Some(Overlay::Fatal);
+
+        state.gateway_mode = GatewayMode::Spawn;
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RestartChild))
+        );
+
+        state.gateway_mode = GatewayMode::Attach;
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(effects.is_empty());
+
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Quit { .. }))
+        );
     }
 }

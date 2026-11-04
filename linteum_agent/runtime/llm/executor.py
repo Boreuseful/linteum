@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Optional
 
 from ...bus.artifact import hydrate_event
@@ -33,6 +34,8 @@ from .errors import AdapterProtocolError, code_for, policy_for
 #: Stable ``location`` strings embedded in ``error_info`` (LLM failures).
 LOCATION_ON_REQUEST = "linteum_agent.runtime.llm.executor.LLMExecutor.on_request"
 LOCATION_STREAM = "linteum_agent.runtime.llm.executor.LLMExecutor._stream_once"
+
+logger = logging.getLogger(__name__)
 
 #: Internal sentinel: the stream was *cooperatively* cancelled (the session's
 #: :class:`CancelToken` was tripped).  Unlike a provider error it must stop the
@@ -91,11 +94,16 @@ def exception_detail(exc: BaseException, limit: int = 400) -> str:
 
 class LLMExecutor:
     def __init__(self, bus, router, *, cache: Optional[LlmCache] = None, cancel=None,
+                 hooks=None,
                  request_timeout: Optional[float] = DEFAULT_REQUEST_HANDLER_TIMEOUT) -> None:
         self.bus = bus
         self.router = router
         self.cache = cache if cache is not None else LlmCache()
         self.cancel = cancel
+        #: Observe-only capability hooks (§6.5), e.g. the ``PluginHost``.  ``None``
+        #: keeps hosts without plugins free of hook dispatch; a non-started host
+        #: no-ops inside ``run_hook``.
+        self.hooks = hooks
         self.last_failure: Optional[dict] = None
         # Decouple the (unbounded) model stream from the bus' generic handler watchdog:
         # declare our own budget so a long stream is never falsely cancelled.  Hosts can
@@ -109,6 +117,14 @@ class LLMExecutor:
     async def on_request(self, ev: Event) -> None:
         ev = await hydrate_event(ev, self.bus.artifacts)
         req = LlmRequest.from_event(ev)
+        # §6.5: exactly once per ``llm.request``, before candidate selection /
+        # retry / fallback — therefore also when no adapter is available.
+        await self._run_hook(
+            "before_llm_request",
+            {"request": ev.payload, "request_id": ev.id, "session_id": ev.session_id,
+             "round": ev.payload.get("round")},
+            ev=ev,
+        )
         candidates = self.router.candidates(req, ev.session_id)
         if not candidates:
             await self._fail(ev, "E_NO_ADAPTER", f"no candidate for alias {req.model!r}",
@@ -244,7 +260,7 @@ class LLMExecutor:
             {"call_id": call.id, "name": call.name, "args": call.arguments}
             for call in response.message.tool_calls
         ]
-        await self.bus.publish(ev.child("llm.completed", {
+        payload = {
             "message": response.message.to_dict(),
             "tool_calls": tool_calls,
             "finish": response.finish,
@@ -256,7 +272,15 @@ class LLMExecutor:
             "cost": cost.to_dict(),
             "pricing_version": cost.pricing_version,
             "round": ev.payload.get("round"),
-        }))
+        }
+        await self.bus.publish(ev.child("llm.completed", payload))
+        # §6.5: once per *final* completion (cache hits included); not for
+        # ``_publish_interrupted`` partials.
+        await self._run_hook(
+            "after_llm_completed",
+            {**payload, "request_id": ev.id, "session_id": ev.session_id},
+            ev=ev,
+        )
 
     async def _publish_interrupted(self, ev: Event, adapter, model, acc) -> None:
         """Emit the partial assistant message as an ``interrupted`` completion (§16.3).
@@ -281,6 +305,31 @@ class LLMExecutor:
         }))
 
     # -- helpers ------------------------------------------------------------
+    async def _run_hook(self, name: str, payload: dict, *, ev: Event) -> None:
+        """Invoke one observe-only hook (§6.5); failures never reach the executor.
+
+        Hook outcome is plugin-layer data (``hook.<name>.applied`` /
+        ``hook.<name>.failed``).  A broken hook runner must not turn a completed
+        model call into ``llm.failed``, a retry/fallback, or a duplicate
+        ``llm.completed`` on the cache-hit path — so anything except
+        cancellation is logged and swallowed.  ``CancelledError`` is re-raised
+        after cleanup (I19).
+        """
+        if self.hooks is None:
+            return
+        try:
+            await self.hooks.run_hook(
+                name, payload,
+                session_id=ev.session_id, cause_id=ev.id, trace_id=ev.trace_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - hooks are observe-only (§6.5)
+            logger.warning(
+                "hook %s failed; continuing (request_id=%s)", name, ev.id,
+                exc_info=True,
+            )
+
     def _clamp(self, req: LlmRequest, capability, *, default_max_tokens: Optional[int] = None) -> LlmRequest:
         """Resolve the effective ``max_tokens`` then clamp it to the model limit.
 

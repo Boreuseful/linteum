@@ -12,7 +12,9 @@ use super::overlays::{
     render_subagents,
 };
 use super::palette;
-use super::screens::{render_fatal, render_mode_picker, render_new_session, render_picker};
+use super::screens::{
+    render_fatal, render_mode_picker, render_new_session, render_picker, render_plugin_panel,
+};
 use super::strings;
 use super::theme::Theme;
 use super::widgets::{
@@ -129,6 +131,10 @@ pub fn render(frame: &mut Frame, state: &TuiState, theme: &Theme) {
             }
             Overlay::Mode => {
                 render_mode_picker(area, frame.buffer_mut(), state, theme);
+                cursor = None;
+            }
+            Overlay::Plugins => {
+                render_plugin_panel(area, frame.buffer_mut(), state, theme);
                 cursor = None;
             }
             Overlay::Fatal => {

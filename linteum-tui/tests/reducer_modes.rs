@@ -46,6 +46,7 @@ fn ok(result: Value) -> CommandResult {
         ok: true,
         result,
         error: None,
+        name: None,
     }
 }
 
@@ -67,6 +68,7 @@ fn err(code: &str) -> CommandResult {
             enters_history: false,
             context: json!({}),
         }),
+        name: None,
     }
 }
 

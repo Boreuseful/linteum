@@ -16,6 +16,7 @@ use super::artifacts::ArtifactViewerState;
 use super::cursor::SessionCursor;
 use super::edit;
 use super::modes::ModeState;
+use super::plugins::PluginsState;
 use super::queue::QueueState;
 use super::sessions::{NewSessionForm, SessionPickerState};
 use super::sidebar::SidebarState;
@@ -58,8 +59,14 @@ pub enum ConnectionEvent {
     Connected {
         features: Vec<String>,
         limits: Limits,
+        /// Gateway process id from `hello` (`None` for pre-v0.4 gateways).
+        instance_id: Option<String>,
     },
-    Reconnected,
+    Reconnected {
+        features: Vec<String>,
+        /// Gateway process id from `hello` (`None` for pre-v0.4 gateways).
+        instance_id: Option<String>,
+    },
     Disconnected {
         reason: String,
         retryable: bool,
@@ -173,6 +180,7 @@ pub enum Overlay {
     SubagentContext,
     Palette,
     Mode,
+    Plugins,
     Fatal,
 }
 
@@ -187,6 +195,15 @@ pub enum Focus {
 /// How quitting affects the gateway process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QuitMode {
+    #[default]
+    Spawn,
+    Attach,
+}
+
+/// Who owns the gateway process. Only a spawned gateway can be restarted from
+/// the plugin panel; an attached one is restarted externally (§11.5.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GatewayMode {
     #[default]
     Spawn,
     Attach,
@@ -289,7 +306,11 @@ pub struct TuiState {
     pub artifact: Option<ArtifactViewerState>,
     pub subagents: SubagentsState,
     pub mode: ModeState,
+    pub plugins: PluginsState,
     pub features: Vec<String>,
+    /// Last `instance_id` reported by the gateway's `hello`; a change across
+    /// reconnects means the gateway restarted.
+    pub gateway_instance: Option<String>,
     pub overlay: Option<Overlay>,
     pub focus: Focus,
     pub sidebar: SidebarState,
@@ -301,8 +322,13 @@ pub struct TuiState {
     pub cursor: SessionCursor,
     pub degraded_replay: bool,
     pub quit_mode: QuitMode,
+    /// Whether this TUI spawned the gateway (`Spawn`) or attached to an
+    /// external one (`Attach`); set from `ResolvedConfig.mode`.
+    pub gateway_mode: GatewayMode,
     /// Last lines of the spawned gateway's stderr, shown on the fatal screen.
     pub child_stderr_tail: Vec<String>,
+    /// Exit status reported for the spawned gateway, shown on the fatal screen.
+    pub child_exit_status: Option<i32>,
     /// Set by a user interrupt so cancellation errors are folded into the
     /// interrupt notice instead of becoming new error cards.
     pub suppressed_cancel: bool,

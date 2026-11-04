@@ -103,6 +103,9 @@ class _ThreadedWriter:
 class StdioTransport:
     """One JSONL connection over stdin/stdout (or an injected reader/writer)."""
 
+    #: The peer is the child/parent process on this machine (§5.6).
+    is_local = True
+
     def __init__(self, reader, writer, *,
                  max_line_bytes: int = DEFAULT_MAX_LINE_BYTES) -> None:
         self._reader = reader
