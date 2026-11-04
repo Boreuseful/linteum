@@ -13,12 +13,15 @@ escape the plugin root (I-security, §4.5 / §12.2).
 from __future__ import annotations
 
 import hashlib
+import re
 import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Optional
 
 import yaml
 
+from ...bus.event import KNOWN_TYPES
+from .config import validate_config_schema
 from .errors import (
     PluginLimit,
     PluginManifestError,
@@ -27,10 +30,13 @@ from .errors import (
 )
 from .model import (
     ENTRY_PATTERN,
+    HOOK_NAMES,
     PLUGIN_ID_PATTERN,
     PLUGIN_VERSION_PATTERN,
+    RESERVED_HOOK_NAMES,
     RUNTIME_INPROC,
     SIDE_EFFECTS,
+    SUBSCRIBABLE_TYPES,
     TOOL_BACKENDS,
     TOOL_NAME_PATTERN,
     TRUST_VALUES,
@@ -39,18 +45,18 @@ from .model import (
     PluginIssue,
     PluginLimits,
     PluginManifest,
+    PluginOrdering,
+    PluginRuntimeLimits,
     ToolDeclaration,
 )
 
 #: The only manifest file name.
 MANIFEST_NAME = "plugin.yaml"
 #: Key names declared by future API versions and rejected loudly (§15.2).
-_FUTURE_TOP_LEVEL = frozenset(
-    {"subscribes", "publishes", "needs_secrets", "limits", "ordering"}
-)
-_FUTURE_CAPABILITIES = frozenset(
-    {"adapters", "hooks", "subagents", "mcp_servers"}
-)
+#: v0.4 promotes every earlier reservation; the empty set keeps one home for
+#: the next reserved name.
+_FUTURE_TOP_LEVEL: frozenset[str] = frozenset()
+_FUTURE_CAPABILITIES = frozenset({"adapters", "subagents", "mcp_servers"})
 _TOP_LEVEL_KEYS = frozenset(
     {
         "id",
@@ -61,9 +67,15 @@ _TOP_LEVEL_KEYS = frozenset(
         "runtime",
         "trust",
         "capabilities",
+        "config_schema",
+        "needs_secrets",
+        "subscribes",
+        "publishes",
+        "limits",
+        "ordering",
     }
 )
-_CAPABILITY_KEYS = frozenset({"tools", "skills", "modes"})
+_CAPABILITY_KEYS = frozenset({"tools", "skills", "modes", "hooks"})
 _TOOL_KEYS = frozenset(
     {
         "name",
@@ -77,6 +89,30 @@ _TOOL_KEYS = frozenset(
 )
 
 _MAX_DESCRIPTION_CHARS = 512
+
+#: Secret names: identifier-like, unique, at most 32 per plugin (§4.1).
+_SECRET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_MAX_SECRETS = 32
+
+#: ``limits`` keys with ``(default, minimum, maximum)`` (§6.1).
+_LIMIT_RULES: dict[str, tuple[int, int, int]] = {
+    "max_events_per_sec": (100, 1, 10_000),
+    "max_handler_ms": (2_000, 1, 60_000),
+    "max_concurrency": (4, 1, 64),
+    "max_output_bytes": (65_536, 1_024, 262_144),
+    "max_consecutive_failures": (5, 1, 100),
+}
+_LIMIT_KEYS = frozenset(_LIMIT_RULES)
+
+#: ``ordering`` keys and accepted ``fail_mode`` values (§6.1).
+_ORDERING_KEYS = frozenset({"priority", "fail_mode"})
+_FAIL_MODES = frozenset({"closed", "open"})
+_ORDERING_PRIORITY_RANGE = (-1_000, 1_000)
+_ORDERING_DEFAULT_PRIORITY = 100
+_ORDERING_DEFAULT_FAIL_MODE = "closed"
+
+#: One event-name segment after ``plugin.<own-id>.``; ``*`` is the only wildcard.
+_PUBLISH_SEGMENT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +171,22 @@ def _unknown_keys(
         if key not in allowed:
             raise _manifest_error(
                 f"unknown field {key!r} under {path or 'plugin.yaml'}",
+                key=f"{path}.{key}".lstrip("."),
+            )
+
+
+def _strict_keys(
+    mapping: Mapping, allowed: frozenset, *, path: str,
+) -> None:
+    """Reject every key outside ``allowed`` (no ``x-`` vendor escape).
+
+    ``limits`` and ``ordering`` are closed sets, unlike the top level and tool
+    declarations where ``x-`` vendor keys are an extension point.
+    """
+    for key in mapping:
+        if not isinstance(key, str) or key not in allowed:
+            raise _manifest_error(
+                f"unknown field {key!r} under {path}",
                 key=f"{path}.{key}".lstrip("."),
             )
 
@@ -405,6 +457,176 @@ def _parse_paths(
     return tuple(result)
 
 
+def _optional_list(raw: Any, *, field: str) -> list[Any]:
+    """An absent/``null`` list field is empty; anything else must be a list."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise _manifest_error(f"{field} must be a list", key=field)
+    return raw
+
+
+def _parse_hooks(raw: Any) -> tuple[str, ...]:
+    """``capabilities.hooks``: only the two read-only names of §6.1."""
+    hooks: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(
+        _optional_list(raw, field="capabilities.hooks")
+    ):
+        field = f"capabilities.hooks[{index}]"
+        name = _require_str(item, field=field)
+        if name in RESERVED_HOOK_NAMES:
+            raise PluginUnsupported(
+                f"hook {name!r} is not supported in v0.4",
+                key=field,
+                hint="remove the hook or target a future plugin api_version",
+            )
+        if name not in HOOK_NAMES:
+            raise _manifest_error(f"unknown hook {name!r}", key=field)
+        if name in seen:
+            raise _manifest_error(f"duplicate hook {name!r}", key=field)
+        seen.add(name)
+        hooks.append(name)
+    return tuple(hooks)
+
+
+def _parse_needs_secrets(raw: Any) -> tuple[str, ...]:
+    """Declared secret *names* only; values never appear in a manifest (§4.1)."""
+    items = _optional_list(raw, field="needs_secrets")
+    if len(items) > _MAX_SECRETS:
+        raise _manifest_error(
+            f"needs_secrets may declare at most {_MAX_SECRETS} names",
+            key="needs_secrets",
+        )
+    names: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        field = f"needs_secrets[{index}]"
+        if not isinstance(item, str) or not _SECRET_NAME_PATTERN.match(item):
+            raise _manifest_error(
+                f"invalid secret name {item!r}", key=field,
+                hint="use an identifier-like name ([A-Za-z_][A-Za-z0-9_]*)",
+            )
+        if item in seen:
+            raise _manifest_error(f"duplicate secret name {item!r}", key=field)
+        seen.add(item)
+        names.append(item)
+    return tuple(names)
+
+
+def _parse_subscribes(raw: Any) -> tuple[str, ...]:
+    """Exact observation-event allowlist; no wildcards (§6.2)."""
+    subscribes: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(_optional_list(raw, field="subscribes")):
+        field = f"subscribes[{index}]"
+        if not isinstance(item, str) or not item:
+            raise _manifest_error(
+                f"{field} must be a non-empty event type", key=field,
+            )
+        if item in seen:
+            raise _manifest_error(
+                f"duplicate subscription {item!r}", key=field,
+            )
+        if item not in SUBSCRIBABLE_TYPES:
+            if item in KNOWN_TYPES:
+                raise PluginUnsupported(
+                    f"subscribing to {item!r} is not supported in v0.4",
+                    key=field,
+                    hint="subscribes is limited to final observation events",
+                )
+            raise _manifest_error(
+                f"{item!r} is not a subscribable event type "
+                "(exact types only, no wildcards)",
+                key=field,
+            )
+        seen.add(item)
+        subscribes.append(item)
+    return tuple(subscribes)
+
+
+def _parse_publishes(raw: Any, *, plugin_id: str) -> tuple[str, ...]:
+    """Publish targets must stay inside ``plugin.<own-id>.*`` (§6.1 / §6.3)."""
+    prefix = f"plugin.{plugin_id}."
+    publishes: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(_optional_list(raw, field="publishes")):
+        field = f"publishes[{index}]"
+        if not isinstance(item, str) or not item:
+            raise _manifest_error(
+                f"{field} must be a non-empty event type", key=field,
+            )
+        if item in seen:
+            raise _manifest_error(f"duplicate publish target {item!r}", key=field)
+        if not item.startswith(prefix):
+            raise _manifest_error(
+                f"publish target {item!r} is outside plugin.{plugin_id}.*",
+                key=field,
+            )
+        segment = item[len(prefix):]
+        if segment != "*" and not _PUBLISH_SEGMENT_PATTERN.match(segment):
+            raise _manifest_error(
+                f"publish target {item!r} must be "
+                f"'plugin.{plugin_id}.*' or 'plugin.{plugin_id}.<segment>'",
+                key=field,
+            )
+        seen.add(item)
+        publishes.append(item)
+    return tuple(publishes)
+
+
+def _parse_runtime_limits(raw: Any) -> PluginRuntimeLimits:
+    """``limits``: five known integer keys with inclusive ranges (§6.1)."""
+    if raw is None:
+        return PluginRuntimeLimits()
+    if not isinstance(raw, Mapping):
+        raise _manifest_error("limits must be a mapping", key="limits")
+    _strict_keys(raw, _LIMIT_KEYS, path="limits")
+    overrides: dict[str, int] = {}
+    for key, (_, minimum, maximum) in _LIMIT_RULES.items():
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _manifest_error(
+                f"limits.{key} must be an integer", key=f"limits.{key}",
+            )
+        if not minimum <= value <= maximum:
+            raise _manifest_error(
+                f"limits.{key} must be within [{minimum}, {maximum}]",
+                key=f"limits.{key}",
+            )
+        overrides[key] = value
+    return PluginRuntimeLimits(**overrides)
+
+
+def _parse_ordering(raw: Any) -> PluginOrdering:
+    """``ordering``: priority (-1000..1000) and fail_mode (closed|open)."""
+    if raw is None:
+        return PluginOrdering()
+    if not isinstance(raw, Mapping):
+        raise _manifest_error("ordering must be a mapping", key="ordering")
+    _strict_keys(raw, _ORDERING_KEYS, path="ordering")
+    priority = raw.get("priority", _ORDERING_DEFAULT_PRIORITY)
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise _manifest_error(
+            "ordering.priority must be an integer", key="ordering.priority",
+        )
+    low, high = _ORDERING_PRIORITY_RANGE
+    if not low <= priority <= high:
+        raise _manifest_error(
+            f"ordering.priority must be within [{low}, {high}]",
+            key="ordering.priority",
+        )
+    fail_mode = raw.get("fail_mode", _ORDERING_DEFAULT_FAIL_MODE)
+    if not isinstance(fail_mode, str) or fail_mode not in _FAIL_MODES:
+        raise _manifest_error(
+            "ordering.fail_mode must be 'closed' or 'open'",
+            key="ordering.fail_mode",
+        )
+    return PluginOrdering(priority=priority, fail_mode=fail_mode)
+
+
 def read_plugin_manifest(
     root: Path, *, source: Optional[str] = None, limits: Optional[PluginLimits] = None,
 ) -> PluginManifest:
@@ -461,17 +683,21 @@ def read_plugin_manifest(
 
     description = normalise_description(raw.get("description"))
 
+    capabilities_present = "capabilities" in raw
     capabilities = raw.get("capabilities")
-    if not isinstance(capabilities, Mapping):
+    if capabilities_present and not isinstance(capabilities, Mapping):
         raise _manifest_error(
             "capabilities must be a mapping with at least one of "
-            "tools/skills/modes",
+            "tools/skills/modes/hooks",
             key="capabilities",
         )
-    _unknown_keys(
-        capabilities, _CAPABILITY_KEYS, path="capabilities",
-        future=_FUTURE_CAPABILITIES,
-    )
+    if capabilities_present:
+        _unknown_keys(
+            capabilities, _CAPABILITY_KEYS, path="capabilities",
+            future=_FUTURE_CAPABILITIES,
+        )
+    else:
+        capabilities = {}
 
     raw_tools = capabilities.get("tools", [])
     if raw_tools is None:
@@ -497,6 +723,7 @@ def read_plugin_manifest(
         seen_tools.add(declaration.name)
         tools.append(declaration)
 
+    hooks = _parse_hooks(capabilities.get("hooks"))
     skill_dirs = _parse_paths(
         capabilities.get("skills"), field="capabilities.skills",
         root=root, container=True,
@@ -506,25 +733,58 @@ def read_plugin_manifest(
         root=root, container=False,
     )
 
+    # Extension fields are top-level (§6.1); only ``hooks`` lives in
+    # ``capabilities``.  Parse every value before the entry checks so a field
+    # error is reported for what is actually wrong with the declaration.
+    subscribes = _parse_subscribes(raw.get("subscribes"))
+    publishes = _parse_publishes(raw.get("publishes"), plugin_id=plugin_id)
+    needs_secrets = _parse_needs_secrets(raw.get("needs_secrets"))
+    runtime_limits = _parse_runtime_limits(raw.get("limits"))
+    ordering = _parse_ordering(raw.get("ordering"))
+    config_schema = (
+        validate_config_schema(raw["config_schema"])
+        if "config_schema" in raw
+        else None
+    )
+
+    if capabilities_present and not any(
+        key in capabilities for key in ("tools", "skills", "modes", "hooks")
+    ):
+        raise _manifest_error(
+            "capabilities must declare at least one of "
+            "tools/skills/modes/hooks",
+            key="capabilities",
+        )
+    if not capabilities_present and not (subscribes or publishes):
+        raise _manifest_error(
+            "capabilities may be omitted only when subscribes or publishes "
+            "is non-empty",
+            key="capabilities",
+        )
+    if not (
+        tools or skill_dirs or mode_paths or hooks
+        or subscribes or publishes
+    ):
+        raise _manifest_error(
+            "plugin must declare at least one capability",
+            key="capabilities",
+        )
+
+    declares_extensions = bool(hooks or subscribes or publishes)
     warnings: list[str] = []
     entry: Optional[PluginEntry] = None
     raw_entry = raw.get("entry")
     if raw_entry is not None:
         entry = _parse_entry(raw_entry, root)
-        if not tools:
+        if not tools and not declares_extensions:
             warnings.append(
                 f"plugin.entry_unused: {plugin_id} declares entry but no tools"
             )
-    elif tools:
+    elif tools or declares_extensions:
         raise _manifest_error(
-            "entry is required when capabilities.tools is non-empty",
+            "entry is required when the plugin declares tools, hooks, "
+            "subscribes or publishes",
             key="entry",
-        )
-
-    if not (tools or skill_dirs or mode_paths):
-        raise _manifest_error(
-            "plugin must declare at least one capability",
-            key="capabilities",
         )
 
     digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
@@ -543,6 +803,13 @@ def read_plugin_manifest(
         mode_paths=mode_paths,
         digest=digest,
         warnings=tuple(warnings),
+        config_schema=config_schema,
+        needs_secrets=needs_secrets,
+        hooks=hooks,
+        subscribes=subscribes,
+        publishes=publishes,
+        runtime_limits=runtime_limits,
+        ordering=ordering,
     )
 
 

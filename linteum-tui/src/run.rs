@@ -1,7 +1,8 @@
 //! Application bootstrap and event loop.
 
+use std::collections::VecDeque;
 use std::io::IsTerminal;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,8 +26,8 @@ use crate::connection::{
 use crate::logging::{LogError, init_logging};
 use crate::ui::{App, TerminalGuard, TerminalOps, Theme, UiError, key_to_action, palette};
 use crate::viewmodel::{
-    ApprovalDecision, CommandSpec, Effect, Focus, Input, Overlay, QuitMode, TuiState, UiAction,
-    reduce,
+    ApprovalDecision, CommandSpec, Effect, Focus, GatewayMode, Input, Overlay, QuitMode, TuiState,
+    UiAction, reduce,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +63,14 @@ impl Connector for SpawnConnector {
 
     fn mode(&self) -> Mode {
         Mode::Spawn
+    }
+
+    fn stderr_tail(&self) -> Vec<String> {
+        self.config
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -155,6 +164,9 @@ pub async fn run_app(cli: Cli) -> Result<(), AppError> {
                 no_lease: config.no_lease,
                 cwd: None,
                 stderr_log: config.log_path.with_file_name("tui-gateway.log"),
+                // One shared tail across respawns so a child exit can report
+                // the most recent stderr (§7.5).
+                stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
                 teardown_grace: Duration::from_secs(5),
                 term_grace: Duration::from_secs(2),
             },
@@ -207,6 +219,10 @@ pub async fn run_loop<T: TerminalOps>(
     app.state.quit_mode = match config.mode {
         Mode::Spawn => QuitMode::Spawn,
         Mode::Attach => QuitMode::Attach,
+    };
+    app.state.gateway_mode = match config.mode {
+        Mode::Spawn => GatewayMode::Spawn,
+        Mode::Attach => GatewayMode::Attach,
     };
 
     let workspace = match config.mode {
@@ -559,6 +575,12 @@ fn overlay_effects(state: &mut TuiState, key: crossterm::event::KeyEvent) -> Opt
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 reduce(state, Input::Action(UiAction::PluginDisable))
             }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reduce(state, Input::Action(UiAction::PluginApply))
+            }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                reduce(state, Input::Action(UiAction::PluginRestart))
+            }
             KeyCode::Esc => reduce(state, Input::Action(UiAction::CloseOverlay)),
             KeyCode::Left => {
                 state.plugins.move_left();
@@ -594,6 +616,11 @@ fn overlay_effects(state: &mut TuiState, key: crossterm::event::KeyEvent) -> Opt
             _ => Vec::new(),
         }),
         Overlay::Fatal => Some(match key.code {
+            // Only a spawned child can be respawned; an attached gateway is
+            // restarted externally (§12.2).
+            KeyCode::Char('r') if state.gateway_mode == GatewayMode::Spawn => {
+                vec![Effect::RestartChild]
+            }
             KeyCode::Char('q') => vec![Effect::Quit {
                 mode: state.quit_mode,
             }],
@@ -806,5 +833,43 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(state.plugins.pending, None);
         assert_eq!(state.overlay, Some(Overlay::Plugins));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn fatal_screen_retries_only_when_the_tui_spawned_the_gateway() {
+        let mut state = TuiState::default();
+        state.overlay = Some(Overlay::Fatal);
+
+        state.gateway_mode = GatewayMode::Spawn;
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RestartChild))
+        );
+
+        state.gateway_mode = GatewayMode::Attach;
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(effects.is_empty());
+
+        let effects = overlay_effects(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Quit { .. }))
+        );
     }
 }

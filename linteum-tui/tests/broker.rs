@@ -12,13 +12,17 @@ use tokio::sync::mpsc;
 struct FakeTransport {
     out: mpsc::Sender<String>,
     input: mpsc::Receiver<String>,
+    exit_status: Option<i32>,
 }
 
 impl Transport for FakeTransport {
     fn split(self: Box<Self>) -> (Box<dyn TransportReader>, Box<dyn TransportWriter>) {
         (
             Box::new(FakeReader { input: self.input }),
-            Box::new(FakeWriter { out: self.out }),
+            Box::new(FakeWriter {
+                out: self.out,
+                exit_status: self.exit_status,
+            }),
         )
     }
 }
@@ -36,6 +40,7 @@ impl TransportReader for FakeReader {
 
 struct FakeWriter {
     out: mpsc::Sender<String>,
+    exit_status: Option<i32>,
 }
 
 #[async_trait]
@@ -49,6 +54,10 @@ impl TransportWriter for FakeWriter {
 
     async fn close(&mut self) -> Result<(), TransportError> {
         Ok(())
+    }
+
+    fn exit_status(&self) -> Option<i32> {
+        self.exit_status
     }
 }
 
@@ -67,6 +76,7 @@ async fn broker_correlates_result_by_reply_to() {
     let transport = Box::new(FakeTransport {
         out: out_tx,
         input: in_rx,
+        exit_status: None,
     });
     let (broker, handle) = CommandBroker::new(transport, Duration::from_secs(30));
     let (input_tx, _input_rx) = mpsc::channel(8);
@@ -89,12 +99,100 @@ async fn broker_correlates_result_by_reply_to() {
 }
 
 #[tokio::test]
+async fn broker_fills_missing_result_name_from_command() {
+    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let (in_tx, in_rx) = mpsc::channel(8);
+    let transport = Box::new(FakeTransport {
+        out: out_tx,
+        input: in_rx,
+        exit_status: None,
+    });
+    let (broker, handle) = CommandBroker::new(transport, Duration::from_secs(30));
+    let (input_tx, _input_rx) = mpsc::channel(8);
+    let task = tokio::spawn(broker.run(input_tx));
+
+    let send = tokio::spawn(async move { handle.send(spec("plugin.list")).await });
+    let line = out_rx.recv().await.unwrap();
+    let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let id = command["id"].as_str().unwrap().to_string();
+    // An old gateway omits `name`; the broker must fill it from the command.
+    in_tx
+        .send(format!(
+            r#"{{"v":1,"kind":"result","id":"r","reply_to":"{id}","ok":true,"result":{{"plugins":[]}}}}"#
+        ))
+        .await
+        .unwrap();
+
+    let result = send.await.unwrap().unwrap();
+    assert_eq!(result.name.as_deref(), Some("plugin.list"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn broker_keeps_result_name_when_present() {
+    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let (in_tx, in_rx) = mpsc::channel(8);
+    let transport = Box::new(FakeTransport {
+        out: out_tx,
+        input: in_rx,
+        exit_status: None,
+    });
+    let (broker, handle) = CommandBroker::new(transport, Duration::from_secs(30));
+    let (input_tx, _input_rx) = mpsc::channel(8);
+    let task = tokio::spawn(broker.run(input_tx));
+
+    let send = tokio::spawn(async move { handle.send(spec("plugin.list")).await });
+    let line = out_rx.recv().await.unwrap();
+    let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let id = command["id"].as_str().unwrap().to_string();
+    in_tx
+        .send(format!(
+            r#"{{"v":1,"kind":"result","id":"r","reply_to":"{id}","ok":true,"result":{{}},"name":"plugin.list"}}"#
+        ))
+        .await
+        .unwrap();
+
+    let result = send.await.unwrap().unwrap();
+    assert_eq!(result.name.as_deref(), Some("plugin.list"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn broker_fills_name_on_early_buffered_result() {
+    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let (in_tx, in_rx) = mpsc::channel(8);
+    // Preload the reply before the command is even sent.
+    in_tx
+        .send(r#"{"v":1,"kind":"result","id":"r","reply_to":"c-1","ok":true,"result":{"early":true}}"#.into())
+        .await
+        .unwrap();
+    let transport = Box::new(FakeTransport {
+        out: out_tx,
+        input: in_rx,
+        exit_status: None,
+    });
+    let (broker, handle) = CommandBroker::new(transport, Duration::from_secs(30));
+    let (input_tx, _input_rx) = mpsc::channel(8);
+    let task = tokio::spawn(broker.run(input_tx));
+
+    let result = tokio::time::timeout(Duration::from_secs(2), handle.send(spec("plugin.list")))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.result["early"], true);
+    assert_eq!(result.name.as_deref(), Some("plugin.list"));
+    out_rx.recv().await.unwrap();
+    task.abort();
+}
+
+#[tokio::test]
 async fn broker_routes_frames_before_result() {
     let (out_tx, mut out_rx) = mpsc::channel(8);
     let (in_tx, in_rx) = mpsc::channel(8);
     let transport = Box::new(FakeTransport {
         out: out_tx,
         input: in_rx,
+        exit_status: None,
     });
     let (broker, handle) = CommandBroker::new(transport, Duration::from_secs(30));
     let (input_tx, mut input_rx) = mpsc::channel(8);
@@ -129,6 +227,7 @@ async fn broker_times_out_after_deadline() {
     let transport = Box::new(FakeTransport {
         out: out_tx,
         input: in_rx,
+        exit_status: None,
     });
     let (broker, handle) = CommandBroker::new(transport, Duration::from_millis(50));
     let (input_tx, _input_rx) = mpsc::channel(8);
@@ -146,6 +245,7 @@ async fn broker_ignores_standalone_error_for_pending() {
     let transport = Box::new(FakeTransport {
         out: out_tx,
         input: in_rx,
+        exit_status: None,
     });
     let (broker, handle) = CommandBroker::new(transport, Duration::from_secs(30));
     let (input_tx, mut input_rx) = mpsc::channel(8);
@@ -179,6 +279,7 @@ async fn broker_accepts_result_that_arrives_before_pending_insert() {
     let transport = Box::new(FakeTransport {
         out: out_tx,
         input: in_rx,
+        exit_status: None,
     });
     let (broker, handle) = CommandBroker::new(transport, Duration::from_secs(30));
     let (input_tx, _input_rx) = mpsc::channel(8);
@@ -200,6 +301,7 @@ async fn raw_command_keeps_its_id() {
     let transport = Box::new(FakeTransport {
         out: out_tx,
         input: in_rx,
+        exit_status: None,
     });
     let (broker, handle): (_, BrokerHandle) =
         CommandBroker::new(transport, Duration::from_secs(30));
@@ -226,4 +328,25 @@ async fn raw_command_keeps_its_id() {
         .unwrap();
     let _ = send.await.unwrap();
     task.abort();
+}
+
+#[tokio::test]
+async fn close_transport_reports_writer_exit_status_and_ends_broker() {
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (_in_tx, in_rx) = mpsc::channel::<String>(8);
+    let transport = Box::new(FakeTransport {
+        out: out_tx,
+        input: in_rx,
+        exit_status: Some(7),
+    });
+    let (broker, handle) = CommandBroker::new(transport, Duration::from_secs(30));
+    let (input_tx, _input_rx) = mpsc::channel(8);
+    let task = tokio::spawn(broker.run(input_tx));
+
+    assert_eq!(handle.close_transport().await, Some(7));
+    let exit = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("broker task did not end after the transport closed")
+        .unwrap();
+    assert_eq!(exit, Some(7));
 }

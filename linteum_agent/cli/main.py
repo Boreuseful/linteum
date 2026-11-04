@@ -42,6 +42,7 @@ from ..runtime.modes.errors import ModeError
 from ..runtime.modes.model import ModeLimits, ModePackage
 from ..runtime.modes.parsing import read_mode_package
 from ..runtime.modes.source import BuiltinModeSource
+from ..runtime.plugins.config import resolve_plugin_config
 from ..runtime.plugins.errors import PluginError
 from ..runtime.plugins.manifest import read_plugin_manifest, scan_plugins
 from ..runtime.plugins.model import PluginLimits
@@ -792,8 +793,23 @@ def _plugin_dirs(settings) -> list:
     return [Path(item).expanduser() for item in settings.dirs]
 
 
-def _plugin_manifest_dict(manifest) -> dict:
-    return {
+def _plugin_config_sources(manifest, values) -> tuple[dict, str]:
+    """``key -> "default" | "file"`` for display, plus an optional error code.
+
+    ``resolve_plugin_config`` returns the resolved values too, but those never
+    leave this function: the CLI only ever prints sources (§4.5).  A resolution
+    failure (invalid file config, required key missing) is data, not a crash —
+    the caller can render the code without any configured value.
+    """
+    try:
+        _resolved, sources = resolve_plugin_config(manifest, values)
+    except PluginError as exc:
+        return {}, exc.code
+    return dict(sources), ""
+
+
+def _plugin_manifest_dict(manifest, config_values=None) -> dict:
+    payload = {
         "id": manifest.id,
         "version": manifest.version,
         "description": manifest.description,
@@ -824,6 +840,22 @@ def _plugin_manifest_dict(manifest) -> dict:
         "modes": [path.stem for path in manifest.mode_paths],
         "digest": manifest.digest,
     }
+    # v0.4 display fields (§4.5): sources and names only, never values.
+    # Empty lists are omitted so pre-v0.4 plugins keep the existing shape.
+    sources, config_error = _plugin_config_sources(manifest, config_values)
+    if sources:
+        payload["config"] = sources
+    if config_error:
+        payload["config_error"] = config_error
+    if manifest.needs_secrets:
+        payload["secrets"] = list(manifest.needs_secrets)
+    if manifest.hooks:
+        payload["hooks"] = list(manifest.hooks)
+    if manifest.subscribes:
+        payload["subscribes"] = list(manifest.subscribes)
+    if manifest.publishes:
+        payload["publishes"] = list(manifest.publishes)
+    return payload
 
 
 def _plugin_manage_fail(args, code: str, message: str, hint: str = "") -> int:
@@ -1022,7 +1054,9 @@ def _run_plugin(args) -> int:
     if args.plugin_command == "list":
         rows = [
             {
-                **_plugin_manifest_dict(manifest),
+                **_plugin_manifest_dict(
+                    manifest, settings.config.get(manifest.id, {}),
+                ),
                 "state": "discovered" if manifest.id in allow else "disabled",
                 "enabled": manifest.id in allow,
             }
@@ -1057,7 +1091,9 @@ def _run_plugin(args) -> int:
         )
         print(f"plugin not found: {args.id}" + (f" ({detail})" if detail else ""))
         return 1
-    payload = _plugin_manifest_dict(manifest)
+    payload = _plugin_manifest_dict(
+        manifest, settings.config.get(manifest.id, {}),
+    )
     payload["enabled"] = manifest.id in allow
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1083,6 +1119,19 @@ def _run_plugin(args) -> int:
         print(f"skill: {path.name}")
     for path in manifest.mode_paths:
         print(f"mode: {path.stem}")
+    for key, source in payload.get("config", {}).items():
+        print(f"config.{key}: {source}")
+    if "config_error" in payload:
+        print(f"config: invalid ({payload['config_error']})")
+    if manifest.needs_secrets:
+        # Declared names only: the CLI never resolves or prints secret values.
+        print("secrets: " + ", ".join(manifest.needs_secrets))
+    for hook in manifest.hooks:
+        print(f"hook: {hook}")
+    if manifest.subscribes:
+        print("subscribes: " + ", ".join(manifest.subscribes))
+    if manifest.publishes:
+        print("publishes: " + ", ".join(manifest.publishes))
     return 0
 
 

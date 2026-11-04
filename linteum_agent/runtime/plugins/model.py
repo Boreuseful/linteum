@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 #: Plugin id / source-id suffix (§4.3).
 PLUGIN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -33,13 +33,30 @@ TOOL_BACKENDS: tuple[str, ...] = ("inproc", "thread")
 #: Accepted tool side effects.
 SIDE_EFFECTS: tuple[str, ...] = ("pure", "read", "write", "dangerous")
 
-#: Lifecycle states (§8.2).
+#: Read-only observation hooks accepted in v0.4 (§6.1).
+HOOK_NAMES: tuple[str, ...] = ("before_llm_request", "after_llm_completed")
+#: Hook names reserved for a later, request-mutating API (§1.2).
+RESERVED_HOOK_NAMES: tuple[str, ...] = (
+    "tool_result_filter", "approval_policy", "plan_updated",
+)
+#: Event types a plugin may subscribe to exactly, with no wildcards (§6.2).
+SUBSCRIBABLE_TYPES: frozenset[str] = frozenset({
+    "llm.completed",
+    "llm.failed",
+    "tool.call.completed",
+    "tool.call.failed",
+    "agent.completed",
+    "agent.failed",
+})
+
+#: Lifecycle states (§8.2 / §6.7).
 STATE_DISCOVERED = "discovered"
 STATE_DISABLED = "disabled"
 STATE_INVALID = "invalid"
 STATE_LOADING = "loading"
 STATE_ACTIVE = "active"
 STATE_FAILED = "failed"
+STATE_QUARANTINED = "quarantined"
 STATE_QUIESCING = "quiescing"
 STATE_UNLOADED = "unloaded"
 
@@ -73,6 +90,25 @@ class ToolDeclaration:
 
 
 @dataclass(frozen=True, slots=True)
+class PluginRuntimeLimits:
+    """Per-plugin quotas for hooks, subscriptions and publishing (§6.1 / §6.7)."""
+
+    max_events_per_sec: int = 100
+    max_handler_ms: int = 2_000
+    max_concurrency: int = 4
+    max_output_bytes: int = 65_536
+    max_consecutive_failures: int = 5
+
+
+@dataclass(frozen=True, slots=True)
+class PluginOrdering:
+    """Deterministic hook ordering and failure policy (§6.1 / §6.5)."""
+
+    priority: int = 100
+    fail_mode: str = "closed"
+
+
+@dataclass(frozen=True, slots=True)
 class PluginManifest:
     """One validated ``plugin.yaml`` plus its resolved declared paths.
 
@@ -95,6 +131,13 @@ class PluginManifest:
     mode_paths: tuple[Path, ...] = ()
     digest: str = ""
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    config_schema: Optional[dict] = None
+    needs_secrets: tuple[str, ...] = ()
+    hooks: tuple[str, ...] = ()
+    subscribes: tuple[str, ...] = ()
+    publishes: tuple[str, ...] = ()
+    runtime_limits: PluginRuntimeLimits = field(default_factory=PluginRuntimeLimits)
+    ordering: PluginOrdering = field(default_factory=PluginOrdering)
 
     @property
     def tool_names(self) -> tuple[str, ...]:
@@ -110,7 +153,10 @@ class PluginManifest:
 
     @property
     def has_capabilities(self) -> bool:
-        return bool(self.tools or self.skill_dirs or self.mode_paths)
+        return bool(
+            self.tools or self.skill_dirs or self.mode_paths
+            or self.hooks or self.subscribes or self.publishes
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +169,24 @@ class PluginLimits:
     load_timeout_ms: int = 10_000
     drain_grace_ms: int = 5_000
     unload_timeout_ms: int = 5_000
+
+
+@dataclass(frozen=True, slots=True)
+class PluginEvent:
+    """Frozen, read-only event view handed to plugin handlers (§6.4).
+
+    The plugin never receives the bus ``Event`` itself: ``origin``/``seq`` are
+    host-stamped and the payload is the JSON body only.
+    """
+
+    type: str
+    session_id: str
+    payload: Mapping[str, Any]
+    seq: Optional[int] = None
+    origin: str = "core"
+    ts: float = 0.0
+    cause_id: Optional[str] = None
+    trace_id: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +233,13 @@ class PluginSummary:
     digest: str = ""
     error: Optional[dict] = None
     warnings: tuple[str, ...] = ()
+    hooks: tuple[str, ...] = ()
+    subscribes: tuple[str, ...] = ()
+    publishes: tuple[str, ...] = ()
+    #: ``key -> "default" | "file"``; values are never exposed (§4.5).
+    config: tuple[tuple[str, str], ...] = ()
+    #: Declared secret names only, never their values (§4.5).
+    secrets: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -184,19 +255,71 @@ class PluginSummary:
             "digest": self.digest,
             "error": self.error,
             "warnings": list(self.warnings),
+            "hooks": list(self.hooks),
+            "subscribes": list(self.subscribes),
+            "publishes": list(self.publishes),
+            "config": dict(self.config),
+            "secrets": list(self.secrets),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PluginChange:
+    """One per-id outcome of a runtime allow change (§5.2)."""
+
+    id: str
+    action: str
+    state: str
+    error: Optional[dict] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "action": self.action,
+            "state": self.state,
+            "error": self.error,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PluginAllowResult:
+    """JSON-able result of ``PluginHost.set_allowed`` (§5.2)."""
+
+    allow: tuple[str, ...]
+    mode: str
+    changed: bool
+    restart_required: bool
+    changes: tuple[PluginChange, ...] = ()
+    summaries: tuple[PluginSummary, ...] = ()
+
+    def to_dict(self) -> dict:
+        return {
+            "allow": list(self.allow),
+            "mode": self.mode,
+            "changed": self.changed,
+            "restart_required": self.restart_required,
+            "changes": [change.to_dict() for change in self.changes],
+            "summaries": [summary.to_dict() for summary in self.summaries],
         }
 
 
 __all__ = [
     "ENTRY_PATTERN",
+    "HOOK_NAMES",
     "PLUGIN_ID_PATTERN",
     "PLUGIN_VERSION_PATTERN",
+    "PluginAllowResult",
     "PluginCatalog",
+    "PluginChange",
     "PluginEntry",
+    "PluginEvent",
     "PluginIssue",
     "PluginLimits",
     "PluginManifest",
+    "PluginOrdering",
+    "PluginRuntimeLimits",
     "PluginSummary",
+    "RESERVED_HOOK_NAMES",
     "RUNTIME_INPROC",
     "SIDE_EFFECTS",
     "STATE_ACTIVE",
@@ -205,8 +328,10 @@ __all__ = [
     "STATE_FAILED",
     "STATE_INVALID",
     "STATE_LOADING",
+    "STATE_QUARANTINED",
     "STATE_QUIESCING",
     "STATE_UNLOADED",
+    "SUBSCRIBABLE_TYPES",
     "TOOL_BACKENDS",
     "TOOL_NAME_PATTERN",
     "TRUST_VALUES",

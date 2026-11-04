@@ -20,13 +20,14 @@ import asyncio
 import contextlib
 import itertools
 import time
+import uuid
 from typing import Optional
 
 from ..config.options import SessionOptions
 from ..config.schema import AppConfig, ConfigError, GatewaySettings
 from ..config.service import ConfigService, EffectiveConfig
 from ..runtime.host import AgentHost, SessionLocked, SessionNotFound
-from ..runtime.plugins.errors import PluginManifestError, PluginNotFound
+from ..runtime.plugins.errors import PluginError, PluginManifestError, PluginNotFound
 from .errors import (
     E_INTERNAL,
     E_PAYLOAD_TOO_LARGE,
@@ -230,7 +231,7 @@ class ClientConnection:
             result = CommandResult.failure(result.reply_to, GatewayError(
                 E_PAYLOAD_TOO_LARGE, "command result exceeds max_frame_bytes",
                 location=LOCATION_SERVER,
-            ))
+            ), name=result.name)
             text = encode(result)
             size = len(text.encode("utf-8"))
         if self._over_capacity(size):
@@ -424,12 +425,16 @@ class GatewayServer:
         config_service: Optional[ConfigService] = None,
         gap_timeout: float = 0.020,
         server_name: str = "linteum",
+        instance_id: Optional[str] = None,
     ) -> None:
         self.host = host
         self.config_service = config_service or host.config_service
         self._fixed_settings = _gateway_settings(config)
         self.gap_timeout = gap_timeout
         self.server_name = server_name
+        # Stable per-process identity, reported by hello so a client can tell
+        # a restarted gateway from a reconnected one (§5.6).
+        self._instance_id = instance_id or uuid.uuid4().hex
         # §11.5.4: capture at startup (apply_scope=restart), never per command.
         self._manage_enabled = self._initial_manage_enabled()
 
@@ -555,11 +560,15 @@ class GatewayServer:
                 )
             validate_command(command)
             result = await self._dispatch(connection, command, settings)
-            connection.send_result(CommandResult.success(command.id, result))
+            connection.send_result(
+                CommandResult.success(command.id, result, name=command.name)
+            )
             self._audit_command(connection, command, "ok", started)
         except GatewayError as exc:
             if command is not None:
-                connection.send_result(CommandResult.failure(command.id, exc))
+                connection.send_result(
+                    CommandResult.failure(command.id, exc, name=command.name)
+                )
             elif request_id:
                 connection.send_result(CommandResult.failure(request_id, exc))
             else:
@@ -578,7 +587,9 @@ class GatewayServer:
                 location=LOCATION_SERVER, exc=exc,
             )
             if command is not None:
-                connection.send_result(CommandResult.failure(command.id, error))
+                connection.send_result(
+                    CommandResult.failure(command.id, error, name=command.name)
+                )
             elif request_id:
                 connection.send_result(CommandResult.failure(request_id, error))
             else:
@@ -601,6 +612,18 @@ class GatewayServer:
             return await self._plugin_set_enabled(command, enable=True)
         if command.name == "plugin.disable":
             return await self._plugin_set_enabled(command, enable=False)
+        if command.name == "plugin.set_allowed":
+            self._require_plugin_runtime(connection)
+            return await self._plugin_set_allowed(command)
+        if command.name == "plugin.load":
+            self._require_plugin_runtime(connection)
+            return await self._plugin_load(command)
+        if command.name == "plugin.unload":
+            self._require_plugin_runtime(connection)
+            return await self._plugin_unload(command)
+        if command.name == "plugin.reload":
+            self._require_plugin_runtime(connection)
+            return await self._plugin_reload(command)
         if command.name == "session.list":
             return await self._session_list(command)
         if command.name == "session.children":
@@ -667,6 +690,7 @@ class GatewayServer:
                 "history_page_size": settings.history.page_size,
             },
             features=FEATURES,
+            instance_id=self._instance_id,
         )
 
     # -- session catalogue --------------------------------------------------
@@ -801,28 +825,56 @@ class GatewayServer:
                 "modes": list(summary.modes),
                 "digest": summary.digest,
             }
+            # §4.5 v0.4: sources and secret names only (never values).  Only
+            # active records carry them; unloaded/disabled/failed are empty.
+            if summary.config:
+                entry["config"] = dict(summary.config)
+            if summary.secrets:
+                entry["secrets"] = list(summary.secrets)
+            if summary.hooks:
+                entry["hooks"] = list(summary.hooks)
+            if summary.subscribes:
+                entry["subscribes"] = list(summary.subscribes)
+            if summary.publishes:
+                entry["publishes"] = list(summary.publishes)
             # §11.2 v0.2: explain failed/disabled plugins without a new command.
             if summary.error:
                 entry["error"] = dict(summary.error)
             if summary.warnings:
                 entry["warnings"] = list(summary.warnings)
             plugins.append(entry)
-        return {
+        result = {
             "plugins": plugins,
             "invalid": invalid,
             "warnings": [*self.host.plugin_warnings(), *config_warnings],
             "manage": manage,
         }
+        # Post-v0.4 apply extension: expose the file-level allow so a local
+        # client can submit exactly the saved list back with mode="apply".
+        # The field is omitted when the file config is unavailable.
+        if file_config is not None:
+            result["allow"] = list(file_config.agent.plugins.allow)
+        return result
 
-    async def _plugin_set_enabled(self, command: Command, *,
-                                  enable: bool) -> dict:
-        """Persistently add/remove one id from ``agent.plugins.allow`` (§11.5)."""
-        if not self._manage_enabled:
-            raise GatewayError(
-                E_PLUGIN_MANAGE_DISABLED,
-                "plugin management is disabled",
-                location=LOCATION_SERVER,
-            )
+    # -- plugin management gates (§11.5.4 / §5.6) --------------------------
+    def _require_manage_enabled(self, *, hint: str = "") -> None:
+        """Raise unless ``gateway.plugins.manage`` is enabled.
+
+        The flag is captured when the server starts (apply_scope=restart);
+        ``hint`` is an optional client-facing remedy kept per gate.
+        """
+        if self._manage_enabled:
+            return
+        context = {"hint": hint} if hint else {}
+        raise GatewayError(
+            E_PLUGIN_MANAGE_DISABLED,
+            "plugin management is disabled",
+            location=LOCATION_SERVER,
+            context=context,
+        )
+
+    def _require_config_service(self) -> ConfigService:
+        """Return the :class:`ConfigService`, or raise ``E_PLUGIN_CONFIG``."""
         service = self.config_service
         if service is None:
             raise GatewayError(
@@ -830,6 +882,10 @@ class GatewayServer:
                 "configuration service is not available",
                 location=LOCATION_SERVER,
             )
+        return service
+
+    def _require_allow_not_env_overridden(self) -> None:
+        """Raise ``E_PLUGIN_CONFIG`` when ``agent.plugins.allow`` comes from env."""
         if self._plugin_allow_env_override():
             raise GatewayError(
                 E_PLUGIN_CONFIG,
@@ -839,8 +895,11 @@ class GatewayServer:
                     "hint": "unset the environment variable and restart the gateway",
                 },
             )
+
+    def _require_config_readable(self, service: ConfigService) -> AppConfig:
+        """Load the config file; a read/parse failure is ``E_PLUGIN_CONFIG``."""
         try:
-            file_config = service.store.load(create=False)
+            return service.store.load(create=False)
         except ConfigError as exc:
             raise GatewayError(
                 E_PLUGIN_CONFIG,
@@ -849,6 +908,14 @@ class GatewayServer:
                 context={"code": exc.code},
                 exc=exc,
             ) from exc
+
+    async def _plugin_set_enabled(self, command: Command, *,
+                                  enable: bool) -> dict:
+        """Persistently add/remove one id from ``agent.plugins.allow`` (§11.5)."""
+        self._require_manage_enabled()
+        service = self._require_config_service()
+        self._require_allow_not_env_overridden()
+        file_config = self._require_config_readable(service)
 
         plugin_id = str(command.args.get("id"))
         summaries = await self.host.list_plugins()
@@ -928,6 +995,104 @@ class GatewayServer:
             "restart_required": restart_required,
             "warnings": [],
         }
+
+    # -- plugin runtime commands (§5.6) -------------------------------------
+    def _require_plugin_runtime(self, connection: ClientConnection) -> None:
+        """Gate the runtime lifecycle commands (§5.6).
+
+        Checked in spec order: the manage flag, a working configuration
+        service with a readable file, no environment override of
+        ``agent.plugins.allow``, and a local transport.  Only clients that
+        pass all four may touch the running plugin set.  The individual
+        checks are shared with :meth:`_plugin_set_enabled`, which checks the
+        env override before reading the file.
+        """
+        self._require_manage_enabled(
+            hint=(
+                "enable gateway.plugins.manage in the configuration "
+                "and restart the gateway"
+            ),
+        )
+        service = self._require_config_service()
+        self._require_config_readable(service)
+        self._require_allow_not_env_overridden()
+        if not getattr(connection.transport, "is_local", True):
+            raise GatewayError(
+                E_PLUGIN_MANAGE_DISABLED,
+                "plugin runtime management requires a local transport",
+                location=LOCATION_SERVER,
+                context={
+                    "hint": (
+                        "plugin runtime commands are only available to local "
+                        "clients (embedded, stdio or loopback)"
+                    ),
+                },
+            )
+
+    @staticmethod
+    def _plugin_gateway_error(exc: PluginError) -> GatewayError:
+        """Map a runtime :class:`PluginError` onto a gateway command error."""
+        context = {}
+        if exc.key:
+            context["key"] = exc.key
+        if exc.hint:
+            context["hint"] = exc.hint
+        return GatewayError(
+            exc.code, str(exc), retryable=exc.retryable,
+            location=LOCATION_SERVER, context=context,
+        )
+
+    async def _plugin_set_allowed(self, command: Command) -> dict:
+        ids = tuple(command.args["ids"])
+        mode = str(command.args.get("mode", "deferred"))
+        try:
+            result = await self.host.set_plugin_allowed(ids, mode=mode)
+        except PluginError as exc:
+            raise self._plugin_gateway_error(exc) from exc
+        return {
+            "allow": list(result.allow),
+            "mode": result.mode,
+            "changed": result.changed,
+            "restart_required": result.restart_required,
+            "plugins": [summary.to_dict() for summary in result.summaries],
+            "changes": [change.to_dict() for change in result.changes],
+        }
+
+    async def _plugin_load(self, command: Command) -> dict:
+        plugin_id = str(command.args["id"])
+        try:
+            summary = await self.host.load_plugin(plugin_id)
+        except PluginError as exc:
+            raise self._plugin_gateway_error(exc) from exc
+        # A validation/setup/commit failure is data, not a command error: the
+        # host returns the failed summary and the command acknowledges it.
+        return {"plugin": summary.to_dict(), "changed": True}
+
+    async def _plugin_unload(self, command: Command) -> dict:
+        plugin_id = str(command.args["id"])
+        grace_ms = command.args.get("grace_ms")
+        try:
+            summary = await self.host.unload_plugin(
+                plugin_id, grace_ms=grace_ms,
+            )
+        except PluginError as exc:
+            raise self._plugin_gateway_error(exc) from exc
+        return {"plugin": summary.to_dict(), "changed": True}
+
+    async def _plugin_reload(self, command: Command) -> dict:
+        plugin_id = str(command.args["id"])
+        summaries = await self.host.list_plugins()
+        current = next(
+            (summary for summary in summaries if summary.id == plugin_id),
+            None,
+        )
+        try:
+            if current is not None and current.state == "active":
+                await self.host.unload_plugin(plugin_id)
+            summary = await self.host.load_plugin(plugin_id)
+        except PluginError as exc:
+            raise self._plugin_gateway_error(exc) from exc
+        return {"plugin": summary.to_dict(), "changed": True}
 
     async def _session_list(self, command: Command) -> dict:
         limit = int(command.args.get("limit") or 50)

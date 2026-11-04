@@ -181,6 +181,7 @@ fn context_result_binds_to_the_loading_request() {
                 }
             }),
             error: None,
+            name: None,
         }),
     );
     assert!(state.subagents.detail.is_some());

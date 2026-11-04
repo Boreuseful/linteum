@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -47,7 +48,7 @@ from ..bus.event import Event, uuid7
 from ..bus.scheduler.cancel import CancelRegistry
 from ..config.options import SessionOptions
 from ..config.schema import AppConfig, ConfigError
-from ..config.service import ConfigService, EffectiveConfig
+from ..config.service import ConfigService, EffectiveConfig, env_var_for
 from ..storage.artifacts import FileArtifactStore
 from ..storage.base import SessionInfo, StorageBundle
 from ..storage.service import SessionService
@@ -73,8 +74,21 @@ from .modes.model import (
 from .modes.selection import resolve_mode
 from .modes.source import BuiltinModeSource, PluginModeSource
 from .observability.run_logger import RunLogger
+from .plugins.errors import (
+    PluginConfigError,
+    PluginManifestError,
+    PluginNotFound,
+    as_plugin_error,
+)
 from .plugins.host import PluginHost
-from .plugins.model import PluginLimits, PluginSummary
+from .plugins.model import (
+    PLUGIN_ID_PATTERN,
+    STATE_DISABLED,
+    STATE_INVALID,
+    PluginAllowResult,
+    PluginLimits,
+    PluginSummary,
+)
 from .plugins.sources import PluginSkillSource
 from .skills.catalog import build_catalog, filter_catalog, load_catalog
 from .skills.model import SkillCatalog, SkillLimits
@@ -296,6 +310,9 @@ class AgentHost:
             reserved_tool_names=self._reserved_tool_names(cfg),
             on_drain=self._drain_plugin_tools,
             log=self._log,
+            config=plugins_cfg.config,
+            secrets=plugins_cfg.secrets,
+            environ=os.environ,
         )
         self._started = False
 
@@ -307,7 +324,9 @@ class AgentHost:
         self.router = LlmRouter(self.llm_registry)
         self._ensure_llm_routing(cfg)
 
-        self.executor = LLMExecutor(self.bus, self.router, cancel=self.cancel_registry)
+        self.executor = LLMExecutor(
+            self.bus, self.router, cancel=self.cancel_registry, hooks=self.plugins,
+        )
         self.results = result_store if result_store is not None else InMemoryResultStore()
         self.sandbox = sandbox if sandbox is not None else Sandbox()
         self.approvals = approvals if approvals is not None else ApprovalGate(self.bus)
@@ -1891,15 +1910,243 @@ class AgentHost:
         await self.plugins.refresh()
         return self.plugins.summaries()
 
+    async def set_plugin_allowed(
+        self, ids: Sequence[str], *, mode: str = "deferred",
+    ) -> PluginAllowResult:
+        """Persist and apply the runtime allowlist, then audit (§5.4 / §5.8).
+
+        Validation is atomic and happens before any write: the mode, id
+        shape/uniqueness, the presence of a :class:`ConfigService`, every
+        *added* id's record and manifest state, and an environment override of
+        ``agent.plugins.allow`` are all checked first.  The allowlist is then persisted with the
+        current revision, and only after a successful write is
+        ``PluginHost.set_allowed`` applied — a persistence failure never
+        changes the runtime allow.  Exactly one
+        ``system.plugin.management`` audit event is published on the host
+        partition; an audit failure never changes the result.
+        """
+        start = time.monotonic()
+        if mode not in ("deferred", "apply"):
+            raise PluginConfigError(
+                f"invalid set_allowed mode: {mode!r}",
+                key="mode", hint="expected 'deferred' or 'apply'",
+            )
+        requested = tuple(ids)
+        for plugin_id in requested:
+            if (
+                not isinstance(plugin_id, str)
+                or PLUGIN_ID_PATTERN.fullmatch(plugin_id) is None
+            ):
+                raise PluginManifestError(
+                    f"invalid plugin id: {plugin_id!r}",
+                    key="agent.plugins.allow",
+                )
+        if len(set(requested)) != len(requested):
+            raise PluginManifestError(
+                "duplicate plugin id in the allow list",
+                key="agent.plugins.allow",
+            )
+        service = self.config_service
+        if service is None:
+            raise PluginConfigError(
+                "configuration service is not available",
+                key="agent.plugins.allow",
+                hint="plugin management requires a persisted configuration",
+            )
+        # Only *added* ids must be discovered and parseable (§5.3/§5.4); an
+        # id the runtime allow already contains may be stale (container
+        # deleted) or invalid, and must never block management.
+        added = [
+            plugin_id for plugin_id in requested
+            if plugin_id not in set(self.plugins.allow)
+        ]
+        for plugin_id in added:
+            summary = self.plugins.get(plugin_id)
+            if summary is None:
+                raise PluginNotFound(
+                    f"plugin not found: {plugin_id!r}", key="plugin_id",
+                )
+            if summary.state == STATE_INVALID:
+                error = summary.error or {}
+                raise PluginManifestError(
+                    error.get("message")
+                    or f"plugin {plugin_id!r} has an invalid manifest",
+                    key="plugin.yaml",
+                    hint=error.get("hint", ""),
+                )
+        try:
+            effective = service.effective(strict=False)
+        except ConfigError as exc:
+            hint = ""
+            if exc.key == "agent.plugins.allow":
+                hint = (
+                    f"unset or fix {env_var_for('agent.plugins.allow')} "
+                    "and restart the gateway"
+                )
+            raise PluginConfigError(
+                "cannot read the effective configuration",
+                key="agent.plugins.allow",
+                hint=hint,
+                context={"code": exc.code},
+                detail=str(exc),
+            ) from exc
+        if effective.sources.get("agent.plugins.allow") == "env":
+            raise PluginConfigError(
+                "agent.plugins.allow is overridden by the environment",
+                key="agent.plugins.allow",
+                hint=(
+                    f"unset {env_var_for('agent.plugins.allow')} "
+                    "and restart the gateway"
+                ),
+            )
+        try:
+            service.set(
+                "agent.plugins.allow", list(requested),
+                expected_revision=service.revision(),
+            )
+        except ConfigError as exc:
+            raise PluginConfigError(
+                "cannot update agent.plugins.allow",
+                key="agent.plugins.allow",
+                context={"code": exc.code},
+                detail=str(exc),
+            ) from exc
+        result = await self.plugins.set_allowed(requested, mode=mode)
+        await self._audit_plugin(
+            "set_allowed",
+            ids=requested,
+            changes=[change.to_dict() for change in result.changes],
+            mode=mode,
+            persisted=True,
+            restart_required=result.restart_required,
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        return result
+
+    async def _audit_plugin(
+        self,
+        action: str,
+        *,
+        ids: Sequence[str],
+        changes: Sequence[dict],
+        mode: Optional[str] = None,
+        persisted: bool = False,
+        restart_required: bool = False,
+        duration_ms: int,
+    ) -> None:
+        """Publish one ``system.plugin.management`` audit event (§5.8).
+
+        Best-effort observation on the reserved host partition: a publish or
+        log failure is recorded and never changes the management result, and
+        ``CancelledError`` always propagates.
+        """
+        payload = {
+            "action": action,
+            "mode": mode,
+            "ids": list(ids),
+            "changes": [dict(change) for change in changes],
+            "persisted": persisted,
+            "restart_required": restart_required,
+            "duration_ms": duration_ms,
+        }
+        try:
+            await self.bus.publish(Event.create(
+                "system.plugin.management", payload,
+                session_id=self.plugins.host_partition,
+            ))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - audit is observation, not state
+            self._log({
+                "kind": "plugin", "level": "warning",
+                "msg": (
+                    "system.plugin.management publish failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "ts": time.time(),
+            })
+        record = {
+            "kind": "plugin", "level": "info", "action": action,
+            "ids": list(ids),
+            "result": (
+                "failed"
+                if any(item.get("action") == "failed" for item in changes)
+                else "ok"
+            ),
+            "duration_ms": duration_ms, "ts": time.time(),
+        }
+        if len(ids) == 1:
+            record["id"] = ids[0]
+        self._log(record)
+
+    def _plugin_state(self, plugin_id: str) -> str:
+        """Current record state, or ``disabled`` for a never-discovered id."""
+        summary = self.plugins.get(plugin_id)
+        return summary.state if summary is not None else STATE_DISABLED
+
     async def load_plugin(self, plugin_id: str) -> PluginSummary:
-        """Load an allowed plugin for this process (host API only, D12)."""
-        return await self.plugins.load(plugin_id)
+        """Load an allowed plugin for this process, then audit (host API only, D12)."""
+        start = time.monotonic()
+        try:
+            summary = await self.plugins.load(plugin_id)
+        except BaseException as exc:
+            await self._audit_plugin(
+                "load", ids=[plugin_id],
+                changes=[{
+                    "id": plugin_id,
+                    "action": "failed",
+                    "state": self._plugin_state(plugin_id),
+                    "error": as_plugin_error(exc).to_dict(),
+                }],
+                restart_required=False,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
+            raise
+        await self._audit_plugin(
+            "load", ids=[plugin_id],
+            changes=[{
+                "id": plugin_id,
+                "action": "load",
+                "state": summary.state,
+                "error": None,
+            }],
+            restart_required=False,
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        return summary
 
     async def unload_plugin(
         self, plugin_id: str, *, grace_ms: Optional[int] = None,
     ) -> PluginSummary:
-        """Quiesce, drain and revoke an active plugin (§8.5)."""
-        return await self.plugins.unload(plugin_id, grace_ms=grace_ms)
+        """Quiesce, drain and revoke an active plugin, then audit (§8.5)."""
+        start = time.monotonic()
+        try:
+            summary = await self.plugins.unload(plugin_id, grace_ms=grace_ms)
+        except BaseException as exc:
+            await self._audit_plugin(
+                "unload", ids=[plugin_id],
+                changes=[{
+                    "id": plugin_id,
+                    "action": "failed",
+                    "state": self._plugin_state(plugin_id),
+                    "error": as_plugin_error(exc).to_dict(),
+                }],
+                restart_required=True,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
+            raise
+        await self._audit_plugin(
+            "unload", ids=[plugin_id],
+            changes=[{
+                "id": plugin_id,
+                "action": "unload",
+                "state": summary.state,
+                "error": None,
+            }],
+            restart_required=False,
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        return summary
 
     async def history(self, session_id: str, *, include_inflight: bool = True) -> list[dict]:
         return await self.service.history(
@@ -1917,6 +2164,7 @@ class AgentHost:
 __all__ = [
     "AgentHost",
     "LeaseManager",
+    "PluginAllowResult",
     "PluginSummary",
     "SessionHandle",
     "SessionLocked",

@@ -155,6 +155,19 @@ class PluginConfigError(PluginError):
     retryable = True
 
 
+class PluginNamespaceError(PluginError):
+    """A publish/subscribe escaped the plugin's declared namespace (§6.3)."""
+
+    code = "E_PLUGIN_NAMESPACE"
+
+
+class PluginQuarantined(PluginError):
+    """The plugin was quarantined after repeated runtime failures (§6.7)."""
+
+    code = "E_PLUGIN_QUARANTINED"
+    retryable = True
+
+
 def as_plugin_error(exc: BaseException) -> PluginError:
     """Wrap an arbitrary exception without losing its type/details."""
     if isinstance(exc, PluginError):
@@ -176,8 +189,10 @@ __all__ = [
     "PluginLimit",
     "PluginLoadError",
     "PluginManifestError",
+    "PluginNamespaceError",
     "PluginNotFound",
     "PluginPathError",
+    "PluginQuarantined",
     "PluginTimeout",
     "PluginToolMissing",
     "PluginToolUndeclared",

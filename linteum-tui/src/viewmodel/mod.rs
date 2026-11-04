@@ -29,8 +29,9 @@ pub use sessions::{NewSessionForm, SessionInfo, SessionPickerState};
 pub use sidebar::{SidebarLayout, SidebarPanel, SidebarState, TreeRow, WorkspaceEntry};
 pub use slash::{SlashCommand, SlashState};
 pub use state::{
-    ActivityEntry, ActivityLog, ComposerState, ConnectionEvent, ConnectionState, Focus, Limits,
-    Overlay, PaletteState, Prefs, QuitMode, SessionView, ThemeChoice, TuiState, UsageView,
+    ActivityEntry, ActivityLog, ComposerState, ConnectionEvent, ConnectionState, Focus,
+    GatewayMode, Limits, Overlay, PaletteState, Prefs, QuitMode, SessionView, ThemeChoice,
+    TuiState, UsageView,
 };
 pub use subagents::{
     ContextMessage, SubagentContextView, SubagentStatus, SubagentView, SubagentsState,
@@ -102,6 +103,8 @@ pub enum UiAction {
     PluginDisable,
     PluginConfirm,
     PluginCancel,
+    PluginRestart,
+    PluginApply,
     Resume,
     Quit,
     ExitSession,
@@ -228,6 +231,11 @@ pub fn reduce(state: &mut TuiState, input: Input) -> Vec<Effect> {
             if reconnected {
                 let mut effects = subscribe_effect(state, state.cursor.after_seq());
                 effects.extend(resend_effects(state));
+                if state.connection == ConnectionState::Live {
+                    // No session to replay: we are already Live, so an open
+                    // plugin panel refetches immediately.
+                    effects.extend(plugins::on_live(state));
+                }
                 effects
             } else if connected {
                 session_list_effect(state, 0)
@@ -332,6 +340,8 @@ fn reduce_action(state: &mut TuiState, action: UiAction) -> Vec<Effect> {
         UiAction::PluginDisable => plugins::begin_manage(state, PluginAction::Disable),
         UiAction::PluginConfirm => plugins::confirm_manage(state),
         UiAction::PluginCancel => plugins::cancel_manage(state),
+        UiAction::PluginRestart => plugins::begin_restart(state),
+        UiAction::PluginApply => plugins::begin_apply(state),
         UiAction::RetryConnection => vec![Effect::ReconnectNow],
         UiAction::Resume => {
             if state.session.as_ref().map(|s| s.phase.as_str()) == Some("paused") {
@@ -640,13 +650,29 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
     let mut mode_effects = Vec::new();
     let mut plugin_effects = Vec::new();
     if result.ok {
-        if result.result.get("plugins").is_some() && result.result.get("invalid").is_some() {
-            plugin_effects.extend(plugins::apply_list(state, &result.result));
-        } else if result.result.get("plugin").is_some()
-            && result.result.get("changed").is_some()
-            && result.result.get("restart_required").is_some()
-        {
-            plugin_effects.extend(plugins::apply_manage_result(state, &result.result));
+        // Gateways that stamp `name` route by command name (D5); the shape
+        // checks below stay as the fallback for old gateways that omit it.
+        match result.name.as_deref() {
+            Some("plugin.list") => {
+                plugin_effects.extend(plugins::apply_list(state, &result.result));
+            }
+            Some("plugin.enable") | Some("plugin.disable") => {
+                plugin_effects.extend(plugins::apply_manage_result(state, &result.result));
+            }
+            Some("plugin.set_allowed") => {
+                plugin_effects.extend(plugins::apply_set_allowed_result(state, &result.result));
+            }
+            _ => {
+                if result.result.get("plugins").is_some() && result.result.get("invalid").is_some()
+                {
+                    plugin_effects.extend(plugins::apply_list(state, &result.result));
+                } else if result.result.get("plugin").is_some()
+                    && result.result.get("changed").is_some()
+                    && result.result.get("restart_required").is_some()
+                {
+                    plugin_effects.extend(plugins::apply_manage_result(state, &result.result));
+                }
+            }
         }
         if result.result.get("modes").is_some() {
             mode_effects.extend(modes::apply_list(state, &result.result));
@@ -695,7 +721,7 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
         if state.subagents.loading.take().is_some() {
             state.subagents.error = Some(format!("{}: {}", error.code, error.message));
         }
-        if state.plugins.managing {
+        if state.plugins.managing || state.plugins.applying {
             plugin_effects.extend(plugins::apply_manage_error(state, error));
         } else if state.plugins.loading {
             plugins::apply_error(state, error);
@@ -1058,20 +1084,57 @@ fn session_id(state: &TuiState) -> Option<String> {
     state.session.as_ref().map(|session| session.id.clone())
 }
 
+/// A successful connect/reconnect means the `r` retry (or an attach-mode
+/// gateway restart) worked, so dismiss the blocking fatal screen. Only the
+/// fatal overlay is touched; other overlays stay as the user left them.
+fn clear_fatal_overlay(state: &mut TuiState) {
+    if state.overlay == Some(Overlay::Fatal) {
+        state.overlay = None;
+        state.last_error = None;
+        state.child_exit_status = None;
+        state.child_stderr_tail.clear();
+    }
+}
+
 fn apply_connection(state: &mut TuiState, event: ConnectionEvent) {
     match event {
         ConnectionEvent::Connecting => {
             state.connection = ConnectionState::Connecting;
             plugins::on_disconnect(state);
         }
-        ConnectionEvent::Connected { features, .. } => {
+        ConnectionEvent::Connected {
+            features,
+            instance_id,
+            ..
+        } => {
+            clear_fatal_overlay(state);
             state.connection = ConnectionState::Live;
             state.features = features;
+            state.gateway_instance = instance_id;
+            if state.gateway_mode == GatewayMode::Spawn {
+                plugins::on_restart_succeeded(state);
+            }
         }
-        ConnectionEvent::Reconnected { features } => {
-            state.connection = ConnectionState::Replaying;
+        ConnectionEvent::Reconnected {
+            features,
+            instance_id,
+        } => {
+            clear_fatal_overlay(state);
+            let previous = state.gateway_instance.take();
             state.features = features;
+            state.gateway_instance = instance_id;
             state.plugins.stale = true;
+            if state.gateway_instance.is_some() && state.gateway_instance != previous {
+                plugins::on_new_instance(state);
+            }
+            if state.gateway_mode == GatewayMode::Spawn {
+                plugins::on_restart_succeeded(state);
+            }
+            state.connection = if state.session.is_none() {
+                ConnectionState::Live
+            } else {
+                ConnectionState::Replaying
+            };
         }
         ConnectionEvent::Disconnected {
             retryable: true, ..
@@ -1088,19 +1151,22 @@ fn apply_connection(state: &mut TuiState, event: ConnectionEvent) {
             plugins::on_disconnect(state);
         }
         ConnectionEvent::ChildExited {
-            status: _,
+            status,
             stderr_tail,
         } => {
             state.connection = ConnectionState::Fatal;
+            state.child_exit_status = status;
             state.child_stderr_tail = stderr_tail;
             state.overlay = Some(Overlay::Fatal);
             plugins::on_disconnect(state);
+            plugins::on_restart_failed(state);
         }
         ConnectionEvent::Fatal { error } => {
             state.connection = ConnectionState::Fatal;
             state.last_error = Some(error);
             state.overlay = Some(Overlay::Fatal);
             plugins::on_disconnect(state);
+            plugins::on_restart_failed(state);
         }
     }
 }

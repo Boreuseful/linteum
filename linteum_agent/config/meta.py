@@ -422,6 +422,14 @@ FIELD_META: dict[str, dict[str, Any]] = {
     "ui.show_reasoning": {"title": "显示 reasoning", "type": "bool"},
 }
 
+#: Keys that live only in the config file (design v0.4 §4.2).  They are parsed
+#: by ``app_from_dict`` but deliberately get no ``FieldSpec``: no CLI/TUI form,
+#: no ``LINTEUM_*`` env override and no ``${VAR}`` interpolation.
+FILE_ONLY_KEYS: frozenset[str] = frozenset({
+    "agent.plugins.config",
+    "agent.plugins.secrets",
+})
+
 _RESTART_PREFIXES: tuple[str, ...] = (
     "storage.", "gateway.websocket.", "gateway.plugins.", "agent.plugins.",
 )
@@ -523,6 +531,8 @@ def _walk(prefix: str, value: Any, out: list[tuple[str, Any]]) -> None:
         if f.name in ("extra", "version"):
             continue
         key = f"{prefix}.{f.name}" if prefix else f.name
+        if key in FILE_ONLY_KEYS:
+            continue
         child = getattr(value, f.name)
         if is_dataclass(child) and not isinstance(child, type):
             _walk(key, child, out)
@@ -706,6 +716,7 @@ def coerce_value(spec: FieldSpec, value: Any) -> Any:
 
 __all__ = [
     "FIELD_META",
+    "FILE_ONLY_KEYS",
     "SECTION_ORDER",
     "SECTION_TITLES",
     "FieldSpec",

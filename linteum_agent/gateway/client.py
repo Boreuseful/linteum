@@ -270,6 +270,31 @@ class AgentClient:
     async def list_plugins(self) -> dict:
         return await self.command("plugin.list", {})
 
+    async def set_plugin_allowed(
+        self, ids: Iterable[str], mode: str = "deferred",
+    ) -> dict:
+        """Rewrite the runtime allowlist (§5.6); requires local + manage."""
+        return await self.command(
+            "plugin.set_allowed", {"ids": list(ids), "mode": mode},
+        )
+
+    async def load_plugin(self, plugin_id: str) -> dict:
+        """Load one allowed plugin for this process (§5.6)."""
+        return await self.command("plugin.load", {"id": plugin_id})
+
+    async def unload_plugin(
+        self, plugin_id: str, *, grace_ms: Optional[int] = None,
+    ) -> dict:
+        """Quiesce, drain and revoke one active plugin (§5.6)."""
+        args: dict = {"id": plugin_id}
+        if grace_ms is not None:
+            args["grace_ms"] = grace_ms
+        return await self.command("plugin.unload", args)
+
+    async def reload_plugin(self, plugin_id: str) -> dict:
+        """Unload (when active) and load one plugin again (§5.6)."""
+        return await self.command("plugin.reload", {"id": plugin_id})
+
     async def set_mode(self, session_id: str, mode: str) -> dict:
         return await self.command(
             "session.mode.set",

@@ -53,6 +53,8 @@ FEATURES: tuple = (
     # v0.3: the gateway understands plugin.enable/disable.  Whether it accepts
     # them is reported separately by plugin.list.manage (§11.5.4).
     "plugins.manage",
+    # v0.4: runtime lifecycle commands (set_allowed/load/unload/reload, §5.6).
+    "plugins.runtime",
 )
 
 #: Commands a client may send (§5.2).  Anything else is ``E_UNKNOWN_COMMAND``.
@@ -78,6 +80,10 @@ KNOWN_COMMANDS: frozenset = frozenset(
         "plugin.list",
         "plugin.enable",
         "plugin.disable",
+        "plugin.set_allowed",
+        "plugin.load",
+        "plugin.unload",
+        "plugin.reload",
         "ping",
     }
 )
@@ -319,6 +325,50 @@ def validate_command(cmd: "Command") -> None:
             raise _bad("invalid plugin id", id=plugin_id)
         return
 
+    if cmd.name in (
+        "plugin.set_allowed", "plugin.load", "plugin.unload", "plugin.reload",
+    ):
+        # §5.6: runtime lifecycle commands take no session and an exact
+        # argument set; the gateway adds the manage/config/local gates.
+        if cmd.session_id is not None or "session_id" in cmd.args:
+            raise _bad(f"{cmd.name} takes no session_id")
+        if cmd.name == "plugin.set_allowed":
+            extra = set(cmd.args) - {"ids", "mode"}
+            if extra:
+                raise _bad(f"{cmd.name} takes only 'ids' and 'mode'")
+            ids = args.get("ids")
+            if (
+                not isinstance(ids, (list, tuple))
+                or not all(
+                    isinstance(item, str) and _PLUGIN_ID.match(item)
+                    for item in ids
+                )
+            ):
+                raise _bad(
+                    f"{cmd.name}.ids must be a list of valid plugin ids"
+                )
+            mode = args.get("mode", "deferred")
+            if mode not in ("deferred", "apply"):
+                raise _bad(f"{cmd.name}.mode must be 'deferred' or 'apply'")
+            return
+        if cmd.name in ("plugin.load", "plugin.reload"):
+            extra = set(cmd.args) - {"id"}
+            if extra:
+                raise _bad(f"{cmd.name} takes only 'id'")
+            plugin_id = _string(args, "id", required=True)
+            if plugin_id is None or not _PLUGIN_ID.match(plugin_id):
+                raise _bad("invalid plugin id", id=plugin_id)
+            return
+        # plugin.unload
+        extra = set(cmd.args) - {"id", "grace_ms"}
+        if extra:
+            raise _bad("plugin.unload takes only 'id' and 'grace_ms'")
+        plugin_id = _string(args, "id", required=True)
+        if plugin_id is None or not _PLUGIN_ID.match(plugin_id):
+            raise _bad("invalid plugin id", id=plugin_id)
+        _integer(args, "grace_ms", minimum=0)
+        return
+
     if cmd.name == "session.mode.set":
         if command_session_id(cmd) is None:
             raise _bad("session.mode.set requires session_id")
@@ -496,20 +546,26 @@ class CommandResult:
     id: str = field(default_factory=lambda: _new_id("r"))
     v: int = PROTOCOL_VERSION
     kind: str = "result"
+    name: Optional[str] = None
 
     @classmethod
-    def success(cls, reply_to: str, result: Optional[dict] = None) -> "CommandResult":
-        return cls(reply_to=reply_to, ok=True, result=dict(result or {}))
+    def success(cls, reply_to: str, result: Optional[dict] = None,
+                *, name: Optional[str] = None) -> "CommandResult":
+        return cls(reply_to=reply_to, ok=True, result=dict(result or {}),
+                   name=name)
 
     @classmethod
-    def failure(cls, reply_to: str, error: GatewayError | Mapping[str, Any]) -> "CommandResult":
+    def failure(cls, reply_to: str, error: GatewayError | Mapping[str, Any],
+                *, name: Optional[str] = None) -> "CommandResult":
         payload = error.to_dict() if isinstance(error, GatewayError) else dict(error)
-        return cls(reply_to=reply_to, ok=False, result={}, error=payload)
+        return cls(reply_to=reply_to, ok=False, result={}, error=payload,
+                   name=name)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "CommandResult":
         if not isinstance(data, Mapping) or data.get("kind") != "result":
             raise _bad("envelope kind must be 'result'")
+        name = data.get("name")
         return cls(
             reply_to=str(data.get("reply_to", "")),
             ok=bool(data.get("ok", False)),
@@ -517,6 +573,7 @@ class CommandResult:
             error=dict(data["error"]) if isinstance(data.get("error"), Mapping) else None,
             id=str(data.get("id") or _new_id("r")),
             v=int(data.get("v", PROTOCOL_VERSION) or PROTOCOL_VERSION),
+            name=name if isinstance(name, str) and name else None,
         )
 
     def to_dict(self) -> dict:
@@ -530,6 +587,8 @@ class CommandResult:
         }
         if self.error is not None:
             data["error"] = self.error
+        if self.name is not None:
+            data["name"] = self.name
         return data
 
 
@@ -583,12 +642,16 @@ def hello_payload(
     server: str = "linteum",
     limits: Optional[Mapping[str, Any]] = None,
     features: Iterable[str] = FEATURES,
+    instance_id: Optional[str] = None,
 ) -> dict:
     return {
         "protocol": PROTOCOL_VERSION,
         "server": server,
         "features": list(features),
         "limits": dict(limits or {}),
+        # Always present and non-empty (§5.6): clients compare it across
+        # reconnects to detect a gateway restart.
+        "instance_id": instance_id or uuid.uuid4().hex,
     }
 
 

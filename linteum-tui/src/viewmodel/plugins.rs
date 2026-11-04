@@ -1,14 +1,16 @@
-//! Plugin panel: read-only snapshot of the host's plugin catalog.
+//! Plugin panel: snapshot of the host's plugin catalog.
 //!
-//! The panel never mutates plugin state; it only sends `plugin.list` and
-//! renders the returned summary. The host partition (`host:<uuid>`) is not a
-//! session partition, so lifecycle events are deliberately not subscribed to
-//! (plugin design §11.4.6).
+//! The panel sends `plugin.list` and renders the returned summary; the
+//! management keys additionally send `plugin.enable`/`plugin.disable`, and the
+//! attach-mode `Ctrl+A` sends `plugin.set_allowed(mode="apply")` (post-v0.4
+//! extension). The host partition (`host:<uuid>`) is not a session partition,
+//! so lifecycle events are deliberately not subscribed to (plugin design
+//! §11.4.6).
 
 use serde_json::{Map, Value};
 
 use super::edit;
-use super::{CommandSpec, ConnectionState, Effect, Overlay, Toast, TuiState};
+use super::{CommandSpec, ConnectionState, Effect, GatewayMode, Overlay, Toast, TuiState};
 use crate::protocol::ErrorInfo;
 
 pub const USAGE: &str = "/plugins";
@@ -186,6 +188,11 @@ pub fn pending_restart(entry: &PluginEntry) -> bool {
 pub enum PluginAction {
     Enable,
     Disable,
+    /// Restart the spawned gateway so saved plugin changes take effect.
+    Restart,
+    /// Apply the saved allow list to the running gateway (attach mode only,
+    /// post-v0.4 extension).
+    Apply,
 }
 
 fn state_rank(state: &str) -> u8 {
@@ -223,6 +230,13 @@ pub struct PluginsState {
     pub last_manage_error: Option<String>,
     /// At least one row has a saved change that needs a host restart.
     pub restart_required: bool,
+    /// A confirmed restart is in flight; wait for the reconnect.
+    pub restarting: bool,
+    /// File-level `agent.plugins.allow` from `plugin.list` (post-v0.4 apply
+    /// extension); `None` when the gateway omits the field.
+    pub allow: Option<Vec<String>>,
+    /// A confirmed `plugin.set_allowed(mode="apply")` is in flight.
+    pub applying: bool,
 }
 
 impl PluginsState {
@@ -418,6 +432,13 @@ pub fn apply_list(state: &mut TuiState, result: &Value) -> Vec<Effect> {
         .get("manage")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    state.plugins.allow = result.get("allow").and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    });
     state.plugins.loaded = true;
     state.plugins.loading = false;
     state.plugins.stale = false;
@@ -469,13 +490,41 @@ pub fn begin_manage(state: &mut TuiState, action: PluginAction) -> Vec<Effect> {
     Vec::new()
 }
 
-/// `y`: send the confirmed `plugin.enable` / `plugin.disable`.
+/// `y`: send the confirmed `plugin.enable` / `plugin.disable`, restart the
+/// spawned gateway for a confirmed `Restart`, or apply the saved allow list
+/// for a confirmed `Apply` (§11.5.5 / post-v0.4 extension).
 pub fn confirm_manage(state: &mut TuiState) -> Vec<Effect> {
     let Some(action) = state.plugins.pending else {
         return Vec::new();
     };
     if state.plugins.managing {
         return Vec::new();
+    }
+    if action == PluginAction::Restart {
+        state.plugins.pending = None;
+        state.plugins.restarting = true;
+        return vec![Effect::RestartChild];
+    }
+    if action == PluginAction::Apply {
+        // The apply confirmation is not tied to the selected row: it submits
+        // exactly the saved allow list (post-v0.4 extension).
+        state.plugins.pending = None;
+        let Some(allow) = state.plugins.allow.clone() else {
+            return toast("plugin allow list unavailable; restart the gateway externally");
+        };
+        state.plugins.applying = true;
+        state.plugins.last_manage_error = None;
+        let mut args = Map::new();
+        args.insert(
+            "ids".into(),
+            Value::Array(allow.into_iter().map(Value::String).collect()),
+        );
+        args.insert("mode".into(), Value::String("apply".to_owned()));
+        return vec![Effect::SendCommand(CommandSpec {
+            name: "plugin.set_allowed".to_owned(),
+            args,
+            session_id: None,
+        })];
     }
     let Some((id, _enabled)) = selected_plugin(state) else {
         state.plugins.pending = None;
@@ -490,6 +539,9 @@ pub fn confirm_manage(state: &mut TuiState) -> Vec<Effect> {
         name: match action {
             PluginAction::Enable => "plugin.enable".to_owned(),
             PluginAction::Disable => "plugin.disable".to_owned(),
+            PluginAction::Restart | PluginAction::Apply => {
+                unreachable!("restart/apply return above")
+            }
         },
         args,
         session_id: None,
@@ -500,6 +552,66 @@ pub fn confirm_manage(state: &mut TuiState) -> Vec<Effect> {
 pub fn cancel_manage(state: &mut TuiState) -> Vec<Effect> {
     state.plugins.pending = None;
     Vec::new()
+}
+
+/// `Ctrl+T`: open a restart confirmation. Only a spawned gateway with saved
+/// plugin changes qualifies; anything else toasts (§11.5.4).
+pub fn begin_restart(state: &mut TuiState) -> Vec<Effect> {
+    if state.plugins.restarting || state.plugins.pending.is_some() {
+        return Vec::new();
+    }
+    if state.gateway_mode == GatewayMode::Attach {
+        return toast("attach mode: restart the gateway externally");
+    }
+    if !state.plugins.restart_required {
+        return toast("no saved plugin changes to apply");
+    }
+    state.plugins.pending = Some(PluginAction::Restart);
+    Vec::new()
+}
+
+/// `Ctrl+A`: open an apply confirmation. Only an attached gateway with the
+/// runtime feature, management enabled, saved changes, and a parsed allow list
+/// qualifies; anything else toasts (post-v0.4 extension).
+pub fn begin_apply(state: &mut TuiState) -> Vec<Effect> {
+    if state.plugins.managing || state.plugins.applying || state.plugins.pending.is_some() {
+        return Vec::new();
+    }
+    if state.gateway_mode != GatewayMode::Attach {
+        return toast("use Ctrl+T to restart the spawned gateway");
+    }
+    if !state
+        .features
+        .iter()
+        .any(|feature| feature == "plugins.runtime")
+    {
+        return toast("runtime apply is not supported by this gateway");
+    }
+    if !state.plugins.manage {
+        return toast("plugin management is disabled");
+    }
+    if !state.plugins.restart_required {
+        return toast("no saved plugin changes to apply");
+    }
+    if state.plugins.allow.is_none() {
+        return toast("plugin allow list unavailable; restart the gateway externally");
+    }
+    state.plugins.pending = Some(PluginAction::Apply);
+    Vec::new()
+}
+
+/// A successful `plugin.set_allowed` (post-v0.4 extension): clear the in-flight
+/// flags, take the reported `restart_required`, and refresh the snapshot so the
+/// row states follow the real runtime list.
+pub fn apply_set_allowed_result(state: &mut TuiState, result: &Value) -> Vec<Effect> {
+    state.plugins.applying = false;
+    state.plugins.pending = None;
+    state.plugins.last_manage_error = None;
+    state.plugins.restart_required = result
+        .get("restart_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    refresh(state)
 }
 
 pub fn apply_manage_result(state: &mut TuiState, result: &Value) -> Vec<Effect> {
@@ -517,6 +629,23 @@ pub fn apply_manage_result(state: &mut TuiState, result: &Value) -> Vec<Effect> 
             entry.enabled = plugin.get("enabled").and_then(Value::as_bool);
             if let Some(runtime_state) = plugin.get("state").and_then(Value::as_str) {
                 entry.state = runtime_state.to_owned();
+            }
+        }
+        // Mirror the gateway's `plugin.enable`/`plugin.disable` list edit on
+        // the parsed allow snapshot, so a later `Ctrl+A` apply submits the
+        // persisted list instead of the stale pre-edit one and reverts the
+        // just-saved change (post-v0.4 extension).
+        if !id.is_empty()
+            && let Some(allow) = state.plugins.allow.as_mut()
+        {
+            match plugin.get("enabled").and_then(Value::as_bool) {
+                Some(true) => {
+                    if !allow.iter().any(|existing| existing == id) {
+                        allow.push(id.to_owned());
+                    }
+                }
+                Some(false) => allow.retain(|existing| existing != id),
+                None => {}
             }
         }
     }
@@ -541,6 +670,7 @@ pub fn apply_manage_result(state: &mut TuiState, result: &Value) -> Vec<Effect> 
 
 pub fn apply_manage_error(state: &mut TuiState, error: &ErrorInfo) -> Vec<Effect> {
     state.plugins.managing = false;
+    state.plugins.applying = false;
     state.plugins.pending = None;
     state.plugins.last_manage_error = Some(format!("{}: {}", error.code, error.message));
     if error.code == "E_PLUGIN_MANAGE_DISABLED" {
@@ -566,10 +696,36 @@ pub fn on_live(state: &mut TuiState) -> Vec<Effect> {
     vec![list_effect()]
 }
 
+/// A reconnect reached a different gateway process: saved plugin changes may
+/// already be in effect, so restart state is cleared and the panel refetches
+/// once the connection goes `Live`.
+pub fn on_new_instance(state: &mut TuiState) {
+    state.plugins.restart_required = false;
+    state.plugins.restarting = false;
+    state.plugins.stale = true;
+}
+
+/// The spawned gateway exited before the restart completed (`ChildExited` /
+/// `Fatal`): the restart prompt is abandoned, not retried.
+pub fn on_restart_failed(state: &mut TuiState) {
+    state.plugins.restarting = false;
+    state.plugins.pending = None;
+}
+
+/// A successful spawn-mode connection is the restart-success signal even when
+/// the old gateway reports no instance id; the instance-gated
+/// `restart_required` flag is cleared separately by [`on_new_instance`]
+/// (§11.5.5).
+pub fn on_restart_succeeded(state: &mut TuiState) {
+    state.plugins.restarting = false;
+    state.plugins.pending = None;
+}
+
 pub fn on_disconnect(state: &mut TuiState) {
     state.plugins.loading = false;
     // A confirmed action is not retried automatically (§11.5.5).
     state.plugins.managing = false;
+    state.plugins.applying = false;
     state.plugins.pending = None;
     if state.plugins.loaded {
         state.plugins.stale = true;

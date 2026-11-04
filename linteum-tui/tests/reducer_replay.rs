@@ -188,7 +188,10 @@ fn reconnected_emits_subscribe_and_resend() {
     reduce(&mut s, Input::Action(UiAction::Send));
     let effects = reduce(
         &mut s,
-        Input::Connection(ConnectionEvent::Reconnected { features: vec![] }),
+        Input::Connection(ConnectionEvent::Reconnected {
+            features: vec![],
+            instance_id: None,
+        }),
     );
     let subscribe = effects
         .iter()

@@ -1,9 +1,12 @@
 #![allow(clippy::field_reassign_with_default)]
 
+use linteum_tui::protocol::ErrorInfo;
 use linteum_tui::ui::Theme;
+use linteum_tui::ui::screens::fatal::fatal_lines;
 use linteum_tui::ui::screens::plugin_panel::plugin_panel_lines;
 use linteum_tui::viewmodel::{
-    ConnectionState, InvalidPlugin, Overlay, PluginAction, PluginEntry, PluginError, TuiState,
+    ConnectionState, GatewayMode, InvalidPlugin, Overlay, PluginAction, PluginEntry, PluginError,
+    TuiState,
 };
 use ratatui::text::Line;
 
@@ -298,4 +301,159 @@ fn manage_error_is_shown_once_when_the_list_is_empty() {
     state.plugins.last_manage_error = Some("E_PLUGIN_CONFIG: nope".into());
     let rendered = joined(&lines(&state));
     assert_eq!(rendered.matches("E_PLUGIN_CONFIG: nope").count(), 1);
+}
+
+fn restart_state() -> TuiState {
+    let mut state = TuiState::default();
+    state.plugins.loaded = true;
+    state.plugins.entries = vec![
+        PluginEntry {
+            enabled: Some(true),
+            ..entry("acme.search", "active")
+        },
+        PluginEntry {
+            enabled: Some(false),
+            state: "disabled".into(),
+            ..entry("other.disabled", "disabled")
+        },
+    ];
+    state.plugins.restart_required = true;
+    state
+}
+
+#[test]
+fn footer_and_confirmation_show_restart_in_spawn_mode() {
+    let mut state = restart_state();
+    state.gateway_mode = GatewayMode::Spawn;
+
+    let before = lines(&state);
+    assert!(before.len() <= 24);
+    let footer = text(before.last().expect("footer"));
+    assert!(footer.contains("Ctrl+T restart"));
+
+    state.plugins.pending = Some(PluginAction::Restart);
+    let confirmation = lines(&state);
+    // The confirmation replaces the footer instead of adding a layout row.
+    assert_eq!(confirmation.len(), before.len());
+    let last = text(confirmation.last().expect("confirmation"));
+    assert!(last.contains("y/N"));
+    assert!(last.contains("Restart gateway"));
+    assert!(last.contains("Active turn will be interrupted."));
+    assert!(!last.contains("Ctrl+R refresh"));
+}
+
+#[test]
+fn attach_mode_does_not_render_restart_footer() {
+    let mut state = restart_state();
+    state.gateway_mode = GatewayMode::Attach;
+    let footer = text(lines(&state).last().expect("footer"));
+    assert!(!footer.contains("Ctrl+T restart"));
+    assert!(footer.contains("Ctrl+R refresh"));
+}
+
+#[test]
+fn restarting_shows_progress_and_hides_the_restart_hint() {
+    let mut state = restart_state();
+    state.gateway_mode = GatewayMode::Spawn;
+    state.plugins.restarting = true;
+    let footer = text(lines(&state).last().expect("footer"));
+    assert!(footer.contains("restarting…"));
+    assert!(!footer.contains("Ctrl+T restart"));
+}
+
+/// Attach mode with runtime apply advertised, manage enabled, saved changes
+/// pending a restart, and a parsed file-level allow list.
+fn attach_apply_state() -> TuiState {
+    let mut state = restart_state();
+    state.gateway_mode = GatewayMode::Attach;
+    state.features = vec!["view".into(), "plugins".into(), "plugins.runtime".into()];
+    state.plugins.manage = true;
+    state.plugins.allow = Some(vec!["acme.search".into()]);
+    state
+}
+
+#[test]
+fn attach_footer_shows_ctrl_a_apply_and_confirmation() {
+    let state = attach_apply_state();
+    let before = lines(&state);
+    assert!(before.len() <= 24);
+    let footer = text(before.last().expect("footer"));
+    assert!(footer.contains("Ctrl+A apply"));
+    // The apply hint sits before the manage hint so it fits at 80 cols.
+    let apply_pos = footer.find("Ctrl+A apply").expect("apply hint");
+    let manage_pos = footer.find("Ctrl+E").expect("manage hint");
+    assert!(apply_pos < manage_pos);
+    assert!(!footer.contains("Ctrl+T restart"));
+
+    let mut pending = attach_apply_state();
+    pending.plugins.pending = Some(PluginAction::Apply);
+    let confirmation = lines(&pending);
+    // The confirmation replaces the footer instead of adding a layout row.
+    assert_eq!(confirmation.len(), before.len());
+    let last = text(confirmation.last().expect("confirmation"));
+    assert!(last.contains("Apply saved plugin changes"));
+    assert!(last.contains("y/N"));
+    assert!(!last.contains("Ctrl+R refresh"));
+}
+
+#[test]
+fn applying_shows_progress_and_hides_the_apply_hint() {
+    let mut state = attach_apply_state();
+    state.plugins.applying = true;
+    let footer = text(lines(&state).last().expect("footer"));
+    assert!(footer.contains("applying…"));
+    assert!(!footer.contains("Ctrl+A apply"));
+}
+
+#[test]
+fn spawn_footer_keeps_ctrl_t_restart_and_has_no_ctrl_a() {
+    let mut state = restart_state();
+    state.gateway_mode = GatewayMode::Spawn;
+    state.features = vec!["view".into(), "plugins".into(), "plugins.runtime".into()];
+    state.plugins.manage = true;
+    let footer = text(lines(&state).last().expect("footer"));
+    assert!(footer.contains("Ctrl+T restart"));
+    assert!(!footer.contains("Ctrl+A"));
+}
+
+#[test]
+fn attach_without_runtime_feature_has_no_apply_hint() {
+    let mut state = restart_state();
+    state.gateway_mode = GatewayMode::Attach;
+    state.plugins.manage = true;
+    state.plugins.allow = Some(vec!["acme.search".into()]);
+    // No plugins.runtime feature: apply is not offered even though saved
+    // changes and management are present.
+    let footer = text(lines(&state).last().expect("footer"));
+    assert!(!footer.contains("Ctrl+A"));
+    assert!(footer.contains("Ctrl+R refresh"));
+}
+
+#[test]
+fn fatal_screen_offers_retry() {
+    let mut state = TuiState::default();
+    state.last_error = Some(ErrorInfo {
+        code: "E_SPAWN_FAILED".into(),
+        source: "gateway".into(),
+        location: "test".into(),
+        message: "not found".into(),
+        exc_type: None,
+        detail: "child failed to start".into(),
+        retryable: true,
+        enters_history: false,
+        context: serde_json::Value::Null,
+    });
+    state.child_stderr_tail = vec!["boom".into()];
+
+    state.gateway_mode = GatewayMode::Spawn;
+    let rendered = joined(&fatal_lines(&state, &Theme::dark()));
+    assert!(rendered.contains("r restart"));
+    assert!(rendered.contains("q quit"));
+    assert!(rendered.contains("E_SPAWN_FAILED"));
+    assert!(rendered.contains("boom"));
+
+    state.gateway_mode = GatewayMode::Attach;
+    let rendered = joined(&fatal_lines(&state, &Theme::dark()));
+    assert!(rendered.contains("q quit"));
+    assert!(!rendered.contains("r restart"));
 }

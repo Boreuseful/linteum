@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use linteum_tui::connection::{CommandBroker, SpawnConfig, resolve_linteum_bin, spawn_stdio};
@@ -50,6 +52,7 @@ async fn spawn_handshake_create_and_subscribe() {
         no_lease: true,
         cwd: Some(workspace.clone()),
         stderr_log: dir.path().join("gateway.log"),
+        stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
         teardown_grace: Duration::from_secs(5),
         term_grace: Duration::from_secs(2),
     })
@@ -137,6 +140,7 @@ async fn plugin_list_round_trips_over_stdio() {
         no_lease: true,
         cwd: Some(workspace),
         stderr_log: dir.path().join("gateway.log"),
+        stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
         teardown_grace: Duration::from_secs(5),
         term_grace: Duration::from_secs(2),
     })

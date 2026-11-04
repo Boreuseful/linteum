@@ -22,6 +22,9 @@ pub struct CommandResult {
     pub result: Value,
     #[serde(default)]
     pub error: Option<ErrorInfo>,
+    /// The command this result acknowledges (D5). Omitted by old gateways.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// A semantic or control frame (`kind:"frame"`).

@@ -1,7 +1,7 @@
 use linteum_tui::protocol::{CommandResult, ErrorInfo};
 use linteum_tui::viewmodel::{
-    ArtifactError, ArtifactViewerState, ConnectionState, Effect, Input, Overlay, SessionInfo,
-    SessionPickerState, SessionView, TuiState, UiAction, reduce,
+    ArtifactError, ArtifactViewerState, ConnectionEvent, ConnectionState, Effect, Input, Limits,
+    Overlay, SessionInfo, SessionPickerState, SessionView, TuiState, UiAction, reduce,
 };
 
 fn state() -> TuiState {
@@ -44,6 +44,7 @@ fn result_err(id: &str, code: &str) -> CommandResult {
             enters_history: false,
             context: serde_json::json!({}),
         }),
+        name: None,
     }
 }
 
@@ -62,6 +63,7 @@ fn session_list_fills_picker_and_infers_has_more() {
              "message_count": 0, "last_seq": 0, "updated_at": 1.0, "created_at": 1.0}
         ]}),
         error: None,
+        name: None,
     };
     picker.apply_list(&result);
     assert_eq!(picker.sessions.len(), 2);
@@ -136,6 +138,7 @@ fn session_list_appends_pages() {
             })).collect::<Vec<_>>()
         }),
         error: None,
+        name: None,
     };
     picker.apply_list(&page(0, &["a", "b"], 2));
     assert!(picker.has_more);
@@ -212,6 +215,7 @@ fn empty_session_list_opens_new_session_dialog() {
         ok: true,
         result: serde_json::json!({"limit": 50, "offset": 0, "sessions": []}),
         error: None,
+        name: None,
     };
     reduce(&mut s, Input::CommandResult(result));
     assert_eq!(s.overlay, Some(Overlay::NewSession));
@@ -230,7 +234,119 @@ fn subscribe_result_marks_live() {
             "subscribed": true, "mode": "view", "after_seq": 0, "snapshot_seq": 0
         }),
         error: None,
+        name: None,
     };
     reduce(&mut s, Input::CommandResult(result));
     assert_eq!(s.connection, ConnectionState::Live);
+}
+
+#[test]
+fn reconnected_without_session_goes_live() {
+    let mut s = TuiState::default();
+    reduce(
+        &mut s,
+        Input::Connection(ConnectionEvent::Reconnected {
+            features: vec!["view".into()],
+            instance_id: Some("gw-2".into()),
+        }),
+    );
+    assert_eq!(s.connection, ConnectionState::Live);
+}
+
+fn fatal_state() -> TuiState {
+    let mut state = state();
+    state.overlay = Some(Overlay::Fatal);
+    state.last_error = Some(ErrorInfo {
+        code: "E_SPAWN_FAILED".into(),
+        source: "gateway".into(),
+        location: "test".into(),
+        message: "not found".into(),
+        exc_type: None,
+        detail: String::new(),
+        retryable: false,
+        enters_history: false,
+        context: serde_json::Value::Null,
+    });
+    state.child_exit_status = Some(7);
+    state.child_stderr_tail = vec!["boom".into()];
+    state
+}
+
+#[test]
+fn a_reconnect_clears_the_fatal_screen() {
+    let mut s = fatal_state();
+    reduce(
+        &mut s,
+        Input::Connection(ConnectionEvent::Connected {
+            features: vec![],
+            limits: Limits::default(),
+            instance_id: None,
+        }),
+    );
+    assert_eq!(s.overlay, None);
+    assert!(s.last_error.is_none());
+    assert_eq!(s.child_exit_status, None);
+    assert!(s.child_stderr_tail.is_empty());
+    assert_eq!(s.connection, ConnectionState::Live);
+
+    let mut s = fatal_state();
+    reduce(
+        &mut s,
+        Input::Connection(ConnectionEvent::Reconnected {
+            features: vec![],
+            instance_id: None,
+        }),
+    );
+    assert_eq!(s.overlay, None);
+    assert!(s.last_error.is_none());
+    assert_eq!(s.child_exit_status, None);
+    assert!(s.child_stderr_tail.is_empty());
+    assert_eq!(s.connection, ConnectionState::Replaying);
+
+    // Unrelated overlays are untouched by a successful connection.
+    let mut s = state();
+    s.overlay = Some(Overlay::Plugins);
+    reduce(
+        &mut s,
+        Input::Connection(ConnectionEvent::Connected {
+            features: vec![],
+            limits: Limits::default(),
+            instance_id: None,
+        }),
+    );
+    assert_eq!(s.overlay, Some(Overlay::Plugins));
+}
+
+#[test]
+fn connection_events_store_the_gateway_instance() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Input::Connection(ConnectionEvent::Connected {
+            features: vec!["view".into()],
+            limits: Limits::default(),
+            instance_id: Some("gw-1".into()),
+        }),
+    );
+    assert_eq!(s.gateway_instance.as_deref(), Some("gw-1"));
+
+    // A reconnect replaces the previous instance id.
+    reduce(
+        &mut s,
+        Input::Connection(ConnectionEvent::Reconnected {
+            features: vec![],
+            instance_id: Some("gw-2".into()),
+        }),
+    );
+    assert_eq!(s.gateway_instance.as_deref(), Some("gw-2"));
+
+    // An old gateway omits the field, so the id becomes `None`.
+    reduce(
+        &mut s,
+        Input::Connection(ConnectionEvent::Reconnected {
+            features: vec![],
+            instance_id: None,
+        }),
+    );
+    assert_eq!(s.gateway_instance, None);
 }

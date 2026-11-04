@@ -59,9 +59,13 @@ pub enum ConnectionEvent {
     Connected {
         features: Vec<String>,
         limits: Limits,
+        /// Gateway process id from `hello` (`None` for pre-v0.4 gateways).
+        instance_id: Option<String>,
     },
     Reconnected {
         features: Vec<String>,
+        /// Gateway process id from `hello` (`None` for pre-v0.4 gateways).
+        instance_id: Option<String>,
     },
     Disconnected {
         reason: String,
@@ -196,6 +200,15 @@ pub enum QuitMode {
     Attach,
 }
 
+/// Who owns the gateway process. Only a spawned gateway can be restarted from
+/// the plugin panel; an attached one is restarted externally (§11.5.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GatewayMode {
+    #[default]
+    Spawn,
+    Attach,
+}
+
 /// One activity-panel entry.
 #[derive(Debug, Clone)]
 pub struct ActivityEntry {
@@ -295,6 +308,9 @@ pub struct TuiState {
     pub mode: ModeState,
     pub plugins: PluginsState,
     pub features: Vec<String>,
+    /// Last `instance_id` reported by the gateway's `hello`; a change across
+    /// reconnects means the gateway restarted.
+    pub gateway_instance: Option<String>,
     pub overlay: Option<Overlay>,
     pub focus: Focus,
     pub sidebar: SidebarState,
@@ -306,8 +322,13 @@ pub struct TuiState {
     pub cursor: SessionCursor,
     pub degraded_replay: bool,
     pub quit_mode: QuitMode,
+    /// Whether this TUI spawned the gateway (`Spawn`) or attached to an
+    /// external one (`Attach`); set from `ResolvedConfig.mode`.
+    pub gateway_mode: GatewayMode,
     /// Last lines of the spawned gateway's stderr, shown on the fatal screen.
     pub child_stderr_tail: Vec<String>,
+    /// Exit status reported for the spawned gateway, shown on the fatal screen.
+    pub child_exit_status: Option<i32>,
     /// Set by a user interrupt so cancellation errors are folded into the
     /// interrupt notice instead of becoming new error cards.
     pub suppressed_cancel: bool,

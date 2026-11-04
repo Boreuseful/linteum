@@ -253,6 +253,11 @@ class PluginSettings:
     load_timeout_ms: int = 10_000
     drain_grace_ms: int = 5_000
     unload_timeout_ms: int = 5_000
+    #: Per-plugin file config (plugin id -> JSON values, design v0.4 §4.2).
+    #: File-level only: these maps deliberately have no ``LINTEUM_*`` override.
+    config: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Per-plugin secret name -> ``env:VAR`` source (design v0.4 §4.2).
+    secrets: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -692,6 +697,8 @@ def _issue(issues: list[Issue], key: str, code: str, message: str,
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _MODE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PLUGIN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+#: Plugin secrets are only injected through an environment variable (§4.2).
+_PLUGIN_SECRET_REF = re.compile(r"^env:[A-Za-z_][A-Za-z0-9_]*$")
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -1004,6 +1011,36 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
     if plugins.unload_timeout_ms <= 0:
         _issue(issues, "agent.plugins.unload_timeout_ms", "E_CONFIG_RANGE",
                "must be > 0")
+    # ``config`` / ``secrets`` are file maps (design v0.4 §4.2).  They are not
+    # part of FIELD_META: a string env override of a nested map is ambiguous.
+    for plugin_id, values in plugins.config.items():
+        key = f"agent.plugins.config.{plugin_id}"
+        if not isinstance(plugin_id, str) or not _PLUGIN_ID.match(plugin_id):
+            _issue(issues, key, "E_CONFIG_PLUGIN_ID",
+                   f"invalid plugin id {plugin_id!r}")
+            continue
+        if not isinstance(values, Mapping):
+            _issue(issues, key, "E_CONFIG_TYPE",
+                   "must be a mapping of config keys to JSON values")
+    for plugin_id, values in plugins.secrets.items():
+        key = f"agent.plugins.secrets.{plugin_id}"
+        if not isinstance(plugin_id, str) or not _PLUGIN_ID.match(plugin_id):
+            _issue(issues, key, "E_CONFIG_PLUGIN_ID",
+                   f"invalid plugin id {plugin_id!r}")
+            continue
+        if not isinstance(values, Mapping):
+            _issue(issues, key, "E_CONFIG_TYPE",
+                   "must be a mapping of secret names to env:VAR references")
+            continue
+        for name, source in values.items():
+            valid = (
+                isinstance(source, str)
+                and _PLUGIN_SECRET_REF.fullmatch(source)
+            )
+            if not valid:
+                # Only the name is reported; the source/value is never echoed.
+                _issue(issues, f"{key}.{name}", "E_CONFIG_RANGE",
+                       "must be a string of the form env:VAR")
 
     # -- gateway --------------------------------------------------------
     gateway = config.gateway

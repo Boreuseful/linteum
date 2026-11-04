@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::ui::Theme;
 use crate::ui::widgets::render_lines;
 use crate::viewmodel::{
-    ConnectionState, PluginAction, PluginEntry, PluginRow, TuiState, pending_restart,
+    ConnectionState, GatewayMode, PluginAction, PluginEntry, PluginRow, TuiState, pending_restart,
 };
 
 const MAX_NAMES_PER_KIND: usize = 8;
@@ -401,6 +401,15 @@ fn footer_line(state: &TuiState, theme: &Theme, width: u16) -> Line<'static> {
                 "y/N · Disable {id}? Running plugin stays active until the host \
                  restarts. Writes agent.plugins.allow."
             ),
+            // No prefix: the sentence is the whole one-line bar, and a `y/N ·`
+            // prefix would push its tail past 80 columns (§11.5.5).
+            PluginAction::Restart => {
+                "Restart gateway to apply saved changes? Active turn will be interrupted. y/N"
+                    .to_owned()
+            }
+            PluginAction::Apply => {
+                "y/N · Apply saved plugin changes to the running gateway now?".to_owned()
+            }
         };
         return Line::from(Span::styled(fit(&text, width as usize), theme.warning));
     }
@@ -408,6 +417,29 @@ fn footer_line(state: &TuiState, theme: &Theme, width: u16) -> Line<'static> {
         state.connection,
         ConnectionState::Offline | ConnectionState::Reconnecting { .. } | ConnectionState::Fatal
     );
+    let restart = if state.plugins.restarting {
+        " · restarting…"
+    } else if state.gateway_mode == GatewayMode::Spawn && state.plugins.restart_required {
+        " · Ctrl+T restart"
+    } else {
+        ""
+    };
+    // Attach mode can apply the saved allow list without a restart when the
+    // gateway advertises runtime management (post-v0.4 extension).
+    let apply = if state.plugins.applying {
+        " · applying…"
+    } else if state.gateway_mode == GatewayMode::Attach
+        && state.plugins.restart_required
+        && state
+            .features
+            .iter()
+            .any(|feature| feature == "plugins.runtime")
+        && state.plugins.manage
+    {
+        " · Ctrl+A apply"
+    } else {
+        ""
+    };
     let manage = if state.plugins.manage {
         " · Ctrl+E/Ctrl+D manage"
     } else {
@@ -415,10 +447,12 @@ fn footer_line(state: &TuiState, theme: &Theme, width: u16) -> Line<'static> {
     };
     let text = if offline {
         format!(
-            "offline · type to filter · ↑↓ select · PgUp/PgDn · Ctrl+R refresh{manage} · Esc close"
+            "offline · type to filter · ↑↓ select · PgUp/PgDn · Ctrl+R refresh{restart}{apply}{manage} · Esc close"
         )
     } else {
-        format!("type to filter · ↑↓ select · PgUp/PgDn · Ctrl+R refresh{manage} · Esc close")
+        format!(
+            "type to filter · ↑↓ select · PgUp/PgDn · Ctrl+R refresh{restart}{apply}{manage} · Esc close"
+        )
     };
     Line::from(Span::styled(fit(&text, width as usize), theme.muted))
 }

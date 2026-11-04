@@ -54,6 +54,9 @@ class ErrorCode(str, Enum):
     # -- persistent enable/disable (plugin-design v0.3 §11.5) --
     E_PLUGIN_MANAGE_DISABLED = "E_PLUGIN_MANAGE_DISABLED"
     E_PLUGIN_CONFIG = "E_PLUGIN_CONFIG"
+    # -- plugin v0.4 namespace/quarantine (plugin-design v0.4 §3.2) --
+    E_PLUGIN_NAMESPACE = "E_PLUGIN_NAMESPACE"
+    E_PLUGIN_QUARANTINED = "E_PLUGIN_QUARANTINED"
     E_DENIED = "E_DENIED"
     E_TOOL_ERROR = "E_TOOL_ERROR"
     E_SANDBOX = "E_SANDBOX"

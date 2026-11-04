@@ -2,8 +2,8 @@
 
 use linteum_tui::protocol::{CommandResult, ErrorInfo};
 use linteum_tui::viewmodel::{
-    CommandSpec, ConnectionEvent, ConnectionState, Effect, Input, Overlay, PluginAction,
-    SessionView, TuiState, UiAction, reduce,
+    CommandSpec, ConnectionEvent, ConnectionState, Effect, GatewayMode, Input, Limits, Overlay,
+    PluginAction, SessionView, TuiState, UiAction, reduce,
 };
 use serde_json::{Value, json};
 
@@ -44,6 +44,7 @@ fn ok(result: Value) -> CommandResult {
         ok: true,
         result,
         error: None,
+        name: None,
     }
 }
 
@@ -65,6 +66,7 @@ fn err(code: &str) -> CommandResult {
             enters_history: false,
             context: json!({}),
         }),
+        name: None,
     }
 }
 
@@ -110,6 +112,17 @@ fn managed_state() -> TuiState {
     let mut state = loaded_state();
     state.features = vec!["view".into(), "plugins".into(), "plugins.manage".into()];
     state.plugins.manage = true;
+    state
+}
+
+/// Attach mode with runtime apply advertised, manage enabled, saved changes
+/// pending a restart, and a parsed file-level allow list.
+fn attach_apply_state() -> TuiState {
+    let mut state = managed_state();
+    state.gateway_mode = GatewayMode::Attach;
+    state.features = vec!["view".into(), "plugins".into(), "plugins.runtime".into()];
+    state.plugins.restart_required = true;
+    state.plugins.allow = Some(vec!["acme.search".into()]);
     state
 }
 
@@ -321,6 +334,7 @@ fn reconnected_carries_features_and_defers_refetch_until_live() {
         &mut state,
         Input::Connection(ConnectionEvent::Reconnected {
             features: vec!["view".into(), "plugins".into()],
+            instance_id: None,
         }),
     );
 
@@ -345,6 +359,7 @@ fn reconnected_panel_stale_without_feature_does_not_refetch() {
         &mut state,
         Input::Connection(ConnectionEvent::Reconnected {
             features: vec!["view".into()],
+            instance_id: None,
         }),
     );
     let effects = reduce(
@@ -361,6 +376,7 @@ fn reconnected_with_closed_panel_does_not_refetch() {
         &mut state,
         Input::Connection(ConnectionEvent::Reconnected {
             features: vec!["view".into(), "plugins".into()],
+            instance_id: None,
         }),
     );
     let effects = reduce(
@@ -420,6 +436,7 @@ fn old_gateway_fields_are_optional() {
     );
     assert!(!state.plugins.manage);
     assert_eq!(state.plugins.entries[0].enabled, None);
+    assert_eq!(state.plugins.allow, None);
 }
 
 #[test]
@@ -592,4 +609,402 @@ fn management_commands_never_carry_a_session() {
             .iter()
             .all(|command| { command.name == "plugin.enable" && command.session_id.is_none() })
     );
+}
+
+#[test]
+fn restart_requires_spawn_and_pending_changes() {
+    // Spawn + restart_required: Ctrl+T opens a Restart confirmation.
+    let mut spawn = state();
+    spawn.plugins.restart_required = true;
+    let effects = reduce(&mut spawn, Input::Action(UiAction::PluginRestart));
+    assert!(effects.is_empty());
+    assert_eq!(spawn.plugins.pending, Some(PluginAction::Restart));
+
+    // Attach mode: the gateway is managed externally, so only toast.
+    let mut attach = state();
+    attach.gateway_mode = GatewayMode::Attach;
+    attach.plugins.restart_required = true;
+    let effects = reduce(&mut attach, Input::Action(UiAction::PluginRestart));
+    assert_eq!(attach.plugins.pending, None);
+    assert!(has_toast(&effects, "attach mode"));
+    assert!(commands(&effects).is_empty());
+
+    // No saved plugin changes: nothing to apply, so only toast.
+    let mut clean = state();
+    let effects = reduce(&mut clean, Input::Action(UiAction::PluginRestart));
+    assert_eq!(clean.plugins.pending, None);
+    assert!(has_toast(&effects, "no saved plugin changes"));
+}
+
+#[test]
+fn restart_confirm_emits_effect_and_is_idempotent() {
+    let mut state = state();
+    state.plugins.restart_required = true;
+    assert!(reduce(&mut state, Input::Action(UiAction::PluginRestart)).is_empty());
+    assert_eq!(state.plugins.pending, Some(PluginAction::Restart));
+
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginConfirm));
+    assert_eq!(effects, vec![Effect::RestartChild]);
+    assert!(state.plugins.restarting);
+    assert_eq!(state.plugins.pending, None);
+
+    // A second confirm is a no-op: the pending action is gone.
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginConfirm));
+    assert!(effects.is_empty());
+    assert!(state.plugins.restarting);
+}
+
+#[test]
+fn reconnected_new_instance_clears_restart_state() {
+    let mut state = state();
+    state.gateway_instance = Some("a".into());
+    state.plugins.restarting = true;
+    state.plugins.restart_required = true;
+    reduce(
+        &mut state,
+        Input::Connection(ConnectionEvent::Reconnected {
+            features: vec![],
+            instance_id: Some("b".into()),
+        }),
+    );
+    assert!(!state.plugins.restarting);
+    assert!(!state.plugins.restart_required);
+    assert!(state.plugins.stale);
+}
+
+#[test]
+fn spawn_reconnect_without_instance_id_clears_restarting() {
+    let mut state = state();
+    state.plugins.restarting = true;
+    state.plugins.restart_required = true;
+    reduce(
+        &mut state,
+        Input::Connection(ConnectionEvent::Reconnected {
+            features: vec![],
+            instance_id: None,
+        }),
+    );
+    assert!(!state.plugins.restarting);
+    // The old gateway reported no instance id, so the saved-change truth is
+    // unknown: restart_required stays as-is.
+    assert!(state.plugins.restart_required);
+    // A subsequent restart can be requested again.
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginRestart));
+    assert_eq!(state.plugins.pending, Some(PluginAction::Restart));
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn spawn_connected_without_instance_id_clears_restarting() {
+    let mut state = state();
+    state.plugins.restarting = true;
+    state.plugins.restart_required = true;
+    reduce(
+        &mut state,
+        Input::Connection(ConnectionEvent::Connected {
+            features: vec![],
+            limits: Limits {
+                max_command_bytes: 0,
+                max_frame_bytes: 0,
+                client_queue_frames: 0,
+                history_page_size: 0,
+            },
+            instance_id: None,
+        }),
+    );
+    assert!(!state.plugins.restarting);
+    assert!(state.plugins.restart_required);
+}
+
+#[test]
+fn attach_reconnect_keeps_restarting() {
+    let mut state = state();
+    state.gateway_mode = GatewayMode::Attach;
+    state.plugins.restarting = true;
+    state.plugins.restart_required = true;
+    reduce(
+        &mut state,
+        Input::Connection(ConnectionEvent::Reconnected {
+            features: vec![],
+            instance_id: None,
+        }),
+    );
+    assert!(state.plugins.restarting);
+    assert!(state.plugins.restart_required);
+}
+
+#[test]
+fn reconnected_same_instance_clears_restarting_but_keeps_restart_required() {
+    let mut state = state();
+    state.gateway_instance = Some("a".into());
+    state.plugins.restarting = true;
+    state.plugins.restart_required = true;
+    reduce(
+        &mut state,
+        Input::Connection(ConnectionEvent::Reconnected {
+            features: vec![],
+            instance_id: Some("a".into()),
+        }),
+    );
+    // A successful spawn-mode reconnect is the restart-success signal; the
+    // saved-change flag stays because the instance did not change.
+    assert!(!state.plugins.restarting);
+    assert!(state.plugins.restart_required);
+}
+
+#[test]
+fn restart_preserves_composer_and_draft() {
+    let mut state = state();
+    state.plugins.restart_required = true;
+    state.composer.text = "hello gateway".into();
+    state.composer.cursor = state.composer.text.len();
+    state.drafts.insert("s1".into(), "older draft".into());
+
+    assert!(reduce(&mut state, Input::Action(UiAction::PluginRestart)).is_empty());
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginConfirm));
+    assert_eq!(effects, vec![Effect::RestartChild]);
+
+    assert_eq!(state.composer.text, "hello gateway");
+    assert_eq!(state.composer.cursor, "hello gateway".len());
+    assert_eq!(
+        state.drafts.get("s1").map(String::as_str),
+        Some("older draft")
+    );
+}
+
+#[test]
+fn list_parses_allow() {
+    let mut state = state();
+    state.plugins.loading = true;
+    reduce(
+        &mut state,
+        Input::CommandResult(ok(json!({
+            "plugins": [entry("acme.search", "active")],
+            "invalid": [],
+            "warnings": [],
+            "allow": ["stale.extra", "acme.search"],
+        }))),
+    );
+    assert_eq!(
+        state.plugins.allow.as_deref(),
+        Some(&["stale.extra".to_owned(), "acme.search".to_owned()][..])
+    );
+}
+
+#[test]
+fn apply_opens_confirmation_and_confirm_sends_set_allowed() {
+    let mut state = attach_apply_state();
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginApply));
+
+    assert!(effects.is_empty());
+    assert_eq!(state.plugins.pending, Some(PluginAction::Apply));
+
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginConfirm));
+    let sent = commands(&effects);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].name, "plugin.set_allowed");
+    assert_eq!(sent[0].args.get("ids"), Some(&json!(["acme.search"])));
+    assert_eq!(sent[0].args.get("mode"), Some(&json!("apply")));
+    assert!(sent[0].session_id.is_none());
+    assert!(state.plugins.applying);
+    assert_eq!(state.plugins.pending, None);
+
+    // A repeated confirm is empty: the pending action is gone.
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginConfirm));
+    assert!(effects.is_empty());
+    assert!(state.plugins.applying);
+}
+
+#[test]
+fn apply_set_allowed_result_clears_flags_and_refreshes() {
+    let mut state = attach_apply_state();
+    state.plugins.applying = true;
+    state.plugins.pending = Some(PluginAction::Apply);
+    let effects = reduce(
+        &mut state,
+        Input::CommandResult(CommandResult {
+            name: Some("plugin.set_allowed".into()),
+            ..ok(json!({
+                "allow": ["acme.search"],
+                "mode": "apply",
+                "changed": true,
+                "restart_required": false,
+                "plugins": [],
+                "changes": [],
+            }))
+        }),
+    );
+
+    assert!(!state.plugins.applying);
+    assert_eq!(state.plugins.pending, None);
+    assert!(!state.plugins.restart_required);
+    assert!(state.plugins.last_manage_error.is_none());
+    // The snapshot is refreshed so row states follow the real runtime list.
+    let sent = commands(&effects);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].name, "plugin.list");
+    assert!(state.plugins.loading);
+}
+
+#[test]
+fn manage_result_keeps_allow_in_sync_for_apply() {
+    // Rows: "a.plugin" carries a saved change (keeps restart_required true);
+    // "b.plugin" is disabled in file and runtime.
+    let mut state = state();
+    state.gateway_mode = GatewayMode::Attach;
+    state.features = vec!["view".into(), "plugins".into(), "plugins.runtime".into()];
+    state.plugins.manage = true;
+    state.plugins.loaded = true;
+    state.plugins.restart_required = true;
+    state.plugins.allow = Some(vec!["a.plugin".into()]);
+    state.plugins.entries = vec![
+        linteum_tui::viewmodel::PluginEntry {
+            id: "a.plugin".into(),
+            state: "active".into(),
+            enabled: Some(false),
+            ..Default::default()
+        },
+        linteum_tui::viewmodel::PluginEntry {
+            id: "b.plugin".into(),
+            state: "disabled".into(),
+            enabled: Some(false),
+            ..Default::default()
+        },
+    ];
+
+    // The gateway persisted an enable of b.plugin: the saved allow is now
+    // ["a.plugin", "b.plugin"]. The parsed snapshot must mirror that edit, or
+    // a later Ctrl+A apply would submit the stale list and revert it.
+    let mut enabled = entry("b.plugin", "disabled");
+    enabled["enabled"] = json!(true);
+    reduce(
+        &mut state,
+        Input::CommandResult(ok(json!({
+            "plugin": enabled,
+            "changed": true,
+            "persisted": true,
+            "restart_required": true,
+            "warnings": [],
+        }))),
+    );
+
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginApply));
+    assert!(effects.is_empty());
+    assert_eq!(state.plugins.pending, Some(PluginAction::Apply));
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginConfirm));
+    let sent = commands(&effects);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].name, "plugin.set_allowed");
+    assert_eq!(
+        sent[0].args.get("ids"),
+        Some(&json!(["a.plugin", "b.plugin"]))
+    );
+    assert_eq!(sent[0].args.get("mode"), Some(&json!("apply")));
+
+    // A later disable of b.plugin removes it again from the submitted list.
+    state.plugins.applying = false;
+    state.plugins.pending = None;
+    let mut disabled = entry("b.plugin", "disabled");
+    disabled["enabled"] = json!(false);
+    reduce(
+        &mut state,
+        Input::CommandResult(ok(json!({
+            "plugin": disabled,
+            "changed": true,
+            "persisted": true,
+            "restart_required": true,
+            "warnings": [],
+        }))),
+    );
+
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginApply));
+    assert!(effects.is_empty());
+    assert_eq!(state.plugins.pending, Some(PluginAction::Apply));
+    let effects = reduce(&mut state, Input::Action(UiAction::PluginConfirm));
+    let sent = commands(&effects);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].args.get("ids"), Some(&json!(["a.plugin"])));
+}
+
+#[test]
+fn apply_gateway_error_clears_applying_and_sets_error() {
+    let mut state = attach_apply_state();
+    state.plugins.applying = true;
+    state.plugins.pending = Some(PluginAction::Apply);
+    let effects = reduce(
+        &mut state,
+        Input::CommandResult(CommandResult {
+            name: Some("plugin.set_allowed".into()),
+            ..err("E_PLUGIN_MANAGE_DISABLED")
+        }),
+    );
+
+    assert!(!state.plugins.applying);
+    assert_eq!(state.plugins.pending, None);
+    assert_eq!(state.plugins.entries.len(), 1);
+    assert!(
+        state
+            .plugins
+            .last_manage_error
+            .as_deref()
+            .is_some_and(|error| error.contains("E_PLUGIN_MANAGE_DISABLED"))
+    );
+    assert!(has_toast(&effects, "E_PLUGIN_MANAGE_DISABLED"));
+}
+
+#[test]
+fn apply_is_gated_by_mode_feature_manage_and_allow() {
+    // Spawn mode: only a toast, pointing at the Ctrl+T restart instead.
+    let mut spawn = attach_apply_state();
+    spawn.gateway_mode = GatewayMode::Spawn;
+    let effects = reduce(&mut spawn, Input::Action(UiAction::PluginApply));
+    assert_eq!(spawn.plugins.pending, None);
+    assert!(has_toast(&effects, "Ctrl+T"));
+    assert!(commands(&effects).is_empty());
+
+    // Missing plugins.runtime: toast, no pending.
+    let mut no_runtime = attach_apply_state();
+    no_runtime.features = vec!["view".into(), "plugins".into()];
+    let effects = reduce(&mut no_runtime, Input::Action(UiAction::PluginApply));
+    assert_eq!(no_runtime.plugins.pending, None);
+    assert!(has_toast(&effects, "not supported"));
+    assert!(commands(&effects).is_empty());
+
+    // Management disabled: toast, no pending.
+    let mut not_managed = attach_apply_state();
+    not_managed.plugins.manage = false;
+    let effects = reduce(&mut not_managed, Input::Action(UiAction::PluginApply));
+    assert_eq!(not_managed.plugins.pending, None);
+    assert!(has_toast(&effects, "management is disabled"));
+
+    // No saved changes: toast, no pending.
+    let mut clean = attach_apply_state();
+    clean.plugins.restart_required = false;
+    let effects = reduce(&mut clean, Input::Action(UiAction::PluginApply));
+    assert_eq!(clean.plugins.pending, None);
+    assert!(has_toast(&effects, "no saved plugin changes"));
+
+    // The allow list is unavailable: toast, no pending, no command.
+    let mut no_allow = attach_apply_state();
+    no_allow.plugins.allow = None;
+    let effects = reduce(&mut no_allow, Input::Action(UiAction::PluginApply));
+    assert_eq!(no_allow.plugins.pending, None);
+    assert!(has_toast(&effects, "unavailable"));
+    assert!(commands(&effects).is_empty());
+}
+
+#[test]
+fn disconnect_clears_an_inflight_apply() {
+    let mut state = attach_apply_state();
+    state.plugins.applying = true;
+    state.plugins.pending = Some(PluginAction::Apply);
+    reduce(
+        &mut state,
+        Input::Connection(ConnectionEvent::Disconnected {
+            retryable: true,
+            reason: "eof".into(),
+        }),
+    );
+    assert!(!state.plugins.applying);
+    assert_eq!(state.plugins.pending, None);
 }

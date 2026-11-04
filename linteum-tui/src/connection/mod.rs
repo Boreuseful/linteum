@@ -40,6 +40,13 @@ pub trait TransportReader: Send {
 pub trait TransportWriter: Send {
     async fn send_text(&mut self, text: String) -> Result<(), TransportError>;
     async fn close(&mut self) -> Result<(), TransportError>;
+
+    /// The exit status of a spawned child once it has been reaped. `None` for
+    /// transports without a child process (websockets) and while the child is
+    /// still running or died from a signal.
+    fn exit_status(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// A full-duplex transport. Splitting lets the broker read and write
