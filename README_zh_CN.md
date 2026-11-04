@@ -218,6 +218,135 @@ Subagent 默认关闭。设置 `agent.subagents.enabled: true` 后，根会话�
 `default_model_profile`。子会话不能再派生，默认不出现在 `session.list` 中
 （需 `include_subagents=true`），并与根会话共用租约。
 
+### 能力插件
+
+插件是 `agent.plugins.dirs`（默认 `~/.linteum/plugins`）下包含 `plugin.yaml`
+的目录，可提供工具（`capabilities.tools` + Python `entry`）、技能目录
+（`capabilities.skills`）和模式文件（`capabilities.modes`）。只有列入
+`agent.plugins.allow` 的插件才会被 import：
+
+```yaml
+agent:
+  plugins:
+    dirs: ["~/.linteum/plugins"]
+    allow: ["acme.search"]
+```
+
+```bash
+linteum plugin list                 # 只发现/校验，不 import 代码
+linteum plugin show acme.search
+linteum plugin validate ~/.linteum/plugins/acme-search
+linteum plugin enable acme.search   # 持久写入 agent.plugins.allow（重启后加载）
+linteum plugin disable acme.search
+```
+
+`plugin enable/disable` 只重写 `agent.plugins.allow`，不 import 插件代码，
+下次宿主启动才生效。CLI 始终允许（本地用户拥有配置文件）。网关只有在
+`gateway.plugins.manage: true`（默认 `false`，需重启）时才向客户端开放同名
+命令；在 `linteum-tui` 中打开 `/plugins`，选中行后按 `Ctrl+E` / `Ctrl+D`，
+再按 `y` 确认。若 allow 列表来自环境变量覆盖，命令会被拒绝，因为写文件不会
+改变生效值。
+
+> **信任边界：** 进程内插件工具拥有宿主权限，只应启用与宿主同等可信的插件。
+> 仅提供 skills/modes 的插件不执行代码。
+
+插件加载对新会话或 `session.mode.set` 后的工具表生效，不会静默修改已开会话；
+卸载会先停止新调用、等待在飞调用（`agent.plugins.drain_grace_ms`）再撤销工具。
+
+#### 配置与密钥
+
+每个插件的配置放在 `agent.plugins.config.<id>`（只来自配置文件，这两组映射
+没有环境变量覆盖），值必须是普通 JSON，并以只读快照传给 `setup`。
+`agent.plugins.secrets.<id>.<NAME>` 中的每个密钥名都必须使用 `env:VAR` 引用：
+
+```yaml
+agent:
+  plugins:
+    config:
+      acme.search:
+        region: eu-west
+    secrets:
+      acme.search:
+        API_KEY: env:ACME_API_KEY   # 唯一支持的密钥来源
+```
+
+配置值在 import 插件代码之前按清单的 `config_schema` 校验；缺少必填键或类型
+不符会以 `E_PLUGIN_CONFIG` 使加载失败。密钥值从不写入配置文件：清单
+`needs_secrets` 中的每个名字都必须映射到 `env:VAR`，宿主在加载时读取环境变量。
+`plugin.list` / `plugin show`（含 `--json`）只显示每个配置键的来源（`default`
+或 `file`）和声明的密钥名，绝不显示配置值或密钥值。
+
+#### 运行时管理
+
+当 `gateway.plugins.manage: true` 时，本地传输（内嵌 inproc、stdio 或回环
+WebSocket）上的客户端可以修改运行中的插件集合：
+
+- `plugin.set_allowed`（`ids`、`mode`）持久化 `agent.plugins.allow`。默认
+  `mode: deferred` 只重写文件并返回 `restart_required`；显式 `mode: apply`
+  还会立即加载/卸载运行中的集合。
+- `plugin.load` / `plugin.unload` / `plugin.reload` 针对单个插件 id 操作当前
+  运行集合。卸载会等待在飞调用结束并撤销工具，但不修改已持久化的 allow 列表。
+
+该接口同时要求 manage 开关和本地传输；远端客户端仍只能只读 `plugin.list`。
+运行时 apply 失败会按插件报告，且不会回滚已经持久化的 allow 列表。CLI 的
+`plugin enable/disable` 仍离线且只在重启后生效：它们只重写
+`agent.plugins.allow`，从不 import 或热加载插件代码，下次宿主启动才生效。
+CLI 没有运行时 load/unload 命令。
+
+本地回环 WebSocket 上的 JSON 客户端可以在不重启网关的情况下应用已保存的
+allow 列表：`plugin.list` 返回一个追加的 `allow` 字段（文件级
+`agent.plugins.allow`，保持顺序并保留未知 id；配置文件不可读时省略），把它
+原样提交给 `plugin.set_allowed(ids=<allow>, mode="apply")` 即可让运行中的
+插件集合与配置一致。TUI 在 attach 模式下、网关声明 `plugins.runtime` 且
+`manage: true` 且至少一行存在已保存变更（`restart_required`）时，用
+`/plugins` 面板里的 `Ctrl+A` 暴露同样的流程。apply 提交的是最近一次
+`plugin.list` 的 `allow` 快照——外部（或其他客户端）改过
+`agent.plugins.allow` 后，请先在面板里按 `Ctrl+R` 刷新。apply 不重启网关：
+已开会话在下一次 `session.mode.set` 或新会话时才看到工具变更，否则需要
+外部重启（spawn 模式仍用 `Ctrl+T`）。远端（非回环）WebSocket 连接会被本地
+传输门拒绝。
+
+#### 钩子、订阅与限制
+
+除工具/技能/模式外，清单还可以观察运行过程并发布自己的事件。钩子和订阅都是
+只读的；声明其中任何一项都需要 `entry`：
+
+```yaml
+capabilities:
+  hooks: [before_llm_request, after_llm_completed]
+subscribes: [llm.completed, tool.call.completed]
+publishes: [plugin.acme.search.*]
+limits:
+  max_events_per_sec: 100
+  max_handler_ms: 2000
+  max_concurrency: 4
+  max_output_bytes: 65536
+  max_consecutive_failures: 5
+ordering:
+  priority: 100
+  fail_mode: closed
+```
+
+- `capabilities.hooks` 只接受 `before_llm_request` 和 `after_llm_completed`。
+  钩子只用于观察：它们不会成为 bus 订阅者，也不会进入 `AgentState`。
+- 顶层 `subscribes` 只接受精确事件类型——`llm.completed`、`llm.failed`、
+  `tool.call.completed`、`tool.call.failed`、`agent.completed`、
+  `agent.failed`——不支持通配符。
+- 顶层 `publishes` 必须位于插件自己的命名空间内：`plugin.<own-id>.*` 或
+  `plugin.<own-id>.<segment>`（单个小写段）。
+- `limits` 的范围含端点，括号内为默认值：`max_events_per_sec` 1..10000
+  （100）、`max_handler_ms` 1..60000（2000）、`max_concurrency` 1..64（4）、
+  `max_output_bytes` 1024..262144（65536）、`max_consecutive_failures`
+  1..100（5）。超过速率限制或输出上限的工作会被丢弃（shed，只记日志、不再
+  分发）；处理器连续失败会隔离（quarantine）插件。
+- `ordering`：`priority` 范围 -1000..1000（默认 100），按
+  `(priority, plugin_id, 注册序号)` 决定钩子处理器的顺序；`fail_mode` 为
+  `closed`（默认：失败会停止后续处理器）或 `open`（继续执行）。
+
+每个块都是严格的白名单：未知键会被拒绝；`limits`/`ordering` 内部的显式
+`null` 会被拒绝，而整个块为 `null` 表示“未配置”。插件在进程内运行，与宿主
+同等可信。
+
 其他配置段与限制（`agent.skills` 的各项上限、`gateway.limits`、
 `gateway.delta`、`gateway.history`、`gateway.backpressure`、
 `storage.checkpoints`、`logging` 轮转）会在生成的模板中说明。

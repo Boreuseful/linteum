@@ -66,6 +66,8 @@ class ProjectorState:
     context_digest: Optional[str] = None
     last_error: Optional[dict] = None
     tool_names: tuple = ()                 # ((call_id, name), ...)
+    #: Current mode summary (``name``/``source``/``digest``/``refresh``).
+    mode: Optional[dict] = None
     #: Request ids whose final ``llm.*`` event has already been projected.  A
     #: coalesced delta may be committed *after* its final event (the bus assigns
     #: ``seq`` at commit time), so late deltas must be dropped rather than
@@ -177,6 +179,7 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
     bound_model = state.bound_model
     context_digest = state.context_digest
     last_error = state.last_error
+    mode = dict(state.mode) if state.mode is not None else None
     completed = list(state.completed_requests)
 
     def _complete_request(request_id: Optional[str]) -> None:
@@ -340,6 +343,11 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
 
     elif etype in ("tool.call.completed", "tool.call.failed"):
         call_id = payload.get("call_id")
+        # A terminal for a call that has already left ``pending`` belongs to a
+        # round the reducer closed: either an interrupt voided the result
+        # (§16.3) or this is a duplicate.  It must not reopen a thinking round,
+        # because the reducer will never publish the event that closes it again.
+        was_pending = call_id is not None and call_id in pending
         ok = etype == "tool.call.completed" and bool(payload.get("ok", True))
         output = payload.get("output")
         if payload.get("output_ref"):
@@ -365,8 +373,9 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         approvals.pop(call_id, None)
         if not ok:
             last_error = _as_error_info(payload)
-        # Every branch done -> the reducer asks the model again.
-        phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
+        if was_pending:
+            # Every branch done -> the reducer asks the model again.
+            phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
 
     # -- approval domain --------------------------------------------------
     elif etype == "approval.required":
@@ -612,6 +621,17 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
             "plugin_id": payload.get("plugin_id") or payload.get("id"),
         }))
 
+    elif etype == "system.mode.changed":
+        mode = {
+            "id": f"{payload.get('source')}/{payload.get('to')}",
+            "name": payload.get("to"),
+            "source": payload.get("source"),
+            "digest": payload.get("to_digest"),
+            "from": payload.get("from"),
+            "refresh": bool(payload.get("refresh", False)),
+        }
+        frames.append(ProjectedFrame("mode", dict(mode)))
+
     elif etype in ("memory.write.applied", "memory.deleted", "system.session.erased"):
         kind = {
             "memory.write.applied": "memory.write.applied",
@@ -638,6 +658,7 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         context_digest=context_digest,
         last_error=last_error,
         tool_names=tuple(tool_names.items()),
+        mode=mode,
         completed_requests=tuple(completed),
     )
     if new_state.phase != state.phase:
@@ -672,6 +693,7 @@ def snapshot_payload(state: ProjectorState) -> dict:
         "pending_approvals": [dict(info) for _, info in state.pending_approvals],
         "usage": dict(state.usage),
         "bound_model": state.bound_model,
+        "mode": dict(state.mode) if state.mode is not None else None,
         "context_digest": state.context_digest,
         "last_error": dict(state.last_error) if state.last_error is not None else None,
     }

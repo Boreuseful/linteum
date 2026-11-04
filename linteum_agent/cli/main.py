@@ -34,9 +34,20 @@ from typing import Optional
 
 from ..config.meta import field_specs, get_spec
 from ..config.schema import ConfigError, default_config
-from ..config.service import ConfigService
+from ..config.service import ConfigService, env_var_for
 from ..config.store import ConfigStore
 from ..runtime.llm.config import PROVIDER_DEFAULTS
+from ..runtime.modes.catalog import load_mode_catalog
+from ..runtime.modes.errors import ModeError
+from ..runtime.modes.model import ModeLimits, ModePackage
+from ..runtime.modes.parsing import read_mode_package
+from ..runtime.modes.source import BuiltinModeSource
+from ..runtime.plugins.config import resolve_plugin_config
+from ..runtime.plugins.errors import PluginError
+from ..runtime.plugins.manifest import read_plugin_manifest, scan_plugins
+from ..runtime.plugins.model import PluginLimits
+from ..runtime.skills.model import SkillLimits, SkillPackage
+from ..runtime.skills.parsing import load_package
 from ..gateway.client import AgentClient, ClientError, ConnectionClosed
 from ..gateway.leases import FileLeaseManager
 from ..gateway.protocol import Frame
@@ -89,6 +100,8 @@ def _parser() -> argparse.ArgumentParser:
                       help="resume an existing session id")
     chat.add_argument("-p", "--profile", default=None,
                       help="agent profile from agent.profiles")
+    chat.add_argument("--mode", default=None,
+                      help="mode name for the new session")
     chat.add_argument("--config", default=None, help="explicit config.yaml path")
     chat.add_argument("--no-lease", action="store_true",
                       help="disable the cross-process single-writer lease")
@@ -96,6 +109,52 @@ def _parser() -> argparse.ArgumentParser:
                       help="print reasoning deltas")
     chat.add_argument("--timeout", type=float, default=None,
                       help="one-shot timeout in seconds (default: none)")
+
+    mode = sub.add_parser("mode", help="inspect mode definitions")
+    mode_sub = mode.add_subparsers(dest="mode_command", required=True)
+    mode_list = mode_sub.add_parser("list", help="list available builtin modes")
+    mode_list.add_argument("--config", default=None, help="explicit config.yaml path")
+    mode_show = mode_sub.add_parser("show", help="show one mode definition")
+    mode_show.add_argument("name")
+    mode_show.add_argument("--config", default=None, help="explicit config.yaml path")
+    mode_validate = mode_sub.add_parser("validate", help="validate one mode file")
+    mode_validate.add_argument("path")
+    mode_validate.add_argument("--config", default=None,
+                               help="explicit config.yaml path")
+
+    plugin = sub.add_parser("plugin", help="inspect and validate capability plugins")
+    plugin_sub = plugin.add_subparsers(dest="plugin_command", required=True)
+    plugin_list = plugin_sub.add_parser(
+        "list", help="list discovered plugins (never imports code)"
+    )
+    plugin_list.add_argument("--config", default=None, help="explicit config.yaml path")
+    plugin_list.add_argument("--json", action="store_true")
+    plugin_show = plugin_sub.add_parser(
+        "show", help="show one plugin manifest (never imports code)"
+    )
+    plugin_show.add_argument("id")
+    plugin_show.add_argument("--config", default=None, help="explicit config.yaml path")
+    plugin_show.add_argument("--json", action="store_true")
+    plugin_validate = plugin_sub.add_parser(
+        "validate", help="statically validate a plugin directory"
+    )
+    plugin_validate.add_argument("path")
+    plugin_validate.add_argument("--config", default=None,
+                                 help="explicit config.yaml path")
+    plugin_enable = plugin_sub.add_parser(
+        "enable", help="add a discovered plugin to agent.plugins.allow"
+    )
+    plugin_enable.add_argument("id")
+    plugin_enable.add_argument("--config", default=None,
+                               help="explicit config.yaml path")
+    plugin_enable.add_argument("--json", action="store_true")
+    plugin_disable = plugin_sub.add_parser(
+        "disable", help="remove a plugin from agent.plugins.allow"
+    )
+    plugin_disable.add_argument("id")
+    plugin_disable.add_argument("--config", default=None,
+                                help="explicit config.yaml path")
+    plugin_disable.add_argument("--json", action="store_true")
 
     sessions = sub.add_parser("sessions", help="list sessions in the catalogue")
     sessions.add_argument("--config", default=None, help="explicit config.yaml path")
@@ -414,6 +473,10 @@ class _Renderer:
                 self.print(f"[notice] {kind}")
         elif name == "compaction.applied":
             self.print("[context compacted]")
+        elif name == "mode":
+            self.print(
+                f"[mode] {payload.get('name')} [{payload.get('source')}]"
+            )
         elif name == "history.page":
             self.print(f"[history] {len(payload.get('frames') or [])} frame(s), "
                        f"next_seq={payload.get('next_seq')}")
@@ -496,6 +559,7 @@ async def _chat(args) -> int:
         await client.connect()
         created = await client.create_session(
             str(workspace), session_id=session_id, profile=args.profile,
+            mode=args.mode,
         )
         session_id = created["session"]["session_id"]
         await client.subscribe(session_id, after_seq=0)
@@ -548,6 +612,9 @@ commands:
   /interrupt [reason]           interrupt the current round
   /resume                       resume a paused session
   /history [limit]              read recent history
+  /mode                         list available modes
+  /mode <name>                  switch the session mode (must be idle)
+  /mode status                  show the current mode
   /session                      print the current session id
   /quit                         exit
 anything else is sent as a user message.
@@ -599,12 +666,473 @@ async def _repl(client: AgentClient, renderer: _Renderer, session_id: str) -> No
                 parts = line.split(maxsplit=1)
                 limit = int(parts[1]) if len(parts) > 1 else 30
                 await client.history(session_id, after_seq=0, limit=limit)
+            elif line.startswith("/mode"):
+                parts = line.split()
+                if len(parts) == 1:
+                    result = await client.list_modes()
+                    for item in result.get("modes") or []:
+                        marker = " (default)" if item.get("default") else ""
+                        renderer.print(
+                            f"{item.get('name')} [{item.get('source')}]"
+                            f"{marker} — {item.get('description') or ''}"
+                        )
+                elif parts[1] == "status":
+                    result = await client.command(
+                        "session.get", {"session_id": session_id},
+                        session_id=session_id,
+                    )
+                    mode = (result.get("snapshot") or {}).get("mode")
+                    if mode:
+                        renderer.print(
+                            f"{mode.get('name')} [{mode.get('source')}] "
+                            f"{mode.get('digest') or ''}"
+                        )
+                    else:
+                        renderer.print("no mode in snapshot")
+                else:
+                    result = await client.set_mode(session_id, parts[1])
+                    mode = result.get("mode") or {}
+                    renderer.print(
+                        f"[mode] {mode.get('name')} [{mode.get('source')}] "
+                        f"changed={result.get('changed')}"
+                    )
+                    for warning in result.get("warnings") or []:
+                        renderer.print(f"[mode warning] {warning}")
             elif line.startswith("/"):
                 renderer.print("unknown command; /help for the list")
             else:
                 await client.send_message(session_id, line)
         except ClientError as exc:
             renderer.print(f"[error] {exc.code}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# modes
+# ---------------------------------------------------------------------------
+
+def _run_mode(args) -> int:
+    service = _build_service(args.config)
+    cfg = service.effective(strict=False).config
+    limits = ModeLimits(
+        max_mode_bytes=cfg.agent.modes.max_mode_bytes,
+        max_modes=cfg.agent.modes.max_modes,
+    )
+    if args.mode_command == "validate":
+        path = Path(args.path).expanduser()
+        package = ModePackage(
+            name=path.stem, path=path,
+            source_id="plugin:validate", priority=400,
+        )
+        try:
+            definition = read_mode_package(package, limits)
+        except ModeError as exc:
+            print(f"{exc.code}: {exc}")
+            return 1
+        print(f"ok: {definition.name} ({definition.source_id})")
+        return 0
+
+    catalog = asyncio.run(load_mode_catalog(
+        (BuiltinModeSource(),), limits=limits,
+    ))
+    if args.mode_command == "list":
+        for name in sorted(catalog.entries):
+            entry = catalog.entries[name]
+            marker = " (default)" if name == cfg.agent.modes.default else ""
+            print(
+                f"{name}{marker}\t{entry.source_id}\t"
+                f"{entry.definition.description}"
+            )
+        return 0
+
+    entry = catalog.get(args.name)
+    if entry is None:
+        print(f"mode not found: {args.name}")
+        return 1
+    definition = entry.definition
+    print(f"name: {definition.name}")
+    print(f"source: {entry.source_id}")
+    print(f"description: {definition.description}")
+    print(f"extends: {definition.extends or '-'}")
+    print(f"prompt_mode: {definition.prompt_mode}")
+    print(
+        "tools.include: "
+        + (
+            "all" if definition.tools.include is None
+            else str(list(definition.tools.include))
+        )
+    )
+    print(f"tools.exclude: {list(definition.tools.exclude)}")
+    print(f"skills.enabled: {definition.skills.enabled}")
+    print(
+        "skills.include: "
+        + (
+            "all" if definition.skills.include is None
+            else str(list(definition.skills.include))
+        )
+    )
+    print(f"skills.exclude: {list(definition.skills.exclude)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# plugins
+# ---------------------------------------------------------------------------
+
+def _plugin_limits(settings) -> PluginLimits:
+    return PluginLimits(
+        max_plugins=settings.max_plugins,
+        max_tools_per_plugin=settings.max_tools_per_plugin,
+        max_manifest_bytes=settings.max_manifest_bytes,
+        load_timeout_ms=settings.load_timeout_ms,
+        drain_grace_ms=settings.drain_grace_ms,
+        unload_timeout_ms=settings.unload_timeout_ms,
+    )
+
+
+def _plugin_dirs(settings) -> list:
+    return [Path(item).expanduser() for item in settings.dirs]
+
+
+def _plugin_config_sources(manifest, values) -> tuple[dict, str]:
+    """``key -> "default" | "file"`` for display, plus an optional error code.
+
+    ``resolve_plugin_config`` returns the resolved values too, but those never
+    leave this function: the CLI only ever prints sources (§4.5).  A resolution
+    failure (invalid file config, required key missing) is data, not a crash —
+    the caller can render the code without any configured value.
+    """
+    try:
+        _resolved, sources = resolve_plugin_config(manifest, values)
+    except PluginError as exc:
+        return {}, exc.code
+    return dict(sources), ""
+
+
+def _plugin_manifest_dict(manifest, config_values=None) -> dict:
+    payload = {
+        "id": manifest.id,
+        "version": manifest.version,
+        "description": manifest.description,
+        "source": manifest.source,
+        "api_version": manifest.api_version,
+        "runtime": manifest.runtime,
+        "trust": manifest.trust,
+        "entry": (
+            {
+                "file": manifest.entry.path.name,
+                "callable": manifest.entry.qualname,
+            }
+            if manifest.entry is not None else None
+        ),
+        "tools": [
+            {
+                "name": item.name,
+                "side_effect": item.side_effect,
+                "timeout": item.timeout,
+                "concurrency": item.concurrency,
+                "idempotent": item.idempotent,
+                "requires_approval": item.requires_approval,
+                "backend": item.backend,
+            }
+            for item in manifest.tools
+        ],
+        "skills": [path.name for path in manifest.skill_dirs],
+        "modes": [path.stem for path in manifest.mode_paths],
+        "digest": manifest.digest,
+    }
+    # v0.4 display fields (§4.5): sources and names only, never values.
+    # Empty lists are omitted so pre-v0.4 plugins keep the existing shape.
+    sources, config_error = _plugin_config_sources(manifest, config_values)
+    if sources:
+        payload["config"] = sources
+    if config_error:
+        payload["config_error"] = config_error
+    if manifest.needs_secrets:
+        payload["secrets"] = list(manifest.needs_secrets)
+    if manifest.hooks:
+        payload["hooks"] = list(manifest.hooks)
+    if manifest.subscribes:
+        payload["subscribes"] = list(manifest.subscribes)
+    if manifest.publishes:
+        payload["publishes"] = list(manifest.publishes)
+    return payload
+
+
+def _plugin_manage_fail(args, code: str, message: str, hint: str = "") -> int:
+    if getattr(args, "json", False):
+        _json_dump({
+            "ok": False,
+            "code": code,
+            "message": message,
+            "hint": hint,
+        })
+    else:
+        suffix = f" ({hint})" if hint else ""
+        print(f"{code}: {message}{suffix}")
+    return 1
+
+
+def _run_plugin_manage(args) -> int:
+    """Persistently edit ``agent.plugins.allow``; never imports plugin code."""
+    service = _build_service(args.config)
+    try:
+        effective = service.effective(strict=False)
+    except ConfigError as exc:
+        return _plugin_manage_fail(
+            args, "E_PLUGIN_CONFIG",
+            f"cannot read configuration ({exc.code})",
+        )
+    cfg = effective.config
+    if effective.sources.get("agent.plugins.allow") == "env":
+        # Writing the file would not change the effective value (D25).
+        return _plugin_manage_fail(
+            args, "E_PLUGIN_CONFIG",
+            "agent.plugins.allow is overridden by the environment",
+            f"unset {env_var_for('agent.plugins.allow')}",
+        )
+    try:
+        file_config = service.store.load(create=False)
+    except ConfigError as exc:
+        return _plugin_manage_fail(
+            args, "E_PLUGIN_CONFIG",
+            f"cannot read configuration ({exc.code})",
+        )
+
+    settings = cfg.agent.plugins
+    catalog = scan_plugins(_plugin_dirs(settings), limits=_plugin_limits(settings))
+    found = {manifest.id for manifest in catalog.manifests}
+    invalid = {issue.id for issue in catalog.invalid if issue.id}
+    plugin_id = args.id
+    enable = args.plugin_command == "enable"
+    warnings: list[str] = []
+
+    if enable and plugin_id not in found:
+        if plugin_id in invalid:
+            return _plugin_manage_fail(
+                args, "E_PLUGIN_MANIFEST",
+                f"invalid plugin manifest: {plugin_id!r}",
+            )
+        return _plugin_manage_fail(
+            args, "E_PLUGIN_NOT_FOUND", f"plugin not found: {plugin_id!r}",
+        )
+    if not enable and plugin_id not in found:
+        # disable is the escape hatch for stale allow entries (§11.3).
+        warnings.append(
+            f"plugin.not_found: {plugin_id!r} is not discovered; "
+            "removing it from agent.plugins.allow"
+        )
+
+    allow = list(file_config.agent.plugins.allow)
+    changed = False
+    if enable and plugin_id not in allow:
+        allow.append(plugin_id)
+        changed = True
+    elif not enable and plugin_id in allow:
+        allow.remove(plugin_id)
+        changed = True
+    if changed:
+        try:
+            service.set(
+                "agent.plugins.allow", allow,
+                expected_revision=service.revision(),
+            )
+        except ConfigError as exc:
+            return _plugin_manage_fail(
+                args, "E_PLUGIN_CONFIG",
+                f"cannot update agent.plugins.allow ({exc.code})",
+            )
+
+    enabled = plugin_id in allow
+    if getattr(args, "json", False):
+        _json_dump({
+            "ok": True,
+            "id": plugin_id,
+            "enabled": enabled,
+            "changed": changed,
+            "persisted": True,
+            # The CLI cannot know whether a host is running; any change (and
+            # even a no-op re-assertion) only affects the next start (§11.3).
+            "restart_required": True,
+            "warnings": warnings,
+        })
+        return 0
+    for warning in warnings:
+        print(f"[warning] {warning}")
+    if not changed:
+        print("no changes")
+    else:
+        print(
+            f"{plugin_id}: {'enabled' if enabled else 'disabled'} "
+            "[restart required]"
+        )
+    return 0
+
+
+def _run_plugin(args) -> int:
+    """Offline plugin inspection; never imports plugin code (D3 / §11.3)."""
+    if args.plugin_command in ("enable", "disable"):
+        return _run_plugin_manage(args)
+    service = _build_service(args.config)
+    cfg = service.effective(strict=False).config
+    settings = cfg.agent.plugins
+    limits = _plugin_limits(settings)
+
+    if args.plugin_command == "validate":
+        path = Path(args.path).expanduser()
+        root = path.parent if path.name == "plugin.yaml" else path
+        try:
+            manifest = read_plugin_manifest(
+                root, source=root.name, limits=limits,
+            )
+        except PluginError as exc:
+            print(f"{exc.code}: {exc}")
+            return 1
+        errors: list[str] = []
+        warnings: list[str] = []
+        mode_limits = ModeLimits(
+            max_mode_bytes=cfg.agent.modes.max_mode_bytes,
+            max_modes=cfg.agent.modes.max_modes,
+        )
+        for mode_path in manifest.mode_paths:
+            try:
+                read_mode_package(
+                    ModePackage(
+                        name=mode_path.stem, path=mode_path,
+                        source_id=f"plugin:{manifest.id}", priority=400,
+                    ),
+                    mode_limits,
+                )
+            except ModeError as exc:
+                errors.append(f"mode {mode_path.stem!r}: {exc.code}: {exc}")
+        skill_settings = cfg.agent.skills
+        skill_limits = SkillLimits(
+            max_result_bytes=skill_settings.max_result_bytes,
+            max_skill_bytes=skill_settings.max_skill_bytes,
+            max_resource_bytes=skill_settings.max_resource_bytes,
+            max_resources_per_skill=skill_settings.max_resources_per_skill,
+            max_index_bytes=skill_settings.max_index_bytes,
+            max_skills=skill_settings.max_skills,
+            max_catalog_bytes=skill_settings.max_catalog_bytes,
+        )
+        for skill_dir in manifest.skill_dirs:
+            try:
+                entry, skill_warnings = load_package(
+                    SkillPackage(
+                        source_id=f"plugin:{manifest.id}", priority=400,
+                        root=skill_dir,
+                    ),
+                    skill_limits,
+                    budget_bytes=skill_settings.max_catalog_bytes,
+                )
+            except Exception as exc:  # noqa: BLE001 - report, do not crash
+                errors.append(
+                    f"skill {skill_dir.name!r}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            warnings.extend(skill_warnings)
+            if entry is None:
+                errors.append(f"skill {skill_dir.name!r}: SKILL.md is invalid")
+        for warning in warnings:
+            print(f"[warning] {warning}")
+        for error in errors:
+            print(f"[error] {error}")
+        if errors:
+            return 1
+        print(f"ok: {manifest.id} {manifest.version}")
+        return 0
+
+    catalog = scan_plugins(_plugin_dirs(settings), limits=limits)
+    allow = set(settings.allow)
+    warnings = list(catalog.warnings)
+    found = {manifest.id for manifest in catalog.manifests}
+    for plugin_id in settings.allow:
+        if plugin_id not in found:
+            warnings.append(
+                f"plugin.not_found: {plugin_id!r} from agent.plugins.allow"
+            )
+
+    if args.plugin_command == "list":
+        rows = [
+            {
+                **_plugin_manifest_dict(
+                    manifest, settings.config.get(manifest.id, {}),
+                ),
+                "state": "discovered" if manifest.id in allow else "disabled",
+                "enabled": manifest.id in allow,
+            }
+            for manifest in catalog.manifests
+        ]
+        invalid = [issue.to_dict() for issue in catalog.invalid]
+        if args.json:
+            print(json.dumps(
+                {"plugins": rows, "invalid": invalid, "warnings": warnings},
+                ensure_ascii=False, indent=2,
+            ))
+            return 0
+        for row in rows:
+            print(
+                f"{row['id']}\t{row['version']}\t{row['state']}\t"
+                f"tools={len(row['tools'])} skills={len(row['skills'])} "
+                f"modes={len(row['modes'])}"
+            )
+        for item in invalid:
+            print(f"{item['source']}\t-\tinvalid\t{item['code']}: {item['error']}")
+        for warning in warnings:
+            print(f"[warning] {warning}")
+        return 0
+
+    manifest = next(
+        (item for item in catalog.manifests if item.id == args.id), None,
+    )
+    if manifest is None:
+        invalid = catalog.invalid
+        detail = "; ".join(
+            f"{issue.source}: {issue.code}" for issue in invalid
+        )
+        print(f"plugin not found: {args.id}" + (f" ({detail})" if detail else ""))
+        return 1
+    payload = _plugin_manifest_dict(
+        manifest, settings.config.get(manifest.id, {}),
+    )
+    payload["enabled"] = manifest.id in allow
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print(f"id: {manifest.id}")
+    print(f"version: {manifest.version}")
+    print(f"source: {manifest.source}")
+    print(f"description: {manifest.description or '-'}")
+    print(f"api_version: {manifest.api_version}")
+    print(f"runtime: {manifest.runtime}")
+    print(f"trust: {manifest.trust}")
+    print(f"enabled: {manifest.id in allow}")
+    if manifest.entry is not None:
+        print(f"entry: {manifest.entry.path.name}:{manifest.entry.qualname}")
+    for item in manifest.tools:
+        print(
+            f"tool: {item.name} side_effect={item.side_effect} "
+            f"timeout={item.timeout} concurrency={item.concurrency} "
+            f"idempotent={item.idempotent} "
+            f"requires_approval={item.requires_approval} backend={item.backend}"
+        )
+    for path in manifest.skill_dirs:
+        print(f"skill: {path.name}")
+    for path in manifest.mode_paths:
+        print(f"mode: {path.stem}")
+    for key, source in payload.get("config", {}).items():
+        print(f"config.{key}: {source}")
+    if "config_error" in payload:
+        print(f"config: invalid ({payload['config_error']})")
+    if manifest.needs_secrets:
+        # Declared names only: the CLI never resolves or prints secret values.
+        print("secrets: " + ", ".join(manifest.needs_secrets))
+    for hook in manifest.hooks:
+        print(f"hook: {hook}")
+    if manifest.subscribes:
+        print("subscribes: " + ", ".join(manifest.subscribes))
+    if manifest.publishes:
+        print("publishes: " + ", ".join(manifest.publishes))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1144,6 +1672,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             return asyncio.run(_sessions(args))
         if args.command == "config":
             return _run_config(args)
+        if args.command == "mode":
+            return _run_mode(args)
+        if args.command == "plugin":
+            return _run_plugin(args)
         if args.command == "setup":
             return _run_setup(args)
     except KeyboardInterrupt:

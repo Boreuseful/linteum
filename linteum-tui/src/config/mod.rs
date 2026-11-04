@@ -108,6 +108,7 @@ pub struct ResolvedConfig {
     pub continue_: bool,
     pub new: bool,
     pub profile: Option<String>,
+    pub default_mode: Option<String>,
 }
 
 impl From<ThemeArg> for ThemeChoice {
@@ -176,6 +177,7 @@ pub fn resolve(cli: Cli, env: &Env) -> Result<ResolvedConfig, ConfigError> {
         .or_else(|| prefs.config.as_ref().map(PathBuf::from));
 
     let no_lease = cli.no_lease || prefs.no_lease;
+    let default_mode = cli.mode.clone().or_else(|| prefs.default_mode.clone());
 
     let theme = if cli.no_color || env.no_color {
         ThemeChoice::Mono
@@ -224,5 +226,6 @@ pub fn resolve(cli: Cli, env: &Env) -> Result<ResolvedConfig, ConfigError> {
         continue_: cli.continue_,
         new: cli.new,
         profile: cli.profile,
+        default_mode,
     })
 }

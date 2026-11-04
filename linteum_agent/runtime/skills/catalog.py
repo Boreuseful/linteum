@@ -277,9 +277,62 @@ async def load_catalog(
     return replace(catalog, warnings=(*catalog.warnings, *warnings))
 
 
+def filter_catalog(
+    catalog: SkillCatalog,
+    *,
+    include: Optional[Sequence[str]] = None,
+    exclude: Sequence[str] = (),
+) -> tuple[SkillCatalog, tuple[str, ...]]:
+    """Return a filtered catalog plus warnings (mode design §7.2).
+
+    ``include=None`` means all entries.  Selectors are exact names or
+    ``source:<source_id>``.  The filtered catalog is rebuilt with
+    :func:`build_catalog` so ``index_text``, ``digest`` and limits stay
+    consistent.  Hidden entries are absent from ``entries`` and therefore
+    unreachable from ``load_skill``.
+    """
+    entries = list(catalog.entries)
+    warnings: list[str] = []
+
+    def matches(selector: str, entry: SkillEntry) -> bool:
+        if selector == "all":
+            return True
+        if selector.startswith("source:"):
+            return entry.source_id == selector[len("source:"):]
+        return entry.name == selector
+
+    if include is not None:
+        selected: list[SkillEntry] = []
+        seen: set[str] = set()
+        for selector in include:
+            matched = [entry for entry in entries if matches(selector, entry)]
+            if not matched:
+                warnings.append(f"skill selector {selector!r} matched no skills")
+                continue
+            for entry in matched:
+                if entry.name not in seen:
+                    seen.add(entry.name)
+                    selected.append(entry)
+        entries = selected
+
+    excluded: set[str] = set()
+    for selector in exclude:
+        matched = [entry for entry in entries if matches(selector, entry)]
+        if not matched:
+            warnings.append(f"skill selector {selector!r} matched no skills")
+            continue
+        excluded.update(entry.name for entry in matched)
+    if excluded:
+        entries = [entry for entry in entries if entry.name not in excluded]
+
+    filtered = build_catalog(entries, limits=catalog.limits)
+    return filtered, (*warnings, *filtered.warnings)
+
+
 __all__ = [
     "build_catalog",
     "catalog_digest",
+    "filter_catalog",
     "load_catalog",
     "render_index",
 ]

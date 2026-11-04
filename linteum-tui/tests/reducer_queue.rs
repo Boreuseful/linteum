@@ -40,6 +40,7 @@ fn result_ok(id: &str, accepted: bool, queued: bool) -> CommandResult {
             "queued": queued, "event_id": "e", "seq": 1
         }),
         error: None,
+        name: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn result_err(id: &str, code: &str) -> CommandResult {
             enters_history: false,
             context: serde_json::json!({}),
         }),
+        name: None,
     }
 }
 
@@ -203,7 +205,13 @@ fn reconnect_resends_unconfirmed_once() {
     s.composer.text = "hello".into();
     reduce(&mut s, Input::Action(UiAction::Send));
     let id = s.queue.entries[0].client_message_id.clone();
-    let effects = reduce(&mut s, Input::Connection(ConnectionEvent::Reconnected));
+    let effects = reduce(
+        &mut s,
+        Input::Connection(ConnectionEvent::Reconnected {
+            features: vec![],
+            instance_id: None,
+        }),
+    );
     let sends: Vec<_> = effects
         .into_iter()
         .filter_map(|effect| match effect {
@@ -244,6 +252,7 @@ fn synthetic_err(code: &str) -> CommandResult {
             enters_history: false,
             context: serde_json::json!({}),
         }),
+        name: None,
     }
 }
 

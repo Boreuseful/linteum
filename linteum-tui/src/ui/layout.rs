@@ -115,6 +115,7 @@ pub fn banner_text(state: &TuiState) -> Option<String> {
 enum SegmentKind {
     Connection,
     Phase,
+    Mode,
     Round,
     Model,
     Tokens,
@@ -133,6 +134,18 @@ impl SegmentKind {
                 .session
                 .as_ref()
                 .map(|session| format!("phase {}", session.phase)),
+            Self::Mode => state.mode.current.as_ref().map(|mode| {
+                let mut text = format!("mode {}", mode.name);
+                if mode.source != "builtin" {
+                    text.push_str(&format!(" [{}]", mode.source));
+                }
+                if state.mode.list_loaded
+                    && !state.mode.options.iter().any(|option| option.id == mode.id)
+                {
+                    text.push_str(" !");
+                }
+                text
+            }),
             Self::Round => state
                 .session
                 .as_ref()
@@ -194,6 +207,7 @@ pub fn status_bar(state: &TuiState, width: u16) -> String {
     let kinds = [
         SegmentKind::Connection,
         SegmentKind::Phase,
+        SegmentKind::Mode,
         SegmentKind::Round,
         SegmentKind::Model,
         SegmentKind::Tokens,

@@ -32,11 +32,19 @@ pub enum CommandError {
 struct Pending {
     reply: oneshot::Sender<Result<CommandResult, CommandError>>,
     deadline: Instant,
+    /// The command name, used to fill `CommandResult.name` when an old
+    /// gateway omits it (D5).
+    name: String,
 }
 
-struct BrokerRequest {
-    command: Command,
-    reply: oneshot::Sender<Result<CommandResult, CommandError>>,
+enum BrokerRequest {
+    Command {
+        command: Command,
+        reply: oneshot::Sender<Result<CommandResult, CommandError>>,
+    },
+    Close {
+        reply: oneshot::Sender<Option<i32>>,
+    },
 }
 
 /// The reader/writer pair plus the request receiver. Run it on a task and send
@@ -74,9 +82,10 @@ impl CommandBroker {
         )
     }
 
-    /// Read frames/results and write commands until the transport closes or
-    /// the UI drops the input receiver.
-    pub async fn run(self, input_tx: mpsc::Sender<Input>) {
+    /// Read frames/results and write commands until the transport closes, the
+    /// UI drops the input receiver, or a `Close` request arrives. Returns the
+    /// writer's exit status (the spawned child's code in stdio spawn mode).
+    pub async fn run(self, input_tx: mpsc::Sender<Input>) -> Option<i32> {
         let Self {
             mut reader,
             mut writer,
@@ -92,31 +101,44 @@ impl CommandBroker {
         let mut early: HashMap<String, CommandResult> = HashMap::new();
         let mut expiry = tokio::time::interval(Duration::from_millis(50));
         expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut writer_closed = false;
 
         loop {
             tokio::select! {
                 request = requests.recv() => {
-                    let Some(request) = request else {
-                        let _ = writer.close().await;
-                        break;
-                    };
-                    let id = request.command.id.clone();
-                    tracing::debug!(id = %id, command = %request.command.name, "sending command");
-                    match encode_command(&request.command) {
-                        Ok(line) => {
-                            if let Err(error) = writer.send_text(line).await {
-                                let _ = request.reply.send(Err(CommandError::Transport(error.to_string())));
-                            } else if let Some(result) = early.remove(&id) {
-                                let _ = request.reply.send(Ok(result));
-                            } else {
-                                pending.insert(id, Pending {
-                                    reply: request.reply,
-                                    deadline: Instant::now() + timeout,
-                                });
-                            }
+                    match request {
+                        None => break,
+                        Some(BrokerRequest::Close { reply }) => {
+                            let _ = writer.close().await;
+                            let _ = reply.send(writer.exit_status());
+                            writer_closed = true;
+                            break;
                         }
-                        Err(error) => {
-                            let _ = request.reply.send(Err(CommandError::Protocol(error.to_string())));
+                        Some(BrokerRequest::Command { command, reply }) => {
+                            let id = command.id.clone();
+                            let name = command.name.clone();
+                            tracing::debug!(id = %id, command = %command.name, "sending command");
+                            match encode_command(&command) {
+                                Ok(line) => {
+                                    if let Err(error) = writer.send_text(line).await {
+                                        let _ = reply.send(Err(CommandError::Transport(error.to_string())));
+                                    } else if let Some(mut result) = early.remove(&id) {
+                                        if result.name.is_none() {
+                                            result.name = Some(name);
+                                        }
+                                        let _ = reply.send(Ok(result));
+                                    } else {
+                                        pending.insert(id, Pending {
+                                            reply,
+                                            deadline: Instant::now() + timeout,
+                                            name,
+                                        });
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = reply.send(Err(CommandError::Protocol(error.to_string())));
+                                }
+                            }
                         }
                     }
                 }
@@ -124,9 +146,12 @@ impl CommandBroker {
                     match message {
                         Some(Ok(line)) => {
                             match decode_envelope(&line) {
-                                Ok(Envelope::Result(result)) => {
+                                Ok(Envelope::Result(mut result)) => {
                                     tracing::debug!(reply_to = %result.reply_to, ok = result.ok, "command result");
                                     if let Some(waiter) = pending.remove(&result.reply_to) {
+                                        if result.name.is_none() {
+                                            result.name = Some(waiter.name);
+                                        }
                                         let _ = waiter.reply.send(Ok(result));
                                     } else if early.len() < 64 {
                                         early.insert(result.reply_to.clone(), result);
@@ -200,6 +225,10 @@ impl CommandBroker {
             }
         }
         fail_all(&mut pending, CommandError::Closed);
+        if !writer_closed {
+            let _ = writer.close().await;
+        }
+        writer.exit_status()
     }
 }
 
@@ -213,7 +242,7 @@ impl BrokerHandle {
     pub async fn send_raw(&self, command: Command) -> Result<CommandResult, CommandError> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(BrokerRequest { command, reply: tx })
+            .send(BrokerRequest::Command { command, reply: tx })
             .await
             .map_err(|_| CommandError::Closed)?;
         match tokio::time::timeout(self.timeout, rx).await {
@@ -221,6 +250,22 @@ impl BrokerHandle {
             Ok(Err(_)) => Err(CommandError::Closed),
             Err(_) => Err(CommandError::Timeout),
         }
+    }
+
+    /// Close the transport through the broker and report the writer's exit
+    /// status. `None` when the broker is already gone or the close timed out.
+    pub async fn close_transport(&self) -> Option<i32> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(BrokerRequest::Close { reply: tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        let reply = tokio::time::timeout(self.timeout, rx).await.ok()?;
+        reply.ok().flatten()
     }
 }
 

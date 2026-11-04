@@ -4,7 +4,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use linteum_tui::ui::widgets::slash_menu::{render_slash_menu, slash_menu_lines};
 use linteum_tui::ui::{App, Theme};
 use linteum_tui::viewmodel::{
-    Effect, Input, Item, Overlay, SessionView, TuiState, UiAction, UserItem, reduce, slash,
+    ConnectionState, Effect, Input, Item, Overlay, SessionView, TuiState, UiAction, UserItem,
+    reduce, slash,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -31,7 +32,7 @@ fn slash_menu_filters_by_id_and_label() {
     }
     assert_eq!(ids("q"), vec!["quit"]);
     assert_eq!(ids("EXIT"), vec!["exit"]);
-    assert_eq!(ids("session"), vec!["exit"]);
+    assert_eq!(ids("session"), vec!["mode", "exit"]);
     assert!(ids("zzz").is_empty());
     assert_eq!(slash::selected("/", 0).unwrap().id, "files");
     assert_eq!(slash::selected("/q", 99).unwrap().id, "quit");
@@ -116,6 +117,26 @@ fn typing_slash_resets_a_stale_selection() {
     state.slash.selected = 1;
     reduce(&mut state, Input::Text("/".into()));
     assert_eq!(state.slash.selected, 0);
+}
+
+#[test]
+fn slash_plugins_opens_the_panel_and_requests_the_list() {
+    let mut state = TuiState::default();
+    state.connection = ConnectionState::Live;
+    state.features = vec!["plugins".into()];
+    state.composer.text = "/plugins".into();
+    let effects = reduce(&mut state, Input::Action(UiAction::ExecuteSlashCommand));
+    assert_eq!(state.overlay, Some(Overlay::Plugins));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendCommand(command) if command.name == "plugin.list"
+    )));
+}
+
+#[test]
+fn slash_menu_lists_plugins() {
+    assert!(ids("").contains(&"plugins"));
+    assert!(ids("plug").contains(&"plugins"));
 }
 
 #[test]

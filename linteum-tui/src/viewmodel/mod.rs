@@ -6,7 +6,9 @@ pub mod approvals;
 pub mod artifacts;
 pub mod cursor;
 pub mod edit;
+pub mod modes;
 pub mod notices;
+pub mod plugins;
 pub mod queue;
 pub mod sessions;
 pub mod sidebar;
@@ -18,13 +20,18 @@ pub mod transcript;
 pub use approvals::{ApprovalDecision, ApprovalState};
 pub use artifacts::{ArtifactError, ArtifactViewerState};
 pub use cursor::SessionCursor;
+pub use modes::{CurrentMode, ModeOption, ModePickerState, ModeState, ModeSwitchResult};
+pub use plugins::{
+    InvalidPlugin, PluginAction, PluginEntry, PluginError, PluginRow, PluginsState, pending_restart,
+};
 pub use queue::{QueueEntryState, QueueState, QueuedMessage};
 pub use sessions::{NewSessionForm, SessionInfo, SessionPickerState};
 pub use sidebar::{SidebarLayout, SidebarPanel, SidebarState, TreeRow, WorkspaceEntry};
 pub use slash::{SlashCommand, SlashState};
 pub use state::{
-    ActivityEntry, ActivityLog, ComposerState, ConnectionEvent, ConnectionState, Focus, Limits,
-    Overlay, PaletteState, Prefs, QuitMode, SessionView, ThemeChoice, TuiState, UsageView,
+    ActivityEntry, ActivityLog, ComposerState, ConnectionEvent, ConnectionState, Focus,
+    GatewayMode, Limits, Overlay, PaletteState, Prefs, QuitMode, SessionView, ThemeChoice,
+    TuiState, UsageView,
 };
 pub use subagents::{
     ContextMessage, SubagentContextView, SubagentStatus, SubagentView, SubagentsState,
@@ -83,6 +90,21 @@ pub enum UiAction {
     NewSession,
     OpenPalette,
     OpenHelp,
+    OpenModePicker,
+    ModeSelectNext,
+    ModeSelectPrevious,
+    ModeSelect,
+    ModeRefresh,
+    OpenPlugins,
+    PluginSelectNext,
+    PluginSelectPrevious,
+    PluginRefresh,
+    PluginEnable,
+    PluginDisable,
+    PluginConfirm,
+    PluginCancel,
+    PluginRestart,
+    PluginApply,
     Resume,
     Quit,
     ExitSession,
@@ -204,11 +226,16 @@ pub fn reduce(state: &mut TuiState, input: Input) -> Vec<Effect> {
         Input::CommandResult(result) => reduce_command_result(state, &result),
         Input::Connection(event) => {
             let connected = matches!(event, ConnectionEvent::Connected { .. });
-            let reconnected = matches!(event, ConnectionEvent::Reconnected);
+            let reconnected = matches!(event, ConnectionEvent::Reconnected { .. });
             apply_connection(state, event);
             if reconnected {
                 let mut effects = subscribe_effect(state, state.cursor.after_seq());
                 effects.extend(resend_effects(state));
+                if state.connection == ConnectionState::Live {
+                    // No session to replay: we are already Live, so an open
+                    // plugin panel refetches immediately.
+                    effects.extend(plugins::on_live(state));
+                }
                 effects
             } else if connected {
                 session_list_effect(state, 0)
@@ -288,6 +315,33 @@ fn reduce_action(state: &mut TuiState, action: UiAction) -> Vec<Effect> {
             state.overlay = Some(Overlay::Help);
             Vec::new()
         }
+        UiAction::OpenModePicker => modes::open_picker(state),
+        UiAction::ModeSelectNext => {
+            modes::move_selection(state, 1);
+            Vec::new()
+        }
+        UiAction::ModeSelectPrevious => {
+            modes::move_selection(state, -1);
+            Vec::new()
+        }
+        UiAction::ModeSelect => modes::select_current(state),
+        UiAction::ModeRefresh => modes::refresh(state),
+        UiAction::OpenPlugins => plugins::open(state),
+        UiAction::PluginSelectNext => {
+            plugins::move_selection(state, 1);
+            Vec::new()
+        }
+        UiAction::PluginSelectPrevious => {
+            plugins::move_selection(state, -1);
+            Vec::new()
+        }
+        UiAction::PluginRefresh => plugins::refresh(state),
+        UiAction::PluginEnable => plugins::begin_manage(state, PluginAction::Enable),
+        UiAction::PluginDisable => plugins::begin_manage(state, PluginAction::Disable),
+        UiAction::PluginConfirm => plugins::confirm_manage(state),
+        UiAction::PluginCancel => plugins::cancel_manage(state),
+        UiAction::PluginRestart => plugins::begin_restart(state),
+        UiAction::PluginApply => plugins::begin_apply(state),
         UiAction::RetryConnection => vec![Effect::ReconnectNow],
         UiAction::Resume => {
             if state.session.as_ref().map(|s| s.phase.as_str()) == Some("paused") {
@@ -547,11 +601,7 @@ fn submit_new_session(state: &mut TuiState) -> Vec<Effect> {
             Value::String(state.new_session.profile.clone()),
         );
     }
-    vec![Effect::SendCommand(CommandSpec {
-        name: "session.create".to_owned(),
-        args,
-        session_id: None,
-    })]
+    modes::submit_create(state, args)
 }
 
 fn session_list_effect(state: &TuiState, offset: usize) -> Vec<Effect> {
@@ -597,12 +647,44 @@ fn unsubscribe_effect(session_id: &str) -> Effect {
 
 fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Effect> {
     let mut effects = Vec::new();
+    let mut mode_effects = Vec::new();
+    let mut plugin_effects = Vec::new();
     if result.ok {
+        // Gateways that stamp `name` route by command name (D5); the shape
+        // checks below stay as the fallback for old gateways that omit it.
+        match result.name.as_deref() {
+            Some("plugin.list") => {
+                plugin_effects.extend(plugins::apply_list(state, &result.result));
+            }
+            Some("plugin.enable") | Some("plugin.disable") => {
+                plugin_effects.extend(plugins::apply_manage_result(state, &result.result));
+            }
+            Some("plugin.set_allowed") => {
+                plugin_effects.extend(plugins::apply_set_allowed_result(state, &result.result));
+            }
+            _ => {
+                if result.result.get("plugins").is_some() && result.result.get("invalid").is_some()
+                {
+                    plugin_effects.extend(plugins::apply_list(state, &result.result));
+                } else if result.result.get("plugin").is_some()
+                    && result.result.get("changed").is_some()
+                    && result.result.get("restart_required").is_some()
+                {
+                    plugin_effects.extend(plugins::apply_manage_result(state, &result.result));
+                }
+            }
+        }
+        if result.result.get("modes").is_some() {
+            mode_effects.extend(modes::apply_list(state, &result.result));
+        } else if result.result.get("mode").is_some() && result.result.get("changed").is_some() {
+            mode_effects.extend(modes::apply_set_result(state, &result.result));
+        }
         if let Some(context) = result.result.get("context") {
             state.subagents.apply_context_result(context);
         }
         if result.result.get("subscribed").and_then(Value::as_bool) == Some(true) {
             state.connection = ConnectionState::Live;
+            plugin_effects.extend(plugins::on_live(state));
         }
         if result.result.get("sessions").is_some() {
             state.picker.apply_list(result);
@@ -633,8 +715,16 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
         }
     }
     if let Some(error) = &result.error {
+        if error.code.starts_with("E_MODE_") || error.code == "E_SESSION_SUBAGENT" {
+            modes::apply_error(state, &error.code, &error.message);
+        }
         if state.subagents.loading.take().is_some() {
             state.subagents.error = Some(format!("{}: {}", error.code, error.message));
+        }
+        if state.plugins.managing || state.plugins.applying {
+            plugin_effects.extend(plugins::apply_manage_error(state, error));
+        } else if state.plugins.loading {
+            plugins::apply_error(state, error);
         }
         if error.code == "E_SESSION_LOCKED" {
             state.connection = ConnectionState::ReadOnly;
@@ -678,6 +768,8 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
     if let Some(text) = restored {
         state.composer.text = text;
     }
+    effects.extend(plugin_effects);
+    effects.extend(mode_effects);
     effects
 }
 
@@ -945,6 +1037,12 @@ fn exit_session(state: &mut TuiState) -> Vec<Effect> {
 }
 
 fn execute_slash_command(state: &mut TuiState) -> Vec<Effect> {
+    if let Some(effects) = plugins::execute_slash(state) {
+        return effects;
+    }
+    if let Some(effects) = modes::execute_slash(state) {
+        return effects;
+    }
     let Some(command) = slash::selected(&state.composer.text, state.slash.selected) else {
         let input = state.composer.text.clone();
         state.composer.text.clear();
@@ -986,36 +1084,89 @@ fn session_id(state: &TuiState) -> Option<String> {
     state.session.as_ref().map(|session| session.id.clone())
 }
 
+/// A successful connect/reconnect means the `r` retry (or an attach-mode
+/// gateway restart) worked, so dismiss the blocking fatal screen. Only the
+/// fatal overlay is touched; other overlays stay as the user left them.
+fn clear_fatal_overlay(state: &mut TuiState) {
+    if state.overlay == Some(Overlay::Fatal) {
+        state.overlay = None;
+        state.last_error = None;
+        state.child_exit_status = None;
+        state.child_stderr_tail.clear();
+    }
+}
+
 fn apply_connection(state: &mut TuiState, event: ConnectionEvent) {
     match event {
-        ConnectionEvent::Connecting => state.connection = ConnectionState::Connecting,
-        ConnectionEvent::Connected { features, .. } => {
+        ConnectionEvent::Connecting => {
+            state.connection = ConnectionState::Connecting;
+            plugins::on_disconnect(state);
+        }
+        ConnectionEvent::Connected {
+            features,
+            instance_id,
+            ..
+        } => {
+            clear_fatal_overlay(state);
             state.connection = ConnectionState::Live;
             state.features = features;
+            state.gateway_instance = instance_id;
+            if state.gateway_mode == GatewayMode::Spawn {
+                plugins::on_restart_succeeded(state);
+            }
         }
-        ConnectionEvent::Reconnected => state.connection = ConnectionState::Replaying,
+        ConnectionEvent::Reconnected {
+            features,
+            instance_id,
+        } => {
+            clear_fatal_overlay(state);
+            let previous = state.gateway_instance.take();
+            state.features = features;
+            state.gateway_instance = instance_id;
+            state.plugins.stale = true;
+            if state.gateway_instance.is_some() && state.gateway_instance != previous {
+                plugins::on_new_instance(state);
+            }
+            if state.gateway_mode == GatewayMode::Spawn {
+                plugins::on_restart_succeeded(state);
+            }
+            state.connection = if state.session.is_none() {
+                ConnectionState::Live
+            } else {
+                ConnectionState::Replaying
+            };
+        }
         ConnectionEvent::Disconnected {
             retryable: true, ..
         } => {
             state.connection = ConnectionState::Reconnecting {
                 retry_in: Duration::from_secs(1),
-            }
+            };
+            plugins::on_disconnect(state);
         }
         ConnectionEvent::Disconnected {
             retryable: false, ..
-        } => state.connection = ConnectionState::Offline,
+        } => {
+            state.connection = ConnectionState::Offline;
+            plugins::on_disconnect(state);
+        }
         ConnectionEvent::ChildExited {
-            status: _,
+            status,
             stderr_tail,
         } => {
             state.connection = ConnectionState::Fatal;
+            state.child_exit_status = status;
             state.child_stderr_tail = stderr_tail;
             state.overlay = Some(Overlay::Fatal);
+            plugins::on_disconnect(state);
+            plugins::on_restart_failed(state);
         }
         ConnectionEvent::Fatal { error } => {
             state.connection = ConnectionState::Fatal;
             state.last_error = Some(error);
             state.overlay = Some(Overlay::Fatal);
+            plugins::on_disconnect(state);
+            plugins::on_restart_failed(state);
         }
     }
 }

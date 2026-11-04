@@ -12,7 +12,7 @@ use crate::protocol::{CommandResult, ErrorInfo};
 use crate::viewmodel::{CommandSpec, ConnectionEvent, Input, Limits};
 
 use super::Transport;
-use super::broker::{CommandBroker, CommandError};
+use super::broker::{BrokerHandle, CommandBroker, CommandError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -75,6 +75,12 @@ impl Backoff {
 pub trait Connector: Send + Sync {
     async fn connect(&self) -> Result<Box<dyn Transport>, super::TransportError>;
     fn mode(&self) -> Mode;
+
+    /// Recent stderr lines from the spawned gateway child (spawn mode). The
+    /// attach connectors have no child and return nothing (§7.5).
+    fn stderr_tail(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub struct SupervisorConfig {
@@ -86,7 +92,6 @@ pub struct SupervisorConfig {
 pub enum SupervisorExit {
     Closed,
     Fatal(ErrorInfo),
-    ChildExited { status: Option<i32> },
 }
 
 pub fn handshake_spec() -> CommandSpec {
@@ -141,13 +146,14 @@ pub async fn run_supervisor(
             Ok(transport) => transport,
             Err(error) => {
                 if config.connector.mode() == Mode::Spawn {
+                    // The supervisor stays alive so `r`/`q` on the fatal
+                    // screen can restart the child or quit (§7.5).
                     let info = error_info("E_SPAWN_FAILED", error.to_string());
-                    let _ = input_tx
-                        .send(Input::Connection(ConnectionEvent::Fatal {
-                            error: info.clone(),
-                        }))
-                        .await;
-                    return SupervisorExit::Fatal(info);
+                    match spawn_fatal_wait(info, &input_tx, &mut control_rx).await {
+                        WaitOutcome::ReconnectNow => continue,
+                        WaitOutcome::Shutdown => return SupervisorExit::Closed,
+                        WaitOutcome::Timeout => unreachable!("spawn fatal wait has no timeout"),
+                    }
                 }
                 let _ = input_tx
                     .send(Input::Connection(ConnectionEvent::Disconnected {
@@ -163,13 +169,12 @@ pub async fn run_supervisor(
         };
 
         let (broker, handle) = CommandBroker::new(transport, Duration::from_secs(30));
-        let mut broker_task: JoinHandle<()> = tokio::spawn(broker.run(input_tx.clone()));
+        let mut broker_task: JoinHandle<Option<i32>> = tokio::spawn(broker.run(input_tx.clone()));
 
         let hello = handle.send(handshake_spec()).await;
         let result = match hello {
             Ok(result) => result,
             Err(error) => {
-                broker_task.abort();
                 let info = match error {
                     CommandError::Timeout => error_info("E_REQUEST_TIMEOUT", "hello timed out"),
                     CommandError::Transport(message) => error_info("E_TRANSPORT", message),
@@ -180,13 +185,14 @@ pub async fn run_supervisor(
                     }
                 };
                 if config.connector.mode() == Mode::Spawn {
-                    let _ = input_tx
-                        .send(Input::Connection(ConnectionEvent::Fatal {
-                            error: info.clone(),
-                        }))
-                        .await;
-                    return SupervisorExit::Fatal(info);
+                    close_and_join(&handle, &mut broker_task).await;
+                    match spawn_fatal_wait(info, &input_tx, &mut control_rx).await {
+                        WaitOutcome::ReconnectNow => continue,
+                        WaitOutcome::Shutdown => return SupervisorExit::Closed,
+                        WaitOutcome::Timeout => unreachable!("spawn fatal wait has no timeout"),
+                    }
                 }
+                broker_task.abort();
                 let _ = input_tx
                     .send(Input::Connection(ConnectionEvent::Disconnected {
                         reason: info.message.clone(),
@@ -201,8 +207,16 @@ pub async fn run_supervisor(
         };
 
         if result.result.get("protocol").and_then(Value::as_u64) != Some(1) {
-            broker_task.abort();
             let info = error_info("E_PROTOCOL_VERSION", "gateway protocol is not 1");
+            if config.connector.mode() == Mode::Spawn {
+                close_and_join(&handle, &mut broker_task).await;
+                match spawn_fatal_wait(info, &input_tx, &mut control_rx).await {
+                    WaitOutcome::ReconnectNow => continue,
+                    WaitOutcome::Shutdown => return SupervisorExit::Closed,
+                    WaitOutcome::Timeout => unreachable!("spawn fatal wait has no timeout"),
+                }
+            }
+            broker_task.abort();
             let _ = input_tx
                 .send(Input::Connection(ConnectionEvent::Fatal {
                     error: info.clone(),
@@ -223,8 +237,16 @@ pub async fn run_supervisor(
             })
             .unwrap_or_default();
         if let Err(info) = check_features(&features) {
-            broker_task.abort();
             let info = *info;
+            if config.connector.mode() == Mode::Spawn {
+                close_and_join(&handle, &mut broker_task).await;
+                match spawn_fatal_wait(info, &input_tx, &mut control_rx).await {
+                    WaitOutcome::ReconnectNow => continue,
+                    WaitOutcome::Shutdown => return SupervisorExit::Closed,
+                    WaitOutcome::Timeout => unreachable!("spawn fatal wait has no timeout"),
+                }
+            }
+            broker_task.abort();
             let _ = input_tx
                 .send(Input::Connection(ConnectionEvent::Fatal {
                     error: info.clone(),
@@ -234,10 +256,18 @@ pub async fn run_supervisor(
         }
         tracing::info!(?features, "gateway connected");
         let limits = parse_limits(result.result.get("limits"));
+        let instance_id = parse_instance_id(result.result.get("instance_id"));
         let connected = if first_connection {
-            ConnectionEvent::Connected { features, limits }
+            ConnectionEvent::Connected {
+                features,
+                limits,
+                instance_id,
+            }
         } else {
-            ConnectionEvent::Reconnected
+            ConnectionEvent::Reconnected {
+                features,
+                instance_id,
+            }
         };
         let _ = input_tx.send(Input::Connection(connected)).await;
         first_connection = false;
@@ -245,6 +275,10 @@ pub async fn run_supervisor(
 
         let mut reconnect = false;
         let mut shutdown = false;
+        let mut broker_done = false;
+        // The broker task's exit status. Captured when the broker-done branch
+        // fires: a completed `JoinHandle` must not be polled again.
+        let mut broker_status: Option<i32> = None;
         loop {
             tokio::select! {
                 command = command_rx.recv() => {
@@ -293,7 +327,9 @@ pub async fn run_supervisor(
                         }
                     }
                 }
-                _ = &mut broker_task => {
+                status = &mut broker_task => {
+                    broker_done = true;
+                    broker_status = status.ok().flatten();
                     break;
                 }
             }
@@ -302,23 +338,32 @@ pub async fn run_supervisor(
             // Closing the request channel lets the broker call the writer's
             // `close`, which performs the child teardown in spawn mode.
             drop(handle);
-            let _ = tokio::time::timeout(Duration::from_secs(10), broker_task).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), &mut broker_task).await;
             return SupervisorExit::Closed;
         }
-        broker_task.abort();
-
         if reconnect {
+            // Close the old transport and wait for the broker before
+            // respawning: never leave the previous child running (§7.5).
+            close_and_join(&handle, &mut broker_task).await;
             continue;
         }
+        debug_assert!(broker_done);
+        let status = broker_status;
         if config.connector.mode() == Mode::Spawn {
-            tracing::error!("gateway child exited");
+            // The child exited on its own. Report it and stay alive until the
+            // user restarts (`r`) or quits; do not respawn automatically.
+            tracing::error!(?status, "gateway child exited");
             let _ = input_tx
                 .send(Input::Connection(ConnectionEvent::ChildExited {
-                    status: None,
-                    stderr_tail: Vec::new(),
+                    status,
+                    stderr_tail: config.connector.stderr_tail(),
                 }))
                 .await;
-            return SupervisorExit::ChildExited { status: None };
+            match wait_for_spawn_control(&mut control_rx).await {
+                WaitOutcome::ReconnectNow => continue,
+                WaitOutcome::Shutdown => return SupervisorExit::Closed,
+                WaitOutcome::Timeout => unreachable!("spawn control wait has no timeout"),
+            }
         }
 
         let _ = input_tx
@@ -354,6 +399,54 @@ async fn wait_or_control(
     }
 }
 
+/// Wait (without a timeout) for a restart request or shutdown. Spawn-mode
+/// child exits and failures wait here so the fatal screen's `r`/`q` work.
+async fn wait_for_spawn_control(control_rx: &mut mpsc::Receiver<SupervisorControl>) -> WaitOutcome {
+    match control_rx.recv().await {
+        Some(SupervisorControl::RestartChild) | Some(SupervisorControl::ReconnectNow) => {
+            WaitOutcome::ReconnectNow
+        }
+        Some(SupervisorControl::Shutdown) | None => WaitOutcome::Shutdown,
+    }
+}
+
+/// Emit the fatal event and stay alive until the user restarts or quits.
+/// Spawn mode only (§7.5); a failed respawn emits `Fatal` again and waits.
+async fn spawn_fatal_wait(
+    info: ErrorInfo,
+    input_tx: &mpsc::Sender<Input>,
+    control_rx: &mut mpsc::Receiver<SupervisorControl>,
+) -> WaitOutcome {
+    let _ = input_tx
+        .send(Input::Connection(ConnectionEvent::Fatal { error: info }))
+        .await;
+    wait_for_spawn_control(control_rx).await
+}
+
+/// Close the transport through the broker and wait (bounded) for the broker
+/// task to end. A stuck broker is aborted; dropping its writer then triggers
+/// the best-effort child kill in `StdioChildWriter::drop`.
+async fn close_and_join(handle: &BrokerHandle, broker_task: &mut JoinHandle<Option<i32>>) {
+    let _ = handle.close_transport().await;
+    if tokio::time::timeout(Duration::from_secs(10), &mut *broker_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("broker did not stop after transport close; aborting");
+        broker_task.abort();
+    }
+}
+
+/// Read the optional `hello` instance id. Pre-v0.4 gateways omit it; a blank
+/// string is treated the same as absent so a malformed value never looks like
+/// a real gateway identity.
+fn parse_instance_id(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 fn parse_limits(value: Option<&Value>) -> Limits {
     let object = value.and_then(Value::as_object);
     let field = |name: &str| {
@@ -385,6 +478,7 @@ fn synthetic_error(error: CommandError) -> CommandResult {
         ok: false,
         result: Value::Null,
         error: Some(error_info(code, error.to_string())),
+        name: None,
     }
 }
 

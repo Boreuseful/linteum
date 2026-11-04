@@ -63,6 +63,10 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
+    /// Initial session mode (name or id) passed to `session.create`.
+    #[arg(long, value_name = "NAME")]
+    pub mode: Option<String>,
+
     /// Explicit TUI preferences file.
     #[arg(long, value_name = "PATH")]
     pub tui_config: Option<PathBuf>,

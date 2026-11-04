@@ -247,6 +247,7 @@ class AgentClient:
         *,
         session_id: Optional[str] = None,
         profile: Optional[str] = None,
+        mode: Optional[str] = None,
         title: Optional[str] = None,
         metadata: Optional[Mapping] = None,
     ) -> dict:
@@ -255,11 +256,51 @@ class AgentClient:
             args["session_id"] = session_id
         if profile is not None:
             args["profile"] = profile
+        if mode is not None:
+            args["mode"] = mode
         if title is not None:
             args["title"] = title
         if metadata is not None:
             args["metadata"] = dict(metadata)
         return await self.command("session.create", args)
+
+    async def list_modes(self) -> dict:
+        return await self.command("mode.list", {})
+
+    async def list_plugins(self) -> dict:
+        return await self.command("plugin.list", {})
+
+    async def set_plugin_allowed(
+        self, ids: Iterable[str], mode: str = "deferred",
+    ) -> dict:
+        """Rewrite the runtime allowlist (§5.6); requires local + manage."""
+        return await self.command(
+            "plugin.set_allowed", {"ids": list(ids), "mode": mode},
+        )
+
+    async def load_plugin(self, plugin_id: str) -> dict:
+        """Load one allowed plugin for this process (§5.6)."""
+        return await self.command("plugin.load", {"id": plugin_id})
+
+    async def unload_plugin(
+        self, plugin_id: str, *, grace_ms: Optional[int] = None,
+    ) -> dict:
+        """Quiesce, drain and revoke one active plugin (§5.6)."""
+        args: dict = {"id": plugin_id}
+        if grace_ms is not None:
+            args["grace_ms"] = grace_ms
+        return await self.command("plugin.unload", args)
+
+    async def reload_plugin(self, plugin_id: str) -> dict:
+        """Unload (when active) and load one plugin again (§5.6)."""
+        return await self.command("plugin.reload", {"id": plugin_id})
+
+    async def set_mode(self, session_id: str, mode: str) -> dict:
+        return await self.command(
+            "session.mode.set",
+            {"session_id": session_id, "mode": mode},
+            session_id=session_id,
+        )
 
     async def list_sessions(self, *, limit: int = 50, offset: int = 0,
                             workspace: Optional[str] = None) -> dict:

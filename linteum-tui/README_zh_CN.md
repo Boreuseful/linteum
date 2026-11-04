@@ -214,6 +214,7 @@ TUI 的配置优先级为：命令行参数 > 环境变量 > TUI TOML > Python
 | `/info` | 显示信息面板。 |
 | `/subagents` | 在侧边栏显示子代理状态。 |
 | `/refresh` | 重新加载工作区目录树。 |
+| `/plugins` | 查看插件；网关允许管理时用 `Ctrl+E`/`Ctrl+D` 持久启用/禁用。 |
 | `/exit` | 离开当前会话。 |
 | `/quit` | 退出 `linteum-tui`。 |
 

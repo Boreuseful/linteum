@@ -33,6 +33,54 @@ fn result_deserializes() {
 }
 
 #[test]
+fn result_deserializes_with_name() {
+    let line = r#"{"v":1,"kind":"result","id":"r-1","reply_to":"c-1","ok":true,"result":{"plugins":[]},"name":"plugin.list"}"#;
+    match decode_envelope(line).unwrap() {
+        Envelope::Result(result) => {
+            assert_eq!(result.reply_to, "c-1");
+            assert_eq!(result.name.as_deref(), Some("plugin.list"));
+        }
+        other => panic!("expected result, got {other:?}"),
+    }
+}
+
+#[test]
+fn result_without_name_deserializes_none() {
+    let line = r#"{"v":1,"kind":"result","id":"r-1","reply_to":"c-1","ok":true,"result":{}}"#;
+    match decode_envelope(line).unwrap() {
+        Envelope::Result(result) => assert!(result.name.is_none()),
+        other => panic!("expected result, got {other:?}"),
+    }
+}
+
+#[test]
+fn hello_result_with_instance_id_decodes() {
+    let line = r#"{"v":1,"kind":"result","id":"r-1","reply_to":"c-1","ok":true,"result":{"protocol":1,"features":["view","replay"],"limits":{},"instance_id":"gw-1"}}"#;
+    match decode_envelope(line).unwrap() {
+        Envelope::Result(result) => {
+            assert!(result.ok);
+            assert_eq!(result.result["protocol"], 1);
+            assert_eq!(result.result["instance_id"], "gw-1");
+        }
+        other => panic!("expected result, got {other:?}"),
+    }
+}
+
+#[test]
+fn hello_result_without_instance_id_decodes() {
+    // Pre-v0.4 gateways omit `instance_id`; the wire shape must still decode.
+    let line = r#"{"v":1,"kind":"result","id":"r-1","reply_to":"c-1","ok":true,"result":{"protocol":1,"features":["view","replay"],"limits":{}}}"#;
+    match decode_envelope(line).unwrap() {
+        Envelope::Result(result) => {
+            assert!(result.ok);
+            assert_eq!(result.result["protocol"], 1);
+            assert!(result.result.get("instance_id").is_none());
+        }
+        other => panic!("expected result, got {other:?}"),
+    }
+}
+
+#[test]
 fn frame_deserializes_optional_fields() {
     let line = r#"{"v":1,"kind":"frame","id":"f-1","frame":"assistant.delta","payload":{"text":"hi"},"session_id":"s-1","seq":7,"ephemeral":true,"replay":false,"ordinal":0}"#;
     match decode_envelope(line).unwrap() {
@@ -77,4 +125,41 @@ fn error_frame_deserializes() {
         Envelope::Error(error) => assert_eq!(error.error_info.code, "E_INTERNAL"),
         other => panic!("expected error, got {other:?}"),
     }
+}
+
+#[test]
+fn plugin_manage_commands_carry_only_an_id() {
+    for (name, id) in [
+        ("plugin.enable", "acme.search"),
+        ("plugin.disable", "acme.search"),
+    ] {
+        let encoded = encode_command(&command(
+            "c-03",
+            name,
+            serde_json::json!({"id": id}).as_object().unwrap().clone(),
+            None,
+        ))
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["kind"], "cmd");
+        assert_eq!(value["name"], name);
+        assert_eq!(value["args"], serde_json::json!({"id": id}));
+        assert!(value.get("session_id").is_none());
+    }
+}
+
+#[test]
+fn plugin_list_command_has_no_session_or_args() {
+    let encoded = encode_command(&command(
+        "c-02",
+        "plugin.list",
+        serde_json::Map::new(),
+        None,
+    ))
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(value["kind"], "cmd");
+    assert_eq!(value["name"], "plugin.list");
+    assert_eq!(value["args"], serde_json::json!({}));
+    assert!(value.get("session_id").is_none());
 }

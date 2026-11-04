@@ -20,6 +20,14 @@ pub fn new_session_lines(state: &TuiState, theme: &Theme) -> Vec<Line<'static>> 
         Line::from("           path on the gateway host (attach mode)"),
         Line::from(format!("Title      [{} ]", form.title)),
         Line::from(format!("Profile    {} (read-only)", form.profile)),
+        Line::from(format!(
+            "Mode       {} (read-only)",
+            if form.mode.trim().is_empty() {
+                "host default".to_owned()
+            } else {
+                form.mode.clone()
+            }
+        )),
         Line::from(""),
         Line::from(if let Some(error) = &form.error {
             Span::styled(error.clone(), theme.danger)
