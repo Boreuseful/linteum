@@ -33,6 +33,7 @@ from ..config.schema import ConfigError
 from ..runtime.state import phases
 from .errors import (
     E_APPROVAL_GONE,
+    E_BACKGROUND_DISABLED,
     E_BAD_FRAME,
     E_BUSY,
     E_INTERNAL,
@@ -498,7 +499,7 @@ class SessionGateway:
         """Route one validated command; returns the ``result`` payload."""
         if self.read_only and cmd.name in (
             "user.message", "user.interrupt", "agent.resume",
-            "session.mode.set",
+            "session.mode.set", "session.task.stop",
         ):
             raise GatewayError(
                 E_SESSION_LOCKED,
@@ -559,6 +560,10 @@ class SessionGateway:
                 return await self._artifact(cmd, connection)
             if cmd.name == "session.context":
                 return await self._context()
+            if cmd.name == "session.tasks":
+                return self._tasks_result()
+            if cmd.name == "session.task.stop":
+                return await self._task_stop(cmd, connection)
             if cmd.name == "session.get":
                 return {"session_id": self.session_id, "snapshot": self.snapshot()}
         raise GatewayError(
@@ -878,6 +883,40 @@ class SessionGateway:
         target = function if isinstance(function, dict) else schema
         name = target.get("name")
         return name if isinstance(name, str) else None
+
+    # -- background tasks (§15.2) -----------------------------------------
+    def _require_background(self) -> None:
+        if not self.host.current_config().agent.background.enabled:
+            raise GatewayError(
+                E_BACKGROUND_DISABLED,
+                "background tasks are disabled by the host",
+                location=LOCATION_SESSION,
+            )
+
+    def _tasks_result(self) -> dict:
+        self._require_background()
+        return {
+            "session_id": self.session_id,
+            "tasks": [dict(info) for _, info in self._state.background],
+        }
+
+    async def _task_stop(
+        self, cmd: Command, connection: "ClientConnection",
+    ) -> dict:
+        self._require_background()
+        task_id = cmd.args["task_id"]
+        committed = await self._publish(Event.create(
+            "background.cancel.requested",
+            {
+                "task_id": task_id,
+                "reason": cmd.args.get("reason") or "client stop",
+                "requested_by": "client",
+                "client_id": connection.id,
+            },
+            session_id=self.session_id,
+            trace_id=cmd.trace_id,
+        ))
+        return {**_receipt(committed), "task_id": task_id}
 
     # -- subscribe / replay ----------------------------------------------
     async def _subscribe(self, cmd: Command, connection: "ClientConnection") -> dict:

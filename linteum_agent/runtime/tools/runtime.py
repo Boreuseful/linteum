@@ -37,6 +37,7 @@ from ...bus.scheduler.cancel import Cancelled, CancelToken
 from ...bus.scheduler.pool import WorkerPool
 from .errors import (
     E_BAD_ARGS,
+    E_BACKGROUND_SPEC_CHANGED,
     E_CANCELLED,
     E_DENIED,
     E_PLUGIN_UNLOADING,
@@ -79,6 +80,7 @@ class ToolRuntime:
         approval_policy: str = "ask",
         approval_policy_for: Optional[Callable[[str], Optional[str]]] = None,
         auto_approve: Collection[str] = (),
+        max_background_timeout: float = 86400.0,
     ) -> None:
         if approval_policy not in ("ask", "allow", "deny"):
             raise ValueError(
@@ -109,6 +111,8 @@ class ToolRuntime:
         chosen = artifacts if artifacts is not None else getattr(bus, "artifacts", None)
         self.artifacts = chosen if chosen is not None else NullArtifactStore()
         self.inline_limit = inline_limit
+        #: Upper bound for ``background: true`` timeouts (``0`` = no clamp).
+        self.max_background_timeout = float(max_background_timeout or 0.0)
         # Sharing the bus pool makes ``bus.wait_until_idle()`` cover tool work;
         # inject a private pool to isolate tool concurrency from event dispatch.
         self.pool = pool if pool is not None else getattr(bus, "pool", None) or WorkerPool(DEFAULT_POOL_SIZE)
@@ -119,6 +123,9 @@ class ToolRuntime:
         self._sessions: dict[str, str] = {}
         #: ``call_id -> tool name`` for the drain bookkeeping (§8.10).
         self._names: dict[str, str] = {}
+        #: ``call_id`` values issued by the background manager (``background``
+        #: payload flag).  Used by cancel scopes and terminal echo (§9.1/§9.2).
+        self._background: set[str] = set()
 
         if auto_subscribe:
             self.subscribe()
@@ -136,6 +143,12 @@ class ToolRuntime:
         call_id = ev.payload.get("call_id")
         if not name or not call_id:
             return  # malformed intent — nothing to pair (I3 only binds well-formed calls)
+
+        #: Background calls were approved by ``BackgroundTaskManager`` during the
+        #: ``start`` handshake.  ``approved`` alone is never trusted: only
+        #: ``background and approved`` skips the gate (§9.1).
+        background = bool(ev.payload.get("background"))
+        approved = bool(ev.payload.get("approved"))
 
         try:
             registry = await self._registry_for_session(ev.session_id)
@@ -155,11 +168,28 @@ class ToolRuntime:
         # ② immediate acknowledgement so the UI knows the call was accepted
         await self.bus.publish(ev.child("tool.call.started", {
             "call_id": call_id, "name": name, "side_effect": spec.side_effect,
+            "background": background,
         }))
 
-        # ③ approval-gated: suspend, do not execute
+        # ②b spec pinning: a background task must run the implementation that was
+        # approved at ``start`` time.  A mode/plugin change fails the task cleanly
+        # instead of silently executing new code (§9.1 / R6).
+        expected_digest = ev.payload.get("spec_digest")
+        if background and expected_digest:
+            if spec.stable_digest() != expected_digest:
+                await self._fail(
+                    ev, call_id,
+                    f"tool spec changed since start: {name}",
+                    E_BACKGROUND_SPEC_CHANGED,
+                    retryable=False,
+                )
+                return
+
+        # ③ approval-gated: suspend, do not execute.  A background call has
+        # already passed the manager's approval handshake.
         policy = await self._effective_approval_policy(ev.session_id)
-        if spec.requires_approval and policy != "allow":
+        gate = spec.requires_approval and policy != "allow"
+        if gate and not (background and approved):
             if policy == "deny":
                 await self._fail(ev, call_id,
                                  f"approval required but policy is 'deny': {name}",
@@ -202,6 +232,8 @@ class ToolRuntime:
         self.tokens[call_id] = token
         self._sessions[call_id] = ev.session_id
         self._names[call_id] = spec.name
+        if ev.payload.get("background"):
+            self._background.add(call_id)
         task = self.pool.spawn(self._execute(ev, spec, token, registry), session_id=ev.session_id)
         self.inflight[call_id] = task
 
@@ -252,6 +284,19 @@ class ToolRuntime:
     async def _execute(self, ev, spec, token: CancelToken, registry=None) -> None:
         call_id = ev.payload["call_id"]
         reg = self.reg if registry is None else registry
+        background = bool(ev.payload.get("background"))
+        timeout = spec.timeout
+        if background:
+            # Only the manager may widen a background call; foreground args can
+            # never raise their own timeout (§9.3).
+            override = ev.payload.get("timeout_s")
+            if override is not None:
+                try:
+                    timeout = float(override)
+                except (TypeError, ValueError):
+                    timeout = spec.timeout
+            if self.max_background_timeout > 0:
+                timeout = min(timeout, self.max_background_timeout)
         try:
             cached = await self.results.get(call_id)          # idempotency: check first
             if cached is not None:
@@ -261,10 +306,12 @@ class ToolRuntime:
             args = spec.validate(ev.payload.get("args") or {})  # schema check
 
             async def progress(payload: dict) -> None:
-                await self.bus.publish(ev.child("tool.output.delta", {"call_id": call_id, **payload}))
+                await self.bus.publish(ev.child("tool.output.delta", {
+                    "call_id": call_id, "background": background, **payload,
+                }))
 
-            async with reg.semaphore(spec.name):              # per-tool concurrency gate
-                async with asyncio.timeout(spec.timeout):    # hard timeout
+            async with reg.semaphore(spec.name, background=background):
+                async with asyncio.timeout(timeout):          # hard timeout
                     out = await self.sandbox.run(spec, args, token, progress, call_id=call_id)
             result = {"ok": True, "output": self._normalise(out)}
         except asyncio.CancelledError:                        # I19 — never swallow
@@ -278,7 +325,7 @@ class ToolRuntime:
             result = self._error(E_CANCELLED, "cancelled", exc=exc,
                                  location=LOCATION_EXECUTE, enters_history=False)
         except TimeoutError as exc:
-            result = self._error(E_TIMEOUT, f"timeout after {spec.timeout}s", exc=exc,
+            result = self._error(E_TIMEOUT, f"timeout after {timeout}s", exc=exc,
                                  location=LOCATION_EXECUTE, retryable=True)
         except ValidationError as exc:
             result = {"ok": False, **exc.as_payload(location=LOCATION_EXECUTE)}
@@ -294,6 +341,11 @@ class ToolRuntime:
         self.tokens.pop(call_id, None)
         self._sessions.pop(call_id, None)
         self._names.pop(call_id, None)
+        self._background.discard(call_id)
+        # Echo the request markers so BackgroundTaskManager can recognise the
+        # terminal as its own (T4 / §6.5).
+        background = bool(ev.payload.get("background"))
+        start_call_id = ev.payload.get("start_call_id")
 
         ok = bool(result.get("ok"))
         if ok:
@@ -310,13 +362,22 @@ class ToolRuntime:
             await self.results.put(call_id, result)           # idempotency: record after
 
         etype = "tool.call.completed" if ok else "tool.call.failed"
-        await self.bus.publish(ev.child(etype, {
-            "call_id": call_id, "name": ev.payload.get("name"), "dedup": dedup, **result,
-        }))
+        payload = {
+            "call_id": call_id, "name": ev.payload.get("name"),
+            "dedup": dedup, **result,
+        }
+        if background:
+            payload["background"] = True
+        if start_call_id:
+            payload["start_call_id"] = start_call_id
+        await self.bus.publish(ev.child(etype, payload))
 
-    async def _fail(self, ev, call_id, message: str, code: str, *, exc=None) -> None:
+    async def _fail(self, ev, call_id, message: str, code: str, *,
+                    exc=None, retryable: Optional[bool] = None) -> None:
+        if retryable is None:
+            retryable = code == E_PLUGIN_UNLOADING
         info = error_info(code, source=ErrorSource.TOOL.value, location=LOCATION_ON_CALL,
-                          message=message, exc=exc, retryable=(code == E_PLUGIN_UNLOADING))
+                          message=message, exc=exc, retryable=retryable)
         await self._finish(ev, call_id,
                            {"ok": False, "code": code, "error": message, "error_info": info.to_dict()})
 
@@ -330,8 +391,26 @@ class ToolRuntime:
             await self._cancel_call(call_id)
             return
         session_id = ev.payload.get("session_id") or ev.session_id
-        self.approvals.cancel(session_id=session_id)
-        for cid in [c for c, s in self._sessions.items() if s == session_id]:
+        # ``scope`` is a pure additive field (§9.2): omitting it keeps the
+        # historical "cancel every foreground call" behaviour.
+        scope = ev.payload.get("scope") or "foreground"
+        if scope == "background":
+            matches = [
+                cid for cid, sid in self._sessions.items()
+                if sid == session_id and cid in self._background
+            ]
+        elif scope == "all":
+            self.approvals.cancel(session_id=session_id)
+            matches = [cid for cid, sid in self._sessions.items() if sid == session_id]
+        else:  # foreground (default, backward compatible)
+            # A background start's approval also belongs to the foreground
+            # scope, so session-level invalidation stays unchanged (§9.2).
+            self.approvals.cancel(session_id=session_id)
+            matches = [
+                cid for cid, sid in self._sessions.items()
+                if sid == session_id and cid not in self._background
+            ]
+        for cid in matches:
             await self._cancel_call(cid)
 
     async def _cancel_call(self, call_id: str) -> None:

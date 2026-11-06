@@ -25,6 +25,20 @@ from typing import Optional
 from ...bus.event import INLINE_LIMIT, Event
 from . import phases
 
+#: Fixed reducer-side retention for terminal background tasks.  This is a
+#: **constant**, not host configuration, so replay is identical regardless of
+#: the process's current ``agent.background.max_terminal_tasks`` (§7.1 / R7).
+BACKGROUND_TERMINAL_RETAIN = 32
+
+#: Task states the background manager may publish.  ``terminal`` is an internal
+#: manager state only; the reducer sees one of the concrete terminal statuses.
+BACKGROUND_STATUSES = frozenset({
+    "running", "stopping", "completed", "failed", "stopped", "lost",
+})
+BACKGROUND_TERMINAL_STATUSES = frozenset({
+    "completed", "failed", "stopped", "lost",
+})
+
 
 @dataclass
 class Budget:
@@ -97,6 +111,21 @@ class AgentState:
     #: parent budget.  Monotone: guarantees at-most-once accounting on replay or
     #: duplicate terminals (subagent design §6.4 / S13).
     subagent_usage_accounted: set = field(default_factory=set)
+    #: ``call_id`` subset of ``pending`` routed to ``background.*`` (the
+    #: ``start`` / ``stop`` / ``list_tasks`` calls).  Task ids never enter
+    #: ``pending`` (async ReAct design v0.1 T3).
+    pending_background: set = field(default_factory=set)
+    #: ``task_id -> {task_id,name,kind,status,start_call_id,started_seq,
+    #: finished_seq,output_ref,code,error}``.  Only references/summaries are
+    #: stored — never the full task output (§7.1 / I11).
+    background: dict = field(default_factory=dict)
+    #: Background task ids whose subagent usage was added to the parent budget.
+    #: Monotone, so duplicate/replayed terminals are counted at most once.
+    background_usage_accounted: set = field(default_factory=set)
+    #: Messages that arrived while a reasoning step was in flight.  They are
+    #: flushed into ``messages`` immediately before the next request so provider
+    #: message ordering stays ``assistant(tool_calls) → tool → user`` (D7).
+    step_inbox: list = field(default_factory=list)
     cancelled: set = field(default_factory=set)        # call_ids voided by an interrupt (§16.3)
     interrupt_pending: bool = False                    # awaiting an interrupted LLM completion to tag
     plan: list = field(default_factory=list)
@@ -142,10 +171,58 @@ class AgentState:
                 "S3: pending_subagents is not a subset of pending "
                 f"{sorted(self.pending_subagents - self.pending)}"
             )
+        if not self.pending_background <= self.pending:  # B1 (§7.1)
+            problems.append(
+                "B1: pending_background is not a subset of pending "
+                f"{sorted(self.pending_background - self.pending)}"
+            )
+        if self.phase == phases.IDLE:
+            if self.pending_background:  # T5
+                problems.append(
+                    "T5: idle with non-empty pending_background "
+                    f"{sorted(self.pending_background)}"
+                )
+            if self.step_inbox:  # T5
+                problems.append(
+                    f"T5: idle with non-empty step_inbox ({len(self.step_inbox)})"
+                )
+        for task_id, meta in self.background.items():
+            if not isinstance(meta, dict):
+                problems.append(f"B2: background[{task_id!r}] is not a mapping")
+                continue
+            if meta.get("task_id") != task_id:
+                problems.append(
+                    f"B2: background[{task_id!r}].task_id is "
+                    f"{meta.get('task_id')!r}"
+                )
+            status = meta.get("status")
+            if status not in BACKGROUND_STATUSES:
+                problems.append(
+                    f"B2: background[{task_id!r}] has status {status!r}"
+                )
+            if status in BACKGROUND_TERMINAL_STATUSES:
+                started = meta.get("started_seq")
+                finished = meta.get("finished_seq")
+                try:
+                    if int(finished) < int(started):
+                        problems.append(
+                            f"B2: background[{task_id!r}] finished_seq "
+                            f"{finished} < started_seq {started}"
+                        )
+                except (TypeError, ValueError):
+                    problems.append(
+                        f"B2: background[{task_id!r}] has invalid seq metadata"
+                    )
         for index, msg in enumerate(self.messages):
             size = len(json.dumps(msg, ensure_ascii=False).encode("utf-8"))
             if size > INLINE_LIMIT:  # I15
                 problems.append(f"I15: message[{index}] is {size}B > {INLINE_LIMIT}B")
+        for index, msg in enumerate(self.step_inbox):
+            size = len(json.dumps(msg, ensure_ascii=False).encode("utf-8"))
+            if size > INLINE_LIMIT:  # I15 / T5
+                problems.append(
+                    f"I15: step_inbox[{index}] is {size}B > {INLINE_LIMIT}B"
+                )
         last_to = 0
         for index, record in enumerate(self.compactions):
             try:
@@ -184,6 +261,33 @@ class AgentState:
         self.tokens_used += int(input_tokens) + int(output_tokens)
         self.usd_used += float(usd)
 
+    # -- background helpers -------------------------------------------------
+    def background_running_ids(self) -> list:
+        """Task ids still running/stopping, in deterministic order."""
+        return sorted(
+            task_id for task_id, meta in self.background.items()
+            if meta.get("status") in ("running", "stopping")
+        )
+
+    def prune_background(self, *, keep_task_id: Optional[str] = None) -> None:
+        """Keep at most :data:`BACKGROUND_TERMINAL_RETAIN` terminal tasks.
+
+        Running/stopping tasks are never pruned.  ``keep_task_id`` exempts the
+        task this reducer step is processing so its notification can still read
+        the metadata (§7.5).
+        """
+        terminal = [
+            (int(meta.get("finished_seq") or 0), task_id)
+            for task_id, meta in self.background.items()
+            if meta.get("status") in BACKGROUND_TERMINAL_STATUSES
+            and task_id != keep_task_id
+        ]
+        overflow = len(terminal) - BACKGROUND_TERMINAL_RETAIN
+        if overflow <= 0:
+            return
+        for _, task_id in sorted(terminal)[:overflow]:
+            self.background.pop(task_id, None)
+
     # -- (de)serialisation --------------------------------------------------
     def to_dict(self) -> dict:
         return {
@@ -194,6 +298,10 @@ class AgentState:
             "pending": sorted(self.pending),
             "pending_subagents": sorted(self.pending_subagents),
             "subagent_usage_accounted": sorted(self.subagent_usage_accounted),
+            "pending_background": sorted(self.pending_background),
+            "background": {task_id: dict(meta) for task_id, meta in self.background.items()},
+            "background_usage_accounted": sorted(self.background_usage_accounted),
+            "step_inbox": [dict(message) for message in self.step_inbox],
             "cancelled": sorted(self.cancelled),
             "interrupt_pending": self.interrupt_pending,
             "plan": self.plan,
@@ -225,6 +333,15 @@ class AgentState:
             pending=set(data.get("pending", [])),
             pending_subagents=set(data.get("pending_subagents", [])),
             subagent_usage_accounted=set(data.get("subagent_usage_accounted", [])),
+            pending_background=set(data.get("pending_background", [])),
+            background={
+                str(task_id): dict(meta)
+                for task_id, meta in (data.get("background") or {}).items()
+            },
+            background_usage_accounted=set(
+                data.get("background_usage_accounted", [])
+            ),
+            step_inbox=[dict(message) for message in data.get("step_inbox", [])],
             cancelled=set(data.get("cancelled", [])),
             interrupt_pending=bool(data.get("interrupt_pending", False)),
             plan=list(data.get("plan", [])),

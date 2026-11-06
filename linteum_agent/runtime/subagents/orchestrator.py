@@ -69,6 +69,8 @@ class _ActiveChild:
     last_tool: Optional[str] = None
     tokens_input: int = 0
     tokens_output: int = 0
+    background: bool = False
+    start_call_id: Optional[str] = None
 
 
 class SubagentOrchestrator:
@@ -198,6 +200,8 @@ class SubagentOrchestrator:
                 environment=str(payload.get("environment") or ""),
                 expected_output=str(payload.get("expected_output") or ""),
                 policy=policy,
+                background=bool(payload.get("background")),
+                start_call_id=payload.get("start_call_id"),
             )
             self._waiting[ev.session_id] = self._waiting.get(ev.session_id, 0) + 1
             self._task_parent[call_id] = ev.session_id
@@ -207,7 +211,11 @@ class SubagentOrchestrator:
                 lambda _t, cid=call_id: self._tasks.pop(cid, None)
             )
         except SubagentError as exc:
-            await self._fail_spawn(call_id, context, exc, title=title)
+            await self._fail_spawn(
+                call_id, context, exc, title=title,
+                background=bool(payload.get("background")),
+                start_call_id=payload.get("start_call_id"),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - errors are data (P4)
@@ -216,6 +224,8 @@ class SubagentOrchestrator:
                 SubagentError(E_SUBAGENT_FAILED,
                               f"{type(exc).__name__}: {exc}", context=context),
                 title=title,
+                background=bool(payload.get("background")),
+                start_call_id=payload.get("start_call_id"),
             )
 
     def on_cancel(self, ev: Event) -> None:
@@ -346,6 +356,8 @@ class SubagentOrchestrator:
                 {"parent_session_id": parent_id, "call_id": task.call_id},
                 exc,
                 title=task.title,
+                background=task.background,
+                start_call_id=task.start_call_id,
             )
         except Exception as exc:  # noqa: BLE001 - errors are data (P4)
             await self._fail_spawn(
@@ -357,6 +369,8 @@ class SubagentOrchestrator:
                              "call_id": task.call_id},
                 ),
                 title=task.title,
+                background=task.background,
+                start_call_id=task.start_call_id,
             )
         finally:
             if acquired:
@@ -403,6 +417,8 @@ class SubagentOrchestrator:
             task=task,
             policy=policy,
             started_at=self.clock(),
+            background=task.background,
+            start_call_id=task.start_call_id,
         )
         self._active[child.session_id] = active
         try:
@@ -681,6 +697,8 @@ class SubagentOrchestrator:
         exc: SubagentError,
         *,
         title: str = "",
+        background: bool = False,
+        start_call_id: Optional[str] = None,
     ) -> None:
         if self._closed:
             return
@@ -705,6 +723,9 @@ class SubagentOrchestrator:
                 "usage": {"input_tokens": 0, "output_tokens": 0, "usd": 0.0},
                 "rounds": 0,
                 "duration_ms": 0,
+                **({"background": True} if background else {}),
+                **({"start_call_id": start_call_id}
+                   if start_call_id is not None else {}),
             },
             session_id=parent_id,
             trace_id=trace_id,
@@ -715,6 +736,13 @@ class SubagentOrchestrator:
     ) -> None:
         if self._closed:
             return
+        if active.background:
+            # Pass the async ReAct markers through every ``subagent.*`` fact so
+            # the parent reducer can tell manager-owned work from foreground
+            # delegation (async ReAct design v0.1 §9.5).
+            payload = {**payload, "background": True}
+            if active.start_call_id is not None:
+                payload["start_call_id"] = active.start_call_id
         await self.bus.publish(Event.create(
             etype,
             payload,

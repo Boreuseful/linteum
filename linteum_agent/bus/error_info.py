@@ -49,6 +49,7 @@ class ErrorSource(str, Enum):
     SANDBOX = "sandbox"
     AGENT = "agent"
     SUBAGENT = "subagent"
+    BACKGROUND = "background"
     CONTEXT = "context"
     STORAGE = "storage"
     PLUGIN = "plugin"

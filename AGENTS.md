@@ -8,6 +8,8 @@ runtime. Change the library only.
 - `linteum_agent/bus/` — Event envelope, RCU router, per-origin WFQ, WAL,
   artifacts, backpressure/coalescing, namespace guards, metrics.
 - `linteum_agent/runtime/agent.py` — pure Agent reducer.
+- `linteum_agent/runtime/background/` — `BackgroundTaskManager`: async ReAct
+  `start`/`stop`/`list_tasks` lifecycle, approval handshake, recovery.
 - `linteum_agent/runtime/state/` — AgentState, phase machine, checkpoints.
 - `linteum_agent/runtime/context.py` — derived ContextPlan + deterministic digest.
 - `linteum_agent/runtime/compaction.py` — deterministic context summary effect.
@@ -133,6 +135,18 @@ change requires breaking one, stop and redesign the change.
   code. An allowlist supplied by an environment override is rejected with
   `E_PLUGIN_CONFIG`. The TUI gates `Ctrl+E`/`Ctrl+D` on both the
   `plugins.manage` feature and `plugin.list.manage`.
+- Async ReAct / background tasks (`agent.background.enabled`, default **off**):
+  `start`/`stop`/`list_tasks` are host-reserved names routed by the Agent, not
+  `ToolSpec` entries. `BackgroundTaskManager` is the sole `background.*`
+  subscriber; `ToolRuntime` and `SubagentOrchestrator` stay the sole subscribers
+  of their own intent events and only echo `background`/`start_call_id`.
+  Background work is process-local: restart recovery publishes `lost`, never
+  re-executes. `state.pending_background` holds only start/stop/list call ids;
+  `state.background` holds references only. Task terminals are user-role
+  notification messages (never `tool` messages), and `state.step_inbox` defers
+  user messages/notifications until the current step's tool results are paired.
+  `on_user` while busy buffers instead of pre-empting. Replay is WAL-derived:
+  `replay_state` never needs `background_tools` or `auto_continue`.
 - Cross-session memory, retrieval/RAG and CQRS projections beyond the session
   catalogue are not implemented yet. Do not assume their APIs exist.
 

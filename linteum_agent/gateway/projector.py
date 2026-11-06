@@ -31,6 +31,10 @@ from ..runtime.state import phases
 STREAMING_LIMIT = 4 * 1024
 #: Maximum characters of tool args / output inlined into a view frame (§6.9).
 PREVIEW_LIMIT = 2 * 1024
+#: Deterministic retention of terminal background tasks in the view.  Mirrors
+#: ``AgentState``'s fixed reducer constant so history replay agrees (§15.1).
+PROJECTOR_BACKGROUND_RETAIN = 32
+_BACKGROUND_TERMINALS = ("completed", "failed", "stopped", "lost")
 
 #: Phase names used by the view.  A handful of states exist only in the view.
 VIEW_AWAITING_APPROVAL = phases.AWAITING_APPROVAL
@@ -66,6 +70,11 @@ class ProjectorState:
     context_digest: Optional[str] = None
     last_error: Optional[dict] = None
     tool_names: tuple = ()                 # ((call_id, name), ...)
+    #: ``((task_id, info), ...)`` for background tasks.  Background tasks are
+    #: **not** part of ``pending`` and never make the session busy (§15.1).
+    background: tuple = ()
+    background_running: int = 0
+    background_task_ids: tuple = ()
     #: Current mode summary (``name``/``source``/``digest``/``refresh``).
     mode: Optional[dict] = None
     #: Request ids whose final ``llm.*`` event has already been projected.  A
@@ -88,6 +97,9 @@ class ProjectorState:
 
     def approval(self, call_id: str) -> Optional[dict]:
         return dict(self.pending_approvals).get(call_id)
+
+    def background_task(self, task_id: str) -> Optional[dict]:
+        return dict(self.background).get(task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +137,20 @@ def _append_partial(current: Optional[str], chunk: str, *,
     if len(text) <= limit:
         return text, False
     return text[-limit:], True
+
+
+def _trim_background(background: dict) -> dict:
+    """Keep the most recent terminal tasks (deterministic, event-order based)."""
+    terminal = [
+        (int(info.get("started_seq") or 0), task_id)
+        for task_id, info in background.items()
+        if info.get("status") in _BACKGROUND_TERMINALS
+    ]
+    overflow = len(terminal) - PROJECTOR_BACKGROUND_RETAIN
+    if overflow > 0:
+        for _, task_id in sorted(terminal)[:overflow]:
+            background.pop(task_id, None)
+    return background
 
 
 def _usage_add(usage: dict, payload: dict) -> dict:
@@ -181,6 +207,9 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
     last_error = state.last_error
     mode = dict(state.mode) if state.mode is not None else None
     completed = list(state.completed_requests)
+    background = {task_id: dict(info) for task_id, info in state.background}
+    background_running = state.background_running
+    background_task_ids = list(state.background_task_ids)
 
     def _complete_request(request_id: Optional[str]) -> None:
         if request_id and request_id not in completed:
@@ -316,66 +345,87 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
     elif etype == "tool.call.requested":
         call_id = payload.get("call_id")
         name = payload.get("name")
-        frames.append(ProjectedFrame("tool.requested", {
-            "call_id": call_id,
-            "name": name,
-            "args": _preview_value(payload.get("args") or {}),
-        }))
-        if call_id:
-            pending.add(call_id)
-            tool_names[call_id] = name
-        phase = phases.AWAITING_TOOLS
+        if payload.get("background"):
+            # Manager-owned work: never enters the foreground barrier and never
+            # makes the session busy.  Record the name for the task panel only.
+            if call_id:
+                tool_names[call_id] = name
+        else:
+            frames.append(ProjectedFrame("tool.requested", {
+                "call_id": call_id,
+                "name": name,
+                "args": _preview_value(payload.get("args") or {}),
+            }))
+            if call_id:
+                pending.add(call_id)
+                tool_names[call_id] = name
+            phase = phases.AWAITING_TOOLS
 
     elif etype == "tool.call.started":
         frames.append(ProjectedFrame("tool.started", {
             "call_id": payload.get("call_id"),
             "name": payload.get("name"),
             "side_effect": payload.get("side_effect"),
+            "background": bool(payload.get("background", False)),
         }))
 
     elif etype == "tool.output.delta":
-        if payload.get("call_id") in pending:
+        call_id = payload.get("call_id")
+        if call_id in pending:
             frames.append(ProjectedFrame("tool.delta", {
-                "call_id": payload.get("call_id"),
+                "call_id": call_id,
+                "text": _preview_text(payload.get("text", "") or ""),
+            }, ephemeral=True))
+        elif call_id in background:
+            # Streaming output of a background task: UI-only, never a state change.
+            frames.append(ProjectedFrame("tool.delta", {
+                "call_id": call_id,
+                "background": True,
                 "text": _preview_text(payload.get("text", "") or ""),
             }, ephemeral=True))
         # else: a coalesced delta after the authoritative tool result — drop it.
 
     elif etype in ("tool.call.completed", "tool.call.failed"):
         call_id = payload.get("call_id")
-        # A terminal for a call that has already left ``pending`` belongs to a
-        # round the reducer closed: either an interrupt voided the result
-        # (§16.3) or this is a duplicate.  It must not reopen a thinking round,
-        # because the reducer will never publish the event that closes it again.
-        was_pending = call_id is not None and call_id in pending
-        ok = etype == "tool.call.completed" and bool(payload.get("ok", True))
-        output = payload.get("output")
-        if payload.get("output_ref"):
-            # The full text is available through ``artifact.read``; only a
-            # preview travels inline (§6.9).
-            output = _preview_text(output if isinstance(output, str) else str(output))
-        elif not isinstance(output, str):
-            output = _preview_value(output)
-        frames.append(ProjectedFrame("tool.result", {
-            "call_id": call_id,
-            "name": payload.get("name") or tool_names.get(call_id),
-            "ok": ok,
-            "output": output,
-            "output_ref": payload.get("output_ref"),
-            "output_tokens": payload.get("output_tokens"),
-            "dedup": bool(payload.get("dedup", False)),
-            "code": payload.get("code"),
-            "error": payload.get("error"),
-            "error_info": _as_error_info(payload),
-        }))
-        pending.discard(call_id)
-        tool_names.pop(call_id, None)
-        approvals.pop(call_id, None)
-        if not ok:
-            last_error = _as_error_info(payload)
-        if was_pending:
-            # Every branch done -> the reducer asks the model again.
-            phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
+        if payload.get("background"):
+            # The task view's terminal is ``background.completed/failed``; the
+            # underlying tool terminal must not produce a foreground result or
+            # toggle busy/phase (§15.1).
+            pass
+        else:
+            # A terminal for a call that has already left ``pending`` belongs to a
+            # round the reducer closed: either an interrupt voided the result
+            # (§16.3) or this is a duplicate.  It must not reopen a thinking round,
+            # because the reducer will never publish the event that closes it again.
+            was_pending = call_id is not None and call_id in pending
+            ok = etype == "tool.call.completed" and bool(payload.get("ok", True))
+            output = payload.get("output")
+            if payload.get("output_ref"):
+                # The full text is available through ``artifact.read``; only a
+                # preview travels inline (§6.9).
+                output = _preview_text(output if isinstance(output, str) else str(output))
+            elif not isinstance(output, str):
+                output = _preview_value(output)
+            frames.append(ProjectedFrame("tool.result", {
+                "call_id": call_id,
+                "name": payload.get("name") or tool_names.get(call_id),
+                "ok": ok,
+                "output": output,
+                "output_ref": payload.get("output_ref"),
+                "output_tokens": payload.get("output_tokens"),
+                "dedup": bool(payload.get("dedup", False)),
+                "code": payload.get("code"),
+                "error": payload.get("error"),
+                "error_info": _as_error_info(payload),
+            }))
+            pending.discard(call_id)
+            tool_names.pop(call_id, None)
+            approvals.pop(call_id, None)
+            if not ok:
+                last_error = _as_error_info(payload)
+            if was_pending:
+                # Every branch done -> the reducer asks the model again.
+                phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
 
     # -- approval domain --------------------------------------------------
     elif etype == "approval.required":
@@ -387,6 +437,10 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
             "args_preview": payload.get("args_preview"),
             "requested_at": event.ts,
             "expires_at": payload.get("expires_at"),
+            # §9.6: background starts can be rendered differently from a
+            # foreground tool approval.
+            "kind": payload.get("kind"),
+            "tool": payload.get("tool"),
         }
         frames.append(ProjectedFrame("approval.required", info))
         if call_id:
@@ -432,37 +486,63 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
             last_error = info
         if payload.get("round") is not None:
             round_number = int(payload["round"])
+        if payload.get("background_running") is not None:
+            background_running = int(payload["background_running"])
+        if payload.get("background_task_ids") is not None:
+            background_task_ids = list(payload["background_task_ids"])
 
     elif etype == "tool.cancel.requested":
         call_id = payload.get("call_id")
-        if call_id:
-            pending.discard(call_id)
-            approvals.pop(call_id, None)
-            tool_names.pop(call_id, None)
-        else:
+        scope = payload.get("scope") or "foreground"
+        is_background = (
+            scope == "background"
+            or (call_id is not None and call_id in background)
+        )
+        frames.append(ProjectedFrame("notice", {
+            "kind": "interrupt", "call_id": call_id, "scope": scope,
+        }))
+        if is_background:
+            # Background cancel is task-local: never affects a foreground step
+            # or the one-session phase (§9.2 / §15.1).  The manager uses a bare
+            # ``call_id`` for a tool task, so the task table is the discriminator.
+            pass
+        elif scope == "all":
             pending.clear()
             approvals.clear()
             tool_names.clear()
-        frames.append(ProjectedFrame("notice", {
-            "kind": "interrupt", "call_id": call_id,
-        }))
-        phase = phases.IDLE
-        streaming = None
+            phase = phases.IDLE
+            streaming = None
+        else:
+            if call_id:
+                pending.discard(call_id)
+                approvals.pop(call_id, None)
+                tool_names.pop(call_id, None)
+            else:
+                pending.clear()
+                approvals.clear()
+                tool_names.clear()
+            phase = phases.IDLE
+            streaming = None
 
     # -- subagent domain --------------------------------------------------
     elif etype == "subagent.spawn.requested":
         call_id = payload.get("call_id")
-        frames.append(ProjectedFrame("subagent.requested", {
-            "call_id": call_id,
-            "title": payload.get("title"),
-            "task": _preview_text(payload.get("task", "") or ""),
-            "tools": list(payload.get("tools") or ()),
-            "model_profile": payload.get("model_profile"),
-        }))
-        if call_id:
-            pending.add(call_id)
-            tool_names[call_id] = "spawn_subagent"
-        phase = phases.AWAITING_TOOLS
+        if payload.get("background"):
+            # Manager-owned child: same rule as background tool calls (§15.1).
+            if call_id:
+                tool_names[call_id] = payload.get("title") or "spawn_subagent"
+        else:
+            frames.append(ProjectedFrame("subagent.requested", {
+                "call_id": call_id,
+                "title": payload.get("title"),
+                "task": _preview_text(payload.get("task", "") or ""),
+                "tools": list(payload.get("tools") or ()),
+                "model_profile": payload.get("model_profile"),
+            }))
+            if call_id:
+                pending.add(call_id)
+                tool_names[call_id] = "spawn_subagent"
+            phase = phases.AWAITING_TOOLS
 
     elif etype == "subagent.started":
         frames.append(ProjectedFrame("subagent.started", {
@@ -493,53 +573,64 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
 
     elif etype == "subagent.completed":
         call_id = payload.get("call_id")
-        was_pending = call_id is not None and call_id in pending
-        frames.append(ProjectedFrame("subagent.result", {
-            "call_id": call_id,
-            "child_session_id": payload.get("child_session_id"),
-            "title": payload.get("title"),
-            "ok": True,
-            "finish": payload.get("finish", "completed"),
-            "summary": _preview_text(payload.get("summary", "") or ""),
-            "summary_ref": payload.get("summary_ref"),
-            "summary_truncated": bool(payload.get("summary_truncated", False)),
-            "usage": payload.get("usage") or {},
-            "rounds": payload.get("rounds"),
-            "duration_ms": payload.get("duration_ms"),
-            "model_profile": payload.get("model_profile"),
-        }))
-        pending.discard(call_id)
-        tool_names.pop(call_id, None)
-        approvals.pop(call_id, None)
-        if was_pending:
-            phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
+        if payload.get("background"):
+            # The task view terminal is ``background.completed``; emit nothing
+            # for the foreground transcript and do not touch phase/pending.
+            pass
+        else:
+            was_pending = call_id is not None and call_id in pending
+            frames.append(ProjectedFrame("subagent.result", {
+                "call_id": call_id,
+                "child_session_id": payload.get("child_session_id"),
+                "title": payload.get("title"),
+                "ok": True,
+                "finish": payload.get("finish", "completed"),
+                "summary": _preview_text(payload.get("summary", "") or ""),
+                "summary_ref": payload.get("summary_ref"),
+                "summary_truncated": bool(payload.get("summary_truncated", False)),
+                "usage": payload.get("usage") or {},
+                "rounds": payload.get("rounds"),
+                "duration_ms": payload.get("duration_ms"),
+                "model_profile": payload.get("model_profile"),
+            }))
+            pending.discard(call_id)
+            tool_names.pop(call_id, None)
+            approvals.pop(call_id, None)
+            if was_pending:
+                phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
 
     elif etype == "subagent.failed":
         call_id = payload.get("call_id")
-        was_pending = call_id is not None and call_id in pending
-        info = _as_error_info(payload)
-        frames.append(ProjectedFrame("subagent.error", {
-            "call_id": call_id,
-            "child_session_id": payload.get("child_session_id"),
-            "title": payload.get("title"),
-            "ok": False,
-            "finish": payload.get("finish", "error"),
-            "code": payload.get("code"),
-            "error": payload.get("error"),
-            "error_info": info,
-            "usage": payload.get("usage") or {},
-            "rounds": payload.get("rounds"),
-            "duration_ms": payload.get("duration_ms"),
-        }))
-        pending.discard(call_id)
-        tool_names.pop(call_id, None)
-        approvals.pop(call_id, None)
-        last_error = info or last_error
-        if was_pending:
-            phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
+        if payload.get("background"):
+            pass
+        else:
+            was_pending = call_id is not None and call_id in pending
+            info = _as_error_info(payload)
+            frames.append(ProjectedFrame("subagent.error", {
+                "call_id": call_id,
+                "child_session_id": payload.get("child_session_id"),
+                "title": payload.get("title"),
+                "ok": False,
+                "finish": payload.get("finish", "error"),
+                "code": payload.get("code"),
+                "error": payload.get("error"),
+                "error_info": info,
+                "usage": payload.get("usage") or {},
+                "rounds": payload.get("rounds"),
+                "duration_ms": payload.get("duration_ms"),
+            }))
+            pending.discard(call_id)
+            tool_names.pop(call_id, None)
+            approvals.pop(call_id, None)
+            last_error = info or last_error
+            if was_pending:
+                phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
 
     elif etype == "subagent.cancel.requested":
         call_ids = list(payload.get("call_ids") or ())
+        was_pending = bool(set(call_ids) & pending) if call_ids else any(
+            name == "spawn_subagent" for _, name in tool_names.items()
+        )
         if call_ids:
             for call_id in call_ids:
                 pending.discard(call_id)
@@ -553,8 +644,187 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         frames.append(ProjectedFrame("notice", {
             "kind": "subagent_cancel", "call_ids": call_ids,
         }))
-        if not pending:
+        # A manager-issued cancel for a background child never affects the
+        # foreground phase; only a call that was actually pending may close it.
+        if was_pending and not pending:
             phase = phases.IDLE
+
+    # -- background tasks (async ReAct §15.1) -----------------------------
+    elif etype == "background.started":
+        call_id = payload.get("call_id")
+        task_id = payload.get("task_id")
+        was_pending = call_id is not None and call_id in pending
+        pending.discard(call_id)
+        tool_names.pop(call_id, None)
+        output = json.dumps({
+            "status": "started",
+            "task_id": task_id,
+            "tool": payload.get("name"),
+            "kind": payload.get("kind", "tool"),
+            "note": "Use stop(task_id=...) to cancel.",
+        }, ensure_ascii=False)
+        frames.append(ProjectedFrame("tool.result", {
+            "call_id": call_id,
+            "name": payload.get("name"),
+            "ok": True,
+            "output": output,
+            "output_ref": None,
+            "output_tokens": None,
+            "dedup": False,
+            "code": None,
+            "error": None,
+            "error_info": None,
+            # TUI marker: this result belongs to a background task, not to a
+            # foreground bash call.
+            "background": True,
+            "task_id": task_id,
+            "background_status": "running",
+        }))
+        if isinstance(task_id, str) and task_id:
+            # A repeated Started (bus redelivery) must not roll a terminal task
+            # back to running or restart its clock.
+            info = background.get(task_id)
+            if info is None:
+                info = {
+                    "task_id": task_id,
+                    "call_id": call_id,
+                    "name": payload.get("name"),
+                    "kind": payload.get("kind", "tool"),
+                    "status": "running",
+                    "started_at": event.ts,
+                    "started_seq": int(event.seq or 0),
+                    "duration_ms": 0,
+                }
+                background[task_id] = info
+            frames.append(ProjectedFrame("background.started", {
+                **dict(info),
+                "start_call_id": call_id,
+            }))
+        if was_pending:
+            phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
+
+    elif etype == "background.start.failed":
+        call_id = payload.get("call_id")
+        was_pending = call_id is not None and call_id in pending
+        pending.discard(call_id)
+        tool_names.pop(call_id, None)
+        info = _as_error_info(payload)
+        frames.append(ProjectedFrame("tool.result", {
+            "call_id": call_id,
+            # The model called the reserved ``start`` wrapper; it never ran a
+            # ``bash`` call.  TUI marks it as a failed background start.
+            "name": "start",
+            "ok": False,
+            "output": json.dumps({
+                "status": "failed",
+                "code": payload.get("code"),
+                "error": payload.get("error"),
+            }, ensure_ascii=False),
+            "output_ref": None,
+            "output_tokens": None,
+            "dedup": False,
+            "code": payload.get("code"),
+            "error": payload.get("error"),
+            "error_info": info,
+            "background": True,
+            "background_status": "failed",
+        }))
+        if was_pending:
+            phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
+
+    elif etype in (
+        "background.stop.completed", "background.stop.failed",
+        "background.list.completed",
+    ):
+        call_id = payload.get("call_id")
+        was_pending = call_id is not None and call_id in pending
+        pending.discard(call_id)
+        name = tool_names.pop(call_id, None)
+        if etype == "background.stop.failed":
+            ok = False
+            output = json.dumps({
+                "status": "failed",
+                "code": payload.get("code"),
+                "error": payload.get("error"),
+            }, ensure_ascii=False)
+            info = _as_error_info(payload)
+        elif etype == "background.stop.completed":
+            ok = True
+            output = json.dumps({
+                "status": payload.get("status", "stopping"),
+                "task_id": payload.get("task_id"),
+                "already_finished": bool(payload.get("already_finished")),
+            }, ensure_ascii=False)
+            info = None
+        else:
+            ok = True
+            output = json.dumps(
+                {"tasks": payload.get("tasks") or []}, ensure_ascii=False,
+            )
+            info = None
+        frames.append(ProjectedFrame("tool.result", {
+            "call_id": call_id,
+            "name": name,
+            "ok": ok,
+            "output": _preview_text(output),
+            "output_ref": None,
+            "output_tokens": None,
+            "dedup": False,
+            "code": payload.get("code"),
+            "error": payload.get("error"),
+            "error_info": info,
+        }))
+        if was_pending:
+            phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
+
+    elif etype in (
+        "background.completed", "background.failed",
+        "background.stopped", "background.lost",
+    ):
+        task_id = payload.get("task_id")
+        status = payload.get("status") or etype.rsplit(".", 1)[-1]
+        info = background.get(task_id)
+        if info is not None:
+            started_at = float(info.get("started_at") or 0.0)
+            duration = (
+                max(0, int((event.ts - started_at) * 1000))
+                if started_at else int(payload.get("duration_ms") or 0)
+            )
+            info.update({
+                "status": status,
+                "duration_ms": duration,
+                "finished_seq": int(event.seq or 0),
+            })
+        frame_name = {
+            "completed": "background.result",
+            "failed": "background.failed",
+            "stopped": "background.stopped",
+            "lost": "background.failed",
+        }.get(status, "background.failed")
+        frames.append(ProjectedFrame(frame_name, {
+            **dict(payload),
+            "status": status,
+            "duration_ms": (
+                info.get("duration_ms") if info is not None
+                else payload.get("duration_ms")
+            ),
+            # The TUI updates the same tool card that was created by the
+            # Started result and appends the terminal status there.
+            "background": True,
+            "background_status": status,
+            "task_id": task_id,
+            "start_call_id": info.get("call_id") if info is not None else None,
+        }))
+        background = _trim_background(background)
+
+    elif etype == "background.cancel.requested":
+        frames.append(ProjectedFrame("notice", {
+            "kind": "background_cancel",
+            "task_ids": list(payload.get("task_ids") or ()),
+            "call_ids": list(payload.get("call_ids") or ()),
+            "task_id": payload.get("task_id"),
+            "requested_by": payload.get("requested_by"),
+        }))
 
     # -- notices / compaction / plugins ----------------------------------
     elif etype == "system.budget.exceeded":
@@ -658,6 +928,9 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         context_digest=context_digest,
         last_error=last_error,
         tool_names=tuple(tool_names.items()),
+        background=tuple(background.items()),
+        background_running=background_running,
+        background_task_ids=tuple(background_task_ids),
         mode=mode,
         completed_requests=tuple(completed),
     )
@@ -696,11 +969,15 @@ def snapshot_payload(state: ProjectorState) -> dict:
         "mode": dict(state.mode) if state.mode is not None else None,
         "context_digest": state.context_digest,
         "last_error": dict(state.last_error) if state.last_error is not None else None,
+        "background": [dict(info) for _, info in state.background],
+        "background_running": state.background_running,
+        "background_task_ids": list(state.background_task_ids),
     }
 
 
 __all__ = [
     "PREVIEW_LIMIT",
+    "PROJECTOR_BACKGROUND_RETAIN",
     "ProjectedFrame",
     "ProjectorState",
     "STREAMING_LIMIT",

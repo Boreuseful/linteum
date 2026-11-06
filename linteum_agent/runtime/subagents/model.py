@@ -57,6 +57,10 @@ class SubagentTask:
     environment: str = ""
     expected_output: str = ""
     policy: Optional[SubagentPolicy] = None
+    #: Async ReAct markers (§9.5): ``background`` selects the manager as the
+    #: parent-side consumer; ``start_call_id`` is the model's original start call.
+    background: bool = False
+    start_call_id: Optional[str] = None
 
     @property
     def prompt_bytes(self) -> int:

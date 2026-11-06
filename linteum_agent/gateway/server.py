@@ -650,7 +650,7 @@ class GatewayServer:
             session_id = command_session_id(command)
             if command.name in (
                 "session.subscribe", "history.read", "artifact.read",
-                "session.context", "approval.decide",
+                "session.context", "approval.decide", "session.tasks",
             ):
                 # A subagent is only reachable through the read-only follow
                 # gateway (which permits ``approval.decide``); a root keeps the

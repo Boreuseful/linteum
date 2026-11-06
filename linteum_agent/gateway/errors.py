@@ -36,6 +36,9 @@ E_MODE_BUSY = "E_MODE_BUSY"
 E_PLUGIN_MANAGE_DISABLED = "E_PLUGIN_MANAGE_DISABLED"
 E_PLUGIN_CONFIG = "E_PLUGIN_CONFIG"
 
+#: Background task commands are only meaningful when the feature is enabled.
+E_BACKGROUND_DISABLED = "E_BACKGROUND_DISABLED"
+
 #: Internal fallback.
 E_INTERNAL = "E_INTERNAL"
 
@@ -84,6 +87,7 @@ class GatewayError(Exception):
 
 __all__ = [
     "E_APPROVAL_GONE",
+    "E_BACKGROUND_DISABLED",
     "E_BAD_FRAME",
     "E_BUSY",
     "E_INTERNAL",

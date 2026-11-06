@@ -34,6 +34,9 @@ E_TOOL_ERROR = ErrorCode.E_TOOL_ERROR.value
 E_SANDBOX = ErrorCode.E_SANDBOX.value
 E_BUDGET = ErrorCode.E_BUDGET.value
 E_SAFETY = ErrorCode.E_SAFETY.value
+#: A background request resolved to a different implementation than the one
+#: approved at ``start`` time (mode/plugin changed mid-flight, design §9.1).
+E_BACKGROUND_SPEC_CHANGED = ErrorCode.E_BACKGROUND_SPEC_CHANGED.value
 
 
 class ToolError(Exception):

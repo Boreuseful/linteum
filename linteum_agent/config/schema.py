@@ -198,6 +198,29 @@ class SubagentSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class BackgroundSettings:
+    """Async ReAct / background task policy (async React design v0.1 §14.1).
+
+    ``allow`` is the *authorization boundary*: it is the only place a host opts
+    a tool (or the configured subagent tool) into ``start(tool, args)``.  An
+    empty tuple means no background task is ever accepted, and enabling
+    subagents alone does not grant background subagent execution.
+    """
+
+    enabled: bool = False
+    auto_continue: bool = True
+    allow: tuple[str, ...] = ("bash",)
+    max_running_per_session: int = 4
+    max_running_total: int = 8
+    max_terminal_tasks: int = 32
+    default_timeout_s: float = 3600.0
+    max_timeout_s: float = 86400.0
+    stop_grace_ms: int = 2000
+    cancel_on_interrupt: bool = False
+    max_output_bytes: int = 1_048_576
+
+
+@dataclass(frozen=True, slots=True)
 class BudgetSettings:
     """Session budget limits (0 = unlimited)."""
 
@@ -284,6 +307,7 @@ class AgentSettings:
     tools: ToolSettings = field(default_factory=ToolSettings)
     skills: SkillsSettings = field(default_factory=SkillsSettings)
     subagents: SubagentSettings = field(default_factory=SubagentSettings)
+    background: BackgroundSettings = field(default_factory=BackgroundSettings)
     budget: BudgetSettings = field(default_factory=BudgetSettings)
     session: SessionSettings = field(default_factory=SessionSettings)
     modes: ModeSettings = field(default_factory=ModeSettings)
@@ -946,6 +970,34 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
     if subagents.max_usd < 0:
         _issue(issues, "agent.subagents.max_usd", "E_CONFIG_RANGE", "must be >= 0")
 
+    # -- agent.background -----------------------------------------------
+    background = config.agent.background
+    if background.max_running_per_session < 1:
+        _issue(issues, "agent.background.max_running_per_session",
+               "E_CONFIG_RANGE", "must be >= 1")
+    if background.max_running_total < background.max_running_per_session:
+        _issue(issues, "agent.background.max_running_total", "E_CONFIG_RANGE",
+               "must be >= max_running_per_session")
+    if background.max_terminal_tasks < 1:
+        _issue(issues, "agent.background.max_terminal_tasks",
+               "E_CONFIG_RANGE", "must be >= 1")
+    if background.default_timeout_s <= 0:
+        _issue(issues, "agent.background.default_timeout_s",
+               "E_CONFIG_RANGE", "must be > 0")
+    if background.max_timeout_s < background.default_timeout_s:
+        _issue(issues, "agent.background.max_timeout_s", "E_CONFIG_RANGE",
+               "must be >= default_timeout_s")
+    if background.stop_grace_ms < 0:
+        _issue(issues, "agent.background.stop_grace_ms", "E_CONFIG_RANGE",
+               "must be >= 0")
+    if background.max_output_bytes <= 0:
+        _issue(issues, "agent.background.max_output_bytes", "E_CONFIG_RANGE",
+               "must be > 0")
+    for index, name in enumerate(background.allow):
+        if not isinstance(name, str) or not name.strip():
+            _issue(issues, f"agent.background.allow.{index}",
+                   "E_CONFIG_RANGE", "must be a non-empty string")
+
     # -- agent.budget ---------------------------------------------------
     budget = config.agent.budget
     for name in ("tokens", "wall_ms", "rounds"):
@@ -1113,6 +1165,7 @@ __all__ = [
     "DEFAULT_PROVIDER",
     "AgentSettings",
     "AppConfig",
+    "BackgroundSettings",
     "BackpressureSettings",
     "BudgetSettings",
     "CheckpointSettings",

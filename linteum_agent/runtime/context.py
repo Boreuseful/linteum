@@ -250,6 +250,10 @@ class CompactingContextBuilder(PassthroughContextBuilder):
             index
             for index in range(last_to + 1, max_end + 1)
             if messages[index].get("role") == "user"
+            # Background notifications are user-role *facts*, not a human turn
+            # boundary; cutting there could split a tool call from its result
+            # (§10.4).
+            and not messages[index].get("background_notification")
         ]
         if not boundaries:
             return None
@@ -272,7 +276,10 @@ class CompactingContextBuilder(PassthroughContextBuilder):
     @staticmethod
     def _last_user_index(messages: Sequence[dict]) -> int:
         for index in range(len(messages) - 1, -1, -1):
-            if messages[index].get("role") == "user":
+            if (
+                messages[index].get("role") == "user"
+                and not messages[index].get("background_notification")
+            ):
                 return index
         return len(messages)
 
