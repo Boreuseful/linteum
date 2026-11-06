@@ -113,6 +113,81 @@ fn subagents_panel_shows_live_status() {
 }
 
 #[test]
+fn background_panel_shows_running_and_finished_tasks() {
+    let mut state = TuiState::default();
+    state.workspace_root = Some("/work/demo".into());
+    reduce(
+        &mut state,
+        Input::Frame(frame(
+            1,
+            "tool.result",
+            json!({
+                "call_id": "c1", "name": "bash", "ok": true,
+                "background": true, "task_id": "bg_running",
+                "background_status": "running",
+                "output": "{\"status\":\"started\"}",
+            }),
+        )),
+    );
+    reduce(
+        &mut state,
+        Input::Frame(frame(
+            2,
+            "tool.result",
+            json!({
+                "call_id": "c2", "name": "bash", "ok": true,
+                "background": true, "task_id": "bg_done",
+                "background_status": "running",
+                "output": "{\"status\":\"started\"}",
+            }),
+        )),
+    );
+    reduce(
+        &mut state,
+        Input::Frame(frame(
+            3,
+            "background.result",
+            json!({
+                "task_id": "bg_done", "start_call_id": "c2", "name": "bash",
+                "kind": "tool", "status": "completed", "ok": true,
+                "duration_ms": 1234, "output": "done",
+                "background": true, "background_status": "completed",
+            }),
+        )),
+    );
+    let _ = reduce(
+        &mut state,
+        Input::Action(UiAction::SidebarShowPanel(SidebarPanel::Background)),
+    );
+    assert!(state.sidebar.visible);
+    assert_eq!(state.sidebar.panel, SidebarPanel::Background);
+    let rendered = rendered(&state);
+    assert!(rendered.contains("Background"));
+    assert!(rendered.contains("1/2"));
+    assert!(rendered.contains("bash"));
+    assert!(rendered.contains("bg_running"));
+    assert!(rendered.contains("running"));
+    assert!(rendered.contains("bg_done"));
+    assert!(rendered.contains("completed"));
+    assert!(rendered.contains("1.2s"));
+}
+
+#[test]
+fn slash_background_command_selects_the_panel() {
+    let mut state = TuiState::default();
+    let command = slash::COMMANDS
+        .iter()
+        .find(|command| command.id == "background")
+        .expect("background slash command");
+    assert_eq!(
+        command.action,
+        UiAction::SidebarShowPanel(SidebarPanel::Background)
+    );
+    let _ = reduce(&mut state, Input::Action(command.action));
+    assert_eq!(state.sidebar.panel, SidebarPanel::Background);
+}
+
+#[test]
 fn split_info_panel_shows_subagents_when_present() {
     let mut state = with_files();
     reduce(

@@ -130,6 +130,17 @@ pub struct ToolCard {
     pub dedup: bool,
     pub safety: bool,
     pub expanded: bool,
+    /// True for a `start(...)` wrapper whose target runs as a background task.
+    /// The TUI renders a `[background]` marker so it is visually distinct from
+    /// an ordinary foreground `bash` call.
+    pub background: bool,
+    /// Lifecycle status of the background task (`running`, `completed`,
+    /// `failed`, `stopped`, `lost`), shown on the card header.
+    pub background_status: Option<String>,
+    /// Host-owned background task id returned by `start`.
+    pub task_id: Option<String>,
+    /// Terminal duration reported by the manager, for the background panel.
+    pub background_duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

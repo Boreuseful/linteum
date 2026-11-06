@@ -44,6 +44,10 @@ pub fn palette_actions() -> Vec<PaletteAction> {
             label: "Sidebar: subagents",
         },
         PaletteAction {
+            id: "sidebar_background",
+            label: "Sidebar: background tasks",
+        },
+        PaletteAction {
             id: "subagents",
             label: "Subagents",
         },
@@ -132,6 +136,10 @@ pub fn execute(action: PaletteAction, state: &mut TuiState) -> Vec<Effect> {
         "sidebar_subagents" => reduce(
             state,
             Input::Action(UiAction::SidebarShowPanel(SidebarPanel::Subagents)),
+        ),
+        "sidebar_background" => reduce(
+            state,
+            Input::Action(UiAction::SidebarShowPanel(SidebarPanel::Background)),
         ),
         "mode" => crate::viewmodel::reduce(state, Input::Action(UiAction::OpenModePicker)),
         "plugins" => crate::viewmodel::reduce(state, Input::Action(UiAction::OpenPlugins)),

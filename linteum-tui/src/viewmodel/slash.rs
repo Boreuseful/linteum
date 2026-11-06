@@ -68,6 +68,12 @@ pub const COMMANDS: &[SlashCommand] = &[
         action: UiAction::SidebarShowPanel(SidebarPanel::Subagents),
     },
     SlashCommand {
+        id: "background",
+        label: "Background tasks",
+        description: "Show running and finished background tasks in the sidebar",
+        action: UiAction::SidebarShowPanel(SidebarPanel::Background),
+    },
+    SlashCommand {
         id: "refresh",
         label: "Refresh files",
         description: "Reload the workspace tree",

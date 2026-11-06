@@ -7,7 +7,9 @@ use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use crate::ui::Theme;
-use crate::viewmodel::{Focus, SidebarLayout, SidebarPanel, SubagentStatus, TuiState};
+use crate::viewmodel::{
+    Focus, Item, SidebarLayout, SidebarPanel, SubagentStatus, ToolCard, TuiState,
+};
 
 pub fn render_sidebar(area: Rect, buf: &mut Buffer, state: &TuiState, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
@@ -48,6 +50,10 @@ fn render_panel(
             state.subagents.running_count(),
             state.subagents.entries.len()
         ),
+        SidebarPanel::Background if !background_tasks(state).is_empty() => {
+            let (running, total) = background_counts(state);
+            format!(" Background · {running}/{total} ")
+        }
         _ => format!(" {} ", panel.title()),
     };
     let block = Block::bordered()
@@ -62,6 +68,7 @@ fn render_panel(
         SidebarPanel::Preview => placeholder_lines("No preview yet", theme),
         SidebarPanel::Info => info_lines(state, inner.width, theme),
         SidebarPanel::Subagents => subagent_lines(state, inner.width, theme),
+        SidebarPanel::Background => background_lines(state, inner.width, theme),
     };
     Paragraph::new(lines).style(theme.text).render(inner, buf);
 }
@@ -171,6 +178,60 @@ fn subagent_lines(state: &TuiState, width: u16, theme: &Theme) -> Vec<Line<'stat
                 text
             }
         };
+        lines.push(Line::from(Span::styled(detail, theme.muted)));
+    }
+    lines
+}
+
+fn is_background_running(card: &ToolCard) -> bool {
+    matches!(card.background_status.as_deref(), None | Some("running"))
+}
+
+/// Background tool cards, active tasks first, in transcript order otherwise.
+fn background_tasks(state: &TuiState) -> Vec<&ToolCard> {
+    let mut tasks: Vec<&ToolCard> = state
+        .transcript
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Tool(card) if card.background => Some(card),
+            _ => None,
+        })
+        .collect();
+    tasks.sort_by_key(|card| if is_background_running(card) { 0 } else { 1 });
+    tasks
+}
+
+fn background_counts(state: &TuiState) -> (usize, usize) {
+    let tasks = background_tasks(state);
+    let running = tasks
+        .iter()
+        .filter(|card| is_background_running(card))
+        .count();
+    (running, tasks.len())
+}
+
+fn background_lines(state: &TuiState, _width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let tasks = background_tasks(state);
+    if tasks.is_empty() {
+        return placeholder_lines("no background tasks", theme);
+    }
+    let mut lines = Vec::new();
+    for card in tasks.iter().take(16) {
+        let status = card.background_status.as_deref().unwrap_or("running");
+        let (marker, style) = match status {
+            "running" => ("●", theme.accent),
+            "completed" => ("✔", theme.success),
+            "failed" | "lost" => ("✖", theme.danger),
+            "stopped" => ("⊘", theme.warning),
+            _ => ("·", theme.muted),
+        };
+        let header = format!("{marker} {} · {status}", card.name);
+        lines.push(Line::from(Span::styled(header, style)));
+        let mut detail = format!("  {}", card.task_id.as_deref().unwrap_or("-"));
+        if let Some(duration_ms) = card.background_duration_ms {
+            detail.push_str(&format!(" · {:.1}s", duration_ms as f64 / 1000.0));
+        }
         lines.push(Line::from(Span::styled(detail, theme.muted)));
     }
     lines
