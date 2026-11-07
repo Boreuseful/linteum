@@ -212,6 +212,7 @@ class BackgroundSettings:
     allow: tuple[str, ...] = ("bash",)
     max_running_per_session: int = 4
     max_running_total: int = 8
+    max_queued_per_session: int = 8
     max_terminal_tasks: int = 32
     default_timeout_s: float = 3600.0
     max_timeout_s: float = 86400.0
@@ -978,6 +979,9 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
     if background.max_running_total < background.max_running_per_session:
         _issue(issues, "agent.background.max_running_total", "E_CONFIG_RANGE",
                "must be >= max_running_per_session")
+    if background.max_queued_per_session < 0:
+        _issue(issues, "agent.background.max_queued_per_session",
+               "E_CONFIG_RANGE", "must be >= 0")
     if background.max_terminal_tasks < 1:
         _issue(issues, "agent.background.max_terminal_tasks",
                "E_CONFIG_RANGE", "must be >= 1")

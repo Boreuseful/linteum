@@ -46,9 +46,10 @@ from .errors import (
     BackgroundError,
 )
 from .model import (
-    ACTIVE_STATES,
     PENDING_APPROVAL,
+    QUEUED,
     RUNNING,
+    SLOT_STATES,
     STARTING,
     STOPPING,
     TERMINAL,
@@ -110,6 +111,8 @@ class BackgroundTaskManager:
         #: ``start call id -> task_id`` retained until the task terminal.
         self._by_call: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        #: Sessions with a scheduled cross-session promotion task.
+        self._promote_pending: set[str] = set()
         self._closed = False
         self._unsubs: list = []
 
@@ -193,43 +196,47 @@ class BackgroundTaskManager:
             return chosen
         return self.approval_policy
 
-    def _active_tasks(self, session_id: Optional[str] = None) -> list[BackgroundTask]:
+    def _slot_tasks(self, session_id: Optional[str] = None) -> list[BackgroundTask]:
+        """Tasks that currently occupy a concurrency slot (queued excluded)."""
         return [
             task for task in self._tasks.values()
-            if task.status in ACTIVE_STATES
+            if task.status in SLOT_STATES
             and (session_id is None or task.session_id == session_id)
         ]
 
-    def _check_limits(
+    def _has_capacity(
         self, session_id: str, *, exclude_task_id: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         per_session = [
-            task for task in self._active_tasks(session_id)
+            task for task in self._slot_tasks(session_id)
             if task.task_id != exclude_task_id
         ]
         if len(per_session) >= self.settings.max_running_per_session:
-            raise BackgroundError(
-                E_BACKGROUND_LIMIT,
-                f"background task limit reached for this session "
-                f"({len(per_session)}/{self.settings.max_running_per_session})",
-                context={
-                    "session_id": session_id,
-                    "running": len(per_session),
-                    "limit": self.settings.max_running_per_session,
-                },
-            )
+            return False
         total = [
-            task for task in self._active_tasks()
+            task for task in self._slot_tasks()
             if task.task_id != exclude_task_id
         ]
-        if len(total) >= self.settings.max_running_total:
+        return len(total) < self.settings.max_running_total
+
+    def _check_queue_limit(
+        self, session_id: str, *, exclude_task_id: Optional[str] = None,
+    ) -> None:
+        queued = [
+            task for task in self._tasks.values()
+            if task.status == QUEUED
+            and task.session_id == session_id
+            and task.task_id != exclude_task_id
+        ]
+        if len(queued) >= self.settings.max_queued_per_session:
             raise BackgroundError(
                 E_BACKGROUND_LIMIT,
-                f"process-wide background task limit reached "
-                f"({len(total)}/{self.settings.max_running_total})",
+                f"background task queue is full for this session "
+                f"({len(queued)}/{self.settings.max_queued_per_session})",
                 context={
-                    "running": len(total),
-                    "limit": self.settings.max_running_total,
+                    "session_id": session_id,
+                    "queued": len(queued),
+                    "limit": self.settings.max_queued_per_session,
                 },
             )
 
@@ -278,12 +285,20 @@ class BackgroundTaskManager:
                 self.approvals.cancel(call_id=call_id)
             self._drop_task(existing)
 
+        # Older queued tasks get first claim on any free slot (including one
+        # just released by a superseded handshake).
+        await self._promote_queued_locked(ev.session_id)
+
         try:
             task, spec = await self._prepare_start(ev, call_id, payload)
         except BackgroundError as exc:
             await self._publish(
                 "background.start.failed",
-                {"call_id": call_id, **exc.as_payload()},
+                {
+                    "call_id": call_id,
+                    "tool": payload.get("tool"),
+                    **exc.as_payload(),
+                },
                 session_id=ev.session_id, trace_id=ev.trace_id, cause_id=ev.id,
             )
             return
@@ -296,7 +311,11 @@ class BackgroundTaskManager:
             )
             await self._publish(
                 "background.start.failed",
-                {"call_id": call_id, **failure.as_payload()},
+                {
+                    "call_id": call_id,
+                    "tool": payload.get("tool"),
+                    **failure.as_payload(),
+                },
                 session_id=ev.session_id, trace_id=ev.trace_id, cause_id=ev.id,
             )
             return
@@ -304,6 +323,10 @@ class BackgroundTaskManager:
         self._by_request[ev.id] = task.task_id
         self._tasks[task.task_id] = task
         self._by_call[call_id] = task.task_id
+
+        if task.status == QUEUED:
+            await self._queue(task, ev)
+            return
 
         if task.status == PENDING_APPROVAL:
             subject = _ApprovalSubject(
@@ -341,7 +364,7 @@ class BackgroundTaskManager:
 
     async def _prepare_start(
         self, ev: Event, call_id: str, payload: Mapping[str, Any],
-        *, exclude_task_id: Optional[str] = None,
+        *, exclude_task_id: Optional[str] = None, approved: bool = False,
     ) -> tuple[BackgroundTask, Any]:
         if not self.settings.enabled:
             raise BackgroundError(
@@ -372,10 +395,12 @@ class BackgroundTaskManager:
                 E_BACKGROUND_ARGS, "start.args must be an object",
             )
 
-        self._check_limits(ev.session_id, exclude_task_id=exclude_task_id)
         subagent_settings = self.current_subagent_settings()
+        spec = None
+        needs_approval = False
 
         if tool_name == subagent_settings.tool_name:
+            task_kind = "subagent"
             if not subagent_settings.enabled:
                 raise BackgroundError(
                     E_BACKGROUND_NOT_ALLOWED,
@@ -389,147 +414,108 @@ class BackgroundTaskManager:
                 raise BackgroundError(
                     E_DENIED, "background subagent spawn is denied by policy",
                 )
-            return BackgroundTask(
-                task_id="bg_" + uuid7(),
-                start_call_id=call_id,
-                session_id=ev.session_id,
-                name=tool_name,
-                kind="subagent",
-                args=dict(args),
-                trace_id=ev.trace_id,
-                start_event_id=ev.id,
-                status=STARTING,
-                start_event=ev,
-            ), None
+        else:
+            task_kind = "tool"
+            try:
+                registry = self._registry_for(ev.session_id)
+                if inspect.isawaitable(registry):
+                    registry = await registry
+                spec = registry.spec(tool_name)
+            except ToolUnavailable as exc:
+                raise BackgroundError(
+                    E_BACKGROUND_NOT_ALLOWED,
+                    f"tool {tool_name!r} is unavailable",
+                    context={"tool": tool_name},
+                ) from exc
+            except UnknownTool as exc:
+                raise BackgroundError(
+                    E_BACKGROUND_UNKNOWN_TOOL,
+                    f"tool {tool_name!r} is not registered",
+                    context={"tool": tool_name},
+                ) from exc
+            if getattr(spec, "plugin_id", None) is not None:
+                raise BackgroundError(
+                    E_BACKGROUND_NOT_ALLOWED,
+                    f"plugin tool {tool_name!r} cannot run in the background in v0.1",
+                    context={"tool": tool_name, "plugin_id": spec.plugin_id},
+                )
+            if not getattr(spec, "backgroundable", False):
+                raise BackgroundError(
+                    E_BACKGROUND_NOT_ALLOWED,
+                    f"tool {tool_name!r} is not background-capable",
+                    context={"tool": tool_name},
+                )
+            try:
+                spec.validate(args)
+            except ValidationError as exc:
+                raise BackgroundError(
+                    E_BACKGROUND_ARGS,
+                    f"invalid args for {tool_name!r}: {exc}",
+                    context={"tool": tool_name},
+                ) from exc
 
-        try:
-            registry = self._registry_for(ev.session_id)
-            if inspect.isawaitable(registry):
-                registry = await registry
-            spec = registry.spec(tool_name)
-        except ToolUnavailable as exc:
-            raise BackgroundError(
-                E_BACKGROUND_NOT_ALLOWED,
-                f"tool {tool_name!r} is unavailable",
-                context={"tool": tool_name},
-            ) from exc
-        except UnknownTool as exc:
-            raise BackgroundError(
-                E_BACKGROUND_UNKNOWN_TOOL,
-                f"tool {tool_name!r} is not registered",
-                context={"tool": tool_name},
-            ) from exc
-        if getattr(spec, "plugin_id", None) is not None:
-            raise BackgroundError(
-                E_BACKGROUND_NOT_ALLOWED,
-                f"plugin tool {tool_name!r} cannot run in the background in v0.1",
-                context={"tool": tool_name, "plugin_id": spec.plugin_id},
+            policy = await self._resolve_approval_policy(ev.session_id)
+            if policy == "deny":
+                raise BackgroundError(
+                    E_DENIED, f"background tool {tool_name!r} is denied by policy",
+                )
+            needs_approval = (
+                bool(spec.requires_approval)
+                and policy != "allow"
+                and tool_name not in self.auto_approve
             )
-        if not getattr(spec, "backgroundable", False):
-            raise BackgroundError(
-                E_BACKGROUND_NOT_ALLOWED,
-                f"tool {tool_name!r} is not background-capable",
-                context={"tool": tool_name},
-            )
-        try:
-            spec.validate(args)
-        except ValidationError as exc:
-            raise BackgroundError(
-                E_BACKGROUND_ARGS,
-                f"invalid args for {tool_name!r}: {exc}",
-                context={"tool": tool_name},
-            ) from exc
 
-        policy = await self._resolve_approval_policy(ev.session_id)
-        if policy == "deny":
-            raise BackgroundError(
-                E_DENIED, f"background tool {tool_name!r} is denied by policy",
-            )
-        needs_approval = (
-            bool(spec.requires_approval)
-            and policy != "allow"
-            and tool_name not in self.auto_approve
-        )
+        if not self._has_capacity(
+            ev.session_id, exclude_task_id=exclude_task_id,
+        ):
+            # Limits are a waiting room, not a failure: accept the start, give
+            # it a task_id, and launch when a slot frees.  Only a *new* start
+            # checks the queue cap; an already-admitted task that is being
+            # re-checked (approval resume / promotion) just stays queued.
+            if exclude_task_id is None:
+                self._check_queue_limit(ev.session_id)
+            status = QUEUED
+        elif needs_approval and not approved:
+            status = PENDING_APPROVAL
+        else:
+            status = STARTING
+
         return BackgroundTask(
             task_id="bg_" + uuid7(),
             start_call_id=call_id,
             session_id=ev.session_id,
             name=tool_name,
-            kind="tool",
+            kind=task_kind,
             args=dict(args),
             trace_id=ev.trace_id,
             start_event_id=ev.id,
-            status=PENDING_APPROVAL if needs_approval else STARTING,
-            spec_digest=spec.stable_digest(),
+            status=status,
+            spec_digest=spec.stable_digest() if spec is not None else None,
             start_event=ev,
+            approved=approved,
         ), spec
 
-    async def _launch(self, task: BackgroundTask, start_ev: Event, *, spec=None) -> None:
-        task.started_at = self.clock()
-        task.status = STARTING
-        try:
-            committed = await self._publish(
-                "background.started", self._started_payload(task),
-                session_id=task.session_id, trace_id=task.trace_id,
-                cause_id=start_ev.id,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - pair the start call
-            await self._fail_start(
-                task, task.start_call_id,
-                BackgroundError(
-                    E_BACKGROUND_SPAWN,
-                    f"failed to publish background.started: {exc}",
-                ),
-                start_ev,
-            )
-            return
-        if committed is None:
-            await self._fail_start(
-                task, task.start_call_id,
-                BackgroundError(
-                    E_BACKGROUND_SPAWN,
-                    "background.started was not committed",
-                ),
-                start_ev,
-            )
-            return
+    async def _queue(self, task: BackgroundTask, start_ev: Event) -> None:
+        """Accept a start beyond the running limit and wait for a free slot."""
+        task.status = QUEUED
+        if not task.started_at:
+            task.started_at = self.clock()
+        await self._publish_started(task, start_ev, status="queued")
 
-        task.start_published = True
-        task.started_seq = int(getattr(committed, "seq", 0) or 0)
+    async def _launch(
+        self, task: BackgroundTask, start_ev: Event, *, spec=None,
+        promote_on_failure: bool = True,
+    ) -> None:
+        # A queued task already has its start terminal; `_publish_started`
+        # emits a running status update instead of a second pairing.
+        if not await self._publish_started(
+            task, start_ev, status="running",
+            promote_on_failure=promote_on_failure,
+        ):
+            return
         task.status = RUNNING
         try:
-            if task.kind == "tool":
-                await self.bus.publish(Event.create(
-                    "tool.call.requested",
-                    {
-                        "call_id": task.task_id,
-                        "name": task.name,
-                        "args": task.args,
-                        "background": True,
-                        "approved": True,
-                        "timeout_s": self._timeout_for(spec),
-                        "start_call_id": task.start_call_id,
-                        "spec_digest": task.spec_digest,
-                    },
-                    session_id=task.session_id,
-                    trace_id=task.trace_id,
-                    cause_id=start_ev.id,
-                ))
-            else:
-                await self.bus.publish(Event.create(
-                    "subagent.spawn.requested",
-                    {
-                        **task.args,
-                        "call_id": task.task_id,
-                        "background": True,
-                        "start_call_id": task.start_call_id,
-                    },
-                    session_id=task.session_id,
-                    trace_id=task.trace_id,
-                    cause_id=start_ev.id,
-                ))
+            await self._publish_underlying(task, start_ev, spec)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the task must still terminate
@@ -547,29 +533,150 @@ class BackgroundTaskManager:
                     ).to_dict(),
                 },
                 cause_id=start_ev.id,
+                promote=promote_on_failure,
             )
+
+    async def _publish_started(
+        self, task: BackgroundTask, start_ev: Event, *, status: str,
+        promote_on_failure: bool = True,
+    ) -> bool:
+        if not task.started_at:
+            task.started_at = self.clock()
+        task.status = QUEUED if status == "queued" else STARTING
+        try:
+            committed = await self._publish(
+                "background.started", self._started_payload(task, status=status),
+                session_id=task.session_id, trace_id=task.trace_id,
+                cause_id=start_ev.id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - pair or terminate the task
+            await self._started_publish_failed(
+                task, start_ev,
+                f"failed to publish background.started: {exc}",
+                promote_on_failure,
+            )
+            return False
+        if committed is None:
+            await self._started_publish_failed(
+                task, start_ev,
+                "background.started was not committed",
+                promote_on_failure,
+            )
+            return False
+        if not task.start_published:
+            task.start_published = True
+            task.started_seq = int(getattr(committed, "seq", 0) or 0)
+        return True
+
+    async def _started_publish_failed(
+        self, task: BackgroundTask, start_ev: Event, message: str,
+        promote: bool,
+    ) -> None:
+        failure = BackgroundError(E_BACKGROUND_SPAWN, message)
+        if task.start_published:
+            # The queued Started was the start terminal; this is a task failure.
+            await self._finish_task(
+                task, "failed",
+                {
+                    "code": failure.code,
+                    "error": failure.message,
+                    "error_info": failure.as_error_info(),
+                },
+                cause_id=start_ev.id,
+                promote=promote,
+            )
+            return
+        await self._fail_start(
+            task, task.start_call_id, failure, start_ev, promote=promote,
+        )
+
+    async def _publish_underlying(
+        self, task: BackgroundTask, start_ev: Event, spec,
+    ) -> None:
+        if task.kind == "tool":
+            await self.bus.publish(Event.create(
+                "tool.call.requested",
+                {
+                    "call_id": task.task_id,
+                    "name": task.name,
+                    "args": task.args,
+                    "background": True,
+                    "approved": True,
+                    "timeout_s": self._timeout_for(spec),
+                    "start_call_id": task.start_call_id,
+                    "spec_digest": task.spec_digest,
+                },
+                session_id=task.session_id,
+                trace_id=task.trace_id,
+                cause_id=start_ev.id,
+            ))
+        else:
+            await self.bus.publish(Event.create(
+                "subagent.spawn.requested",
+                {
+                    **task.args,
+                    "call_id": task.task_id,
+                    "background": True,
+                    "start_call_id": task.start_call_id,
+                },
+                session_id=task.session_id,
+                trace_id=task.trace_id,
+                cause_id=start_ev.id,
+            ))
 
     async def _fail_start(
         self, task: BackgroundTask, call_id: str,
-        failure: BackgroundError, parent: Event,
+        failure: BackgroundError, parent: Event, *, promote: bool = True,
     ) -> None:
-        """Pair the start call with a failure instead of a Started (§8.3 step 9)."""
+        """Close a start handshake as a failure.
+
+        Before ``background.started`` the start call is paired with
+        ``background.start.failed``.  *After* it (a queued task, or a promotion
+        that needs approval), the start terminal already exists, so the task
+        lifecycle must end with ``background.failed`` instead — otherwise the
+        Agent would ignore the event and the task would stay open forever.
+        """
+        if task.start_published:
+            await self._finish_task(
+                task, "failed",
+                {
+                    "code": failure.code,
+                    "error": failure.message,
+                    "error_info": failure.as_error_info(),
+                },
+                cause_id=parent.id,
+                promote=promote,
+            )
+            return
         self._drop_task(task)
         await self._publish(
             "background.start.failed",
-            {"call_id": call_id, **failure.as_payload()},
+            {
+                "call_id": call_id,
+                "tool": task.name,
+                **failure.as_payload(),
+            },
             session_id=parent.session_id, trace_id=parent.trace_id,
             cause_id=parent.id,
         )
+        if promote:
+            await self._promote_queued_locked(parent.session_id)
+            self._schedule_other_promotions(parent.session_id)
 
     @staticmethod
-    def _started_payload(task: BackgroundTask) -> dict:
+    def _started_payload(
+        task: BackgroundTask, *, status: Optional[str] = None,
+    ) -> dict:
+        if status is None:
+            status = "queued" if task.status == QUEUED else "running"
         return {
             "call_id": task.start_call_id,
             "task_id": task.task_id,
             "name": task.name,
             "kind": task.kind,
-            "status": "running",
+            "status": status,
             "started_at": task.started_at,
         }
 
@@ -586,6 +693,7 @@ class BackgroundTaskManager:
                 # target implementation before starting (§8.4 step 4).
                 task2, spec = await self._prepare_start(
                     ev, call_id, payload, exclude_task_id=task.task_id,
+                    approved=True,
                 )
             except BackgroundError as exc:
                 await self._fail_start(task, call_id, exc, ev)
@@ -612,6 +720,16 @@ class BackgroundTaskManager:
                     ),
                     ev,
                 )
+                return
+            task.approved = True
+            if task2.status == QUEUED:
+                # Approval arrived but every slot is now taken.  If the start
+                # call was never paired (approval before launch), pair it now
+                # as queued; otherwise keep the existing Started.
+                if task.start_published:
+                    task.status = QUEUED
+                else:
+                    await self._queue(task, ev)
                 return
             await self._launch(task, ev, spec=spec)
 
@@ -700,6 +818,23 @@ class BackgroundTaskManager:
                     cause_id=ev.id,
                 )
                 return
+            if task.status == QUEUED:
+                # Never launched: pair the stop call and terminal immediately.
+                task.stop_requested_by = call_id or "stop"
+                task.stop_reason = payload.get("reason")
+                await self._publish(
+                    "background.stop.completed",
+                    {
+                        "call_id": call_id,
+                        "task_id": task.task_id,
+                        "status": "stopping",
+                        "already_finished": False,
+                    },
+                    session_id=ev.session_id, trace_id=ev.trace_id,
+                    cause_id=ev.id,
+                )
+                await self._finish_task(task, "stopped", {}, cause_id=ev.id)
+                return
 
             task.status = STOPPING
             task.stop_requested_by = call_id or "stop"
@@ -787,6 +922,12 @@ class BackgroundTaskManager:
         reason: Optional[str] = None,
     ) -> None:
         if task.is_terminal:
+            return
+        if task.status == QUEUED:
+            # Never launched: no worker to cancel, close the lifecycle now.
+            task.stop_requested_by = requested_by
+            task.stop_reason = reason or task.stop_reason
+            await self._finish_task(task, "stopped", {}, cause_id=ev.id)
             return
         if not task.start_published:
             if self.approvals is not None:
@@ -926,6 +1067,7 @@ class BackgroundTaskManager:
         *,
         cause_id: Optional[str] = None,
         recovered: bool = False,
+        promote: bool = True,
     ) -> bool:
         if task.is_terminal:
             return False
@@ -992,7 +1134,182 @@ class BackgroundTaskManager:
         if timer is not None and timer is not asyncio.current_task():
             timer.cancel()
         self._prune_terminal_tasks()
+        if promote:
+            # A slot was freed: let the oldest queued task use it.  Promotion
+            # itself may finish tasks, so it runs with promote=False inside.
+            await self._promote_queued_locked(task.session_id)
+            self._schedule_other_promotions(task.session_id)
         return True
+
+    async def _promote_queued_locked(self, session_id: str) -> None:
+        """Launch queued tasks while this session has free slots (FIFO)."""
+        if self._closed:
+            return
+        while True:
+            task = next(
+                (
+                    item for item in self._tasks.values()
+                    if item.session_id == session_id and item.status == QUEUED
+                ),
+                None,
+            )
+            if task is None:
+                return
+            if not self._has_capacity(session_id, exclude_task_id=task.task_id):
+                return
+            if task.start_event is None:
+                await self._finish_task(
+                    task, "failed",
+                    {
+                        "code": E_BACKGROUND_LOST,
+                        "error": "queued task lost its start event",
+                        "error_info": error_info(
+                            E_BACKGROUND_LOST,
+                            source=ErrorSource.BACKGROUND.value,
+                            message="queued task lost its start event",
+                            context={"task_id": task.task_id},
+                        ).to_dict(),
+                    },
+                    cause_id=task.start_event_id, promote=False,
+                )
+                continue
+
+            payload = (
+                task.start_event.payload
+                if isinstance(task.start_event.payload, dict) else {}
+            )
+            try:
+                prepared, spec = await self._prepare_start(
+                    task.start_event, task.start_call_id, payload,
+                    exclude_task_id=task.task_id, approved=task.approved,
+                )
+            except BackgroundError as exc:
+                await self._finish_task(
+                    task, "failed",
+                    {
+                        "code": exc.code,
+                        "error": exc.message,
+                        "error_info": exc.as_error_info(),
+                    },
+                    cause_id=task.start_event_id, promote=False,
+                )
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - errors are data
+                failure = BackgroundError(
+                    E_BACKGROUND_SPAWN, f"{type(exc).__name__}: {exc}",
+                )
+                await self._finish_task(
+                    task, "failed",
+                    {
+                        "code": failure.code,
+                        "error": failure.message,
+                        "error_info": failure.as_error_info(),
+                    },
+                    cause_id=task.start_event_id, promote=False,
+                )
+                continue
+
+            task.spec_digest = prepared.spec_digest
+            if prepared.kind != task.kind or prepared.name != task.name:
+                await self._finish_task(
+                    task, "failed",
+                    {
+                        "code": E_BACKGROUND_NOT_ALLOWED,
+                        "error": "background target changed while queued",
+                        "error_info": BackgroundError(
+                            E_BACKGROUND_NOT_ALLOWED,
+                            "background target changed while queued",
+                        ).as_error_info(),
+                    },
+                    cause_id=task.start_event_id, promote=False,
+                )
+                continue
+            if prepared.status == QUEUED:
+                return  # capacity changed; keep waiting
+            if prepared.status == PENDING_APPROVAL:
+                task.status = PENDING_APPROVAL
+                subject = _ApprovalSubject(
+                    name=task.name,
+                    side_effect=(
+                        spec.side_effect if spec is not None else "dangerous"
+                    ),
+                )
+                if self.approvals is None:
+                    await self._finish_task(
+                        task, "failed",
+                        {
+                            "code": E_BACKGROUND_APPROVAL,
+                            "error": "approval is required but no gate is configured",
+                            "error_info": BackgroundError(
+                                E_BACKGROUND_APPROVAL,
+                                "approval is required but no gate is configured",
+                            ).as_error_info(),
+                        },
+                        cause_id=task.start_event_id, promote=False,
+                    )
+                    continue
+                try:
+                    await self.approvals.request(
+                        task.start_event, subject,
+                        resume=self._resume_start, deny=self._deny_start,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - terminate cleanly
+                    await self._finish_task(
+                        task, "failed",
+                        {
+                            "code": E_BACKGROUND_APPROVAL,
+                            "error": (
+                                "failed to request approval: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                            "error_info": BackgroundError(
+                                E_BACKGROUND_APPROVAL,
+                                "failed to request approval",
+                            ).as_error_info(),
+                        },
+                        cause_id=task.start_event_id, promote=False,
+                    )
+                    continue
+                return  # approval owns the slot until resolved
+
+            await self._launch(
+                task, task.start_event, spec=spec, promote_on_failure=False,
+            )
+            # A successful launch occupies the slot; the loop head re-checks
+            # capacity.  A failed launch is terminal and the loop continues.
+
+    def _schedule_other_promotions(self, session_id: str) -> None:
+        """Best-effort promotion for sessions blocked by the process-wide cap."""
+        if self._closed:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        others = {
+            task.session_id for task in self._tasks.values()
+            if task.status == QUEUED and task.session_id != session_id
+        }
+        for other in others:
+            if other in self._promote_pending:
+                continue
+            self._promote_pending.add(other)
+            loop.create_task(self._promote_session(other))
+
+    async def _promote_session(self, session_id: str) -> None:
+        try:
+            async with self._lock(session_id):
+                await self._promote_queued_locked(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - promotion is best effort
+            pass
+        finally:
+            self._promote_pending.discard(session_id)
 
     def _prune_terminal_tasks(self) -> None:
         keep = max(1, int(self.settings.max_terminal_tasks or 1))
@@ -1051,6 +1368,8 @@ class BackgroundTaskManager:
         task.stop_timer = asyncio.get_running_loop().create_task(_force())
 
     async def _request_cancel(self, task: BackgroundTask) -> None:
+        if task.status == QUEUED:
+            return  # never launched: nothing to cancel
         if task.kind == "tool":
             await self.bus.publish(Event.create(
                 "tool.cancel.requested",
@@ -1284,6 +1603,7 @@ class BackgroundTaskManager:
                     "background.start.failed",
                     {
                         "call_id": call_id,
+                        "tool": starts[call_id].get("tool"),
                         "code": E_BACKGROUND_LOST,
                         "error": "background start lost after process restart",
                         "error_info": error_info(
@@ -1434,6 +1754,7 @@ class BackgroundTaskManager:
     ) -> None:
         payload = {
             "call_id": task.start_call_id,
+            "tool": task.name,
             "code": code,
             "error": message,
             "error_info": error_info(
@@ -1533,6 +1854,7 @@ class BackgroundTaskManager:
                     "background.start.failed",
                     {
                         "call_id": task.start_call_id,
+                        "tool": task.name,
                         "code": E_BACKGROUND_CANCELLED,
                         "error": "host shut down",
                         "error_info": error_info(
@@ -1549,6 +1871,7 @@ class BackgroundTaskManager:
         self._tasks.clear()
         self._by_request.clear()
         self._by_call.clear()
+        self._promote_pending.clear()
         self._locks.clear()
 
     # -- accessors ----------------------------------------------------------

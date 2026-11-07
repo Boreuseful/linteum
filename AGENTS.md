@@ -116,9 +116,11 @@ change requires breaking one, stop and redesign the change.
 - `bus.publish` marks the event deduped and assigns `seq` before the WAL append
   (`bus/bus.py`). A WAL failure can drop a retry or leave a `seq` gap. On a
   reopened store the bus seeds `seq`/dedup from the WAL before the first publish.
-- `WorkerPool` allows 4 concurrent handlers per session
-  (`bus/scheduler/pool.py:20-34`); reducer serialisation and tool parallelism are
-  not separated.
+- `WorkerPool` has two per-session lanes: `dispatch` (event handlers, default 4)
+  and `execution` (`ToolRuntime` workers, default 4). They use independent
+  semaphores, so a blocked tool cannot starve event dispatch; both still count
+  toward `wait_until_idle()`. Background-task admission
+  (`max_running_per_session`) caps execution independently.
 - Capability plugins (`runtime/plugins`) are implemented for tools/skills/modes;
   hooks, adapters, transport plugins, plugin KV and remote install remain
   unimplemented. Plugins run **in-process** and are trusted like the host.
@@ -145,8 +147,13 @@ change requires breaking one, stop and redesign the change.
   `state.background` holds references only. Task terminals are user-role
   notification messages (never `tool` messages), and `state.step_inbox` defers
   user messages/notifications until the current step's tool results are paired.
-  `on_user` while busy buffers instead of pre-empting. Replay is WAL-derived:
-  `replay_state` never needs `background_tools` or `auto_continue`.
+  A start beyond `max_running_per_session` / `max_running_total` is accepted as
+  `queued` (up to `max_queued_per_session`) instead of failing; promotion
+  re-emits `background.started{status:"running"}` for the same task_id and must
+  **not** pair the start call a second time. Only a full queue fails with
+  `E_BACKGROUND_LIMIT`. `on_user` while busy buffers instead of pre-empting.
+  Replay is WAL-derived: `replay_state` never needs `background_tools` or
+  `auto_continue`.
 - Cross-session memory, retrieval/RAG and CQRS projections beyond the session
   catalogue are not implemented yet. Do not assume their APIs exist.
 

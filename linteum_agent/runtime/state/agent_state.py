@@ -33,7 +33,7 @@ BACKGROUND_TERMINAL_RETAIN = 32
 #: Task states the background manager may publish.  ``terminal`` is an internal
 #: manager state only; the reducer sees one of the concrete terminal statuses.
 BACKGROUND_STATUSES = frozenset({
-    "running", "stopping", "completed", "failed", "stopped", "lost",
+    "queued", "running", "stopping", "completed", "failed", "stopped", "lost",
 })
 BACKGROUND_TERMINAL_STATUSES = frozenset({
     "completed", "failed", "stopped", "lost",
@@ -263,10 +263,10 @@ class AgentState:
 
     # -- background helpers -------------------------------------------------
     def background_running_ids(self) -> list:
-        """Task ids still running/stopping, in deterministic order."""
+        """Outstanding task ids (queued/running/stopping), in sorted order."""
         return sorted(
             task_id for task_id, meta in self.background.items()
-            if meta.get("status") in ("running", "stopping")
+            if meta.get("status") in ("queued", "running", "stopping")
         )
 
     def prune_background(self, *, keep_task_id: Optional[str] = None) -> None:

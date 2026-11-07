@@ -670,7 +670,13 @@ class Agent:
         return "background.list.requested", {"call_id": call_id}
 
     async def on_background_started(self, ev: Event) -> None:
-        """Pair one ``background.started`` with its ``start`` tool call (§7.3)."""
+        """Pair a ``start`` call, or update a queued task that just got a slot.
+
+        The first ``background.started`` for a start call pairs the tool result
+        and advances the barrier.  A later one for the same task_id (queued ->
+        running) only updates metadata: the start call is already paired and no
+        new message is allowed (§7.3).
+        """
         if not self._mine(ev):
             return
         self.state.observe(ev)
@@ -678,40 +684,62 @@ class Agent:
         call_id = payload.get("call_id")
         if not call_id or call_id in self.state.cancelled:
             return  # voided by an interrupt: never enters history
-        if (
-            call_id not in self.state.pending
-            or call_id not in self.state.pending_background
-        ):
-            return  # duplicate / late
         task_id = payload.get("task_id")
-        content = json.dumps({
-            "status": "started",
-            "task_id": task_id,
-            "tool": payload.get("name"),
-            "kind": payload.get("kind", "tool"),
-            "note": "Use stop(task_id=...) to cancel.",
-        }, ensure_ascii=False)
-        self.state.messages.append({
-            "role": "tool",
-            "tool_call_id": call_id,
-            "content": content,
-        })
-        self.state.pending.discard(call_id)
-        self.state.pending_background.discard(call_id)
-        if isinstance(task_id, str) and task_id:
-            self.state.background[task_id] = {
+        status = payload.get("status")
+        if status not in ("queued", "running"):
+            status = "running"
+
+        if (
+            call_id in self.state.pending
+            and call_id in self.state.pending_background
+        ):
+            content = json.dumps({
+                "status": "queued" if status == "queued" else "started",
                 "task_id": task_id,
-                "name": payload.get("name"),
+                "tool": payload.get("name"),
                 "kind": payload.get("kind", "tool"),
-                "status": "running",
-                "start_call_id": call_id,
-                "started_seq": int(ev.seq or 0),
-                "finished_seq": None,
-                "output_ref": None,
-                "code": None,
-                "error": None,
-            }
-        await self._barrier(ev)
+                "note": (
+                    "Queued until a background slot is free. "
+                    "Use stop(task_id=...) to cancel."
+                    if status == "queued"
+                    else "Use stop(task_id=...) to cancel."
+                ),
+            }, ensure_ascii=False)
+            self.state.messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": content,
+            })
+            self.state.pending.discard(call_id)
+            self.state.pending_background.discard(call_id)
+            if isinstance(task_id, str) and task_id:
+                self.state.background[task_id] = {
+                    "task_id": task_id,
+                    "name": payload.get("name"),
+                    "kind": payload.get("kind", "tool"),
+                    "status": status,
+                    "start_call_id": call_id,
+                    "started_seq": int(ev.seq or 0),
+                    "finished_seq": None,
+                    "output_ref": None,
+                    "code": None,
+                    "error": None,
+                }
+            await self._barrier(ev)
+            return
+
+        # Queued task promoted to running: no second pairing, no barrier.
+        meta = (
+            self.state.background.get(task_id)
+            if isinstance(task_id, str) else None
+        )
+        if (
+            meta is not None
+            and meta.get("status") == "queued"
+            and status == "running"
+        ):
+            meta["status"] = "running"
+            self._tick()
 
     async def on_background_start_failed(self, ev: Event) -> None:
         """Pair a rejected ``start`` and advance the barrier (§7.3)."""
@@ -727,11 +755,14 @@ class Agent:
             or call_id not in self.state.pending_background
         ):
             return
-        content = json.dumps({
+        failure = {
             "status": "failed",
             "code": payload.get("code"),
             "error": payload.get("error"),
-        }, ensure_ascii=False)
+        }
+        if payload.get("tool") is not None:
+            failure["tool"] = payload.get("tool")
+        content = json.dumps(failure, ensure_ascii=False)
         self.state.messages.append({
             "role": "tool",
             "tool_call_id": call_id,
@@ -1229,9 +1260,9 @@ class Agent:
             phases.AWAITING_APPROVAL,
         ):
             return
-        # Buffered inputs are already-recorded facts: land them before the
-        # half-round is closed so they are not lost (T5 / §7.13).
-        self._flush_inbox()
+        # Buffered inputs are flushed only *after* the interrupted tool results
+        # are paired: provider message order must stay
+        # ``assistant(tool_calls) -> tool(...) -> user(...)`` (D7 / §10.3).
         # A recovered process has no live orchestrator; tell any still-running
         # one to close the child before pairing the round as interrupted.
         if self.state.pending_subagents:
@@ -1265,6 +1296,7 @@ class Agent:
                     "interrupted": True,
                 })
                 self.state.cancelled.add(call_id)
+            self._flush_inbox()  # after pairing: assistant -> tool -> user
             self.state.pending = set(approvals)
             # Approvals are tool calls, never subagent calls.
             self.state.pending_subagents &= approvals
@@ -1282,7 +1314,8 @@ class Agent:
                     "content": INTERRUPT_TAG,
                     "interrupted": True,
                 })
-            self.state.cancelled |= self.state.pending
+        self._flush_inbox()  # after pairing: assistant -> tool -> user
+        self.state.cancelled |= self.state.pending
         self.state.pending.clear()
         self.state.pending_subagents.clear()
         self.state.pending_background.clear()

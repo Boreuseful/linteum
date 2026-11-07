@@ -58,6 +58,9 @@ from .agent import Agent, AgentBusy
 from .background import (
     BACKGROUND_TOOL_NAMES,
     BackgroundTaskManager,
+    LIST_TOOL,
+    START_TOOL,
+    STOP_TOOL,
     background_tool_schemas,
 )
 from .compaction import ContextCompactor
@@ -612,15 +615,22 @@ class AgentHost:
             registry.reserve(subagent_name)
             subagent_catalog = SubagentCatalog(cfg.agent.subagents)
 
+        enabled = cfg.agent.background.enabled
         targets = self._background_targets(
             cfg, registry, subagent_tools, workspace=workspace,
         )
+        # stop/list_tasks are management tools, not start targets: keep them
+        # injected whenever the feature is on so a mode switch cannot strand an
+        # already-running task (§14.5).  `start` still needs a non-empty enum.
         bg_schemas = (
-            background_tool_schemas(targets)
-            if cfg.agent.background.enabled else []
+            background_tool_schemas(targets, include_management=True)
+            if enabled else []
         )
         background_tools = (
-            frozenset(BACKGROUND_TOOL_NAMES) if targets else frozenset()
+            frozenset(
+                ({START_TOOL} if targets else set()) | {STOP_TOOL, LIST_TOOL}
+            )
+            if enabled else frozenset()
         )
 
         def schemas() -> list[dict]:

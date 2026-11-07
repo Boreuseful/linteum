@@ -250,6 +250,15 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "type": "int",
         "minimum": 1,
     },
+    "agent.background.max_queued_per_session": {
+        "title": "单会话待命任务上限",
+        "type": "int",
+        "minimum": 0,
+        "description": (
+            "并发已满时新 start 进入 queued 待命；超过此上限才返回 "
+            "E_BACKGROUND_LIMIT。0 表示不排队（旧行为）。"
+        ),
+    },
     "agent.background.max_terminal_tasks": {
         "title": "终态任务保留数",
         "type": "int",

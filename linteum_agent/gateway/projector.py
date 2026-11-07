@@ -656,33 +656,44 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         was_pending = call_id is not None and call_id in pending
         pending.discard(call_id)
         tool_names.pop(call_id, None)
-        output = json.dumps({
-            "status": "started",
-            "task_id": task_id,
-            "tool": payload.get("name"),
-            "kind": payload.get("kind", "tool"),
-            "note": "Use stop(task_id=...) to cancel.",
-        }, ensure_ascii=False)
-        frames.append(ProjectedFrame("tool.result", {
-            "call_id": call_id,
-            "name": payload.get("name"),
-            "ok": True,
-            "output": output,
-            "output_ref": None,
-            "output_tokens": None,
-            "dedup": False,
-            "code": None,
-            "error": None,
-            "error_info": None,
-            # TUI marker: this result belongs to a background task, not to a
-            # foreground bash call.
-            "background": True,
-            "task_id": task_id,
-            "background_status": "running",
-        }))
+        status = payload.get("status")
+        if status not in ("queued", "running"):
+            status = "running"
+        if was_pending:
+            # Only the first Started pairs the start call.  A later promotion
+            # (queued -> running) is a status update and must not emit a second
+            # tool.result for the same call.
+            output = json.dumps({
+                "status": "queued" if status == "queued" else "started",
+                "task_id": task_id,
+                "tool": payload.get("name"),
+                "kind": payload.get("kind", "tool"),
+                "note": (
+                    "Queued until a background slot is free. "
+                    "Use stop(task_id=...) to cancel."
+                    if status == "queued"
+                    else "Use stop(task_id=...) to cancel."
+                ),
+            }, ensure_ascii=False)
+            frames.append(ProjectedFrame("tool.result", {
+                "call_id": call_id,
+                "name": payload.get("name"),
+                "ok": True,
+                "output": output,
+                "output_ref": None,
+                "output_tokens": None,
+                "dedup": False,
+                "code": None,
+                "error": None,
+                "error_info": None,
+                # TUI marker: this result belongs to a background task, not to
+                # a foreground bash call.
+                "background": True,
+                "task_id": task_id,
+                "background_status": status,
+                "started_at": event.ts,
+            }))
         if isinstance(task_id, str) and task_id:
-            # A repeated Started (bus redelivery) must not roll a terminal task
-            # back to running or restart its clock.
             info = background.get(task_id)
             if info is None:
                 info = {
@@ -690,12 +701,16 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
                     "call_id": call_id,
                     "name": payload.get("name"),
                     "kind": payload.get("kind", "tool"),
-                    "status": "running",
+                    "status": status,
                     "started_at": event.ts,
                     "started_seq": int(event.seq or 0),
                     "duration_ms": 0,
                 }
                 background[task_id] = info
+            elif info.get("status") not in _BACKGROUND_TERMINALS:
+                # Promotion updates queued -> running; never roll back a
+                # terminal task.
+                info["status"] = status
             frames.append(ProjectedFrame("background.started", {
                 **dict(info),
                 "start_call_id": call_id,
@@ -717,6 +732,7 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
             "ok": False,
             "output": json.dumps({
                 "status": "failed",
+                "tool": payload.get("tool"),
                 "code": payload.get("code"),
                 "error": payload.get("error"),
             }, ensure_ascii=False),
@@ -728,6 +744,10 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
             "error_info": info,
             "background": True,
             "background_status": "failed",
+            # A rejected start has no task id, but the TUI still shows when it
+            # was attempted and which tool it targeted.
+            "background_target": payload.get("tool"),
+            "started_at": event.ts,
         }))
         if was_pending:
             phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
@@ -793,6 +813,7 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
             info.update({
                 "status": status,
                 "duration_ms": duration,
+                "finished_at": event.ts,
                 "finished_seq": int(event.seq or 0),
             })
         frame_name = {
@@ -814,6 +835,8 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
             "background_status": status,
             "task_id": task_id,
             "start_call_id": info.get("call_id") if info is not None else None,
+            "started_at": info.get("started_at") if info is not None else None,
+            "finished_at": event.ts,
         }))
         background = _trim_background(background)
 

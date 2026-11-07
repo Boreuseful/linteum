@@ -113,8 +113,9 @@ class ToolRuntime:
         self.inline_limit = inline_limit
         #: Upper bound for ``background: true`` timeouts (``0`` = no clamp).
         self.max_background_timeout = float(max_background_timeout or 0.0)
-        # Sharing the bus pool makes ``bus.wait_until_idle()`` cover tool work;
-        # inject a private pool to isolate tool concurrency from event dispatch.
+        # Sharing the bus pool keeps ``bus.wait_until_idle()`` covering tool
+        # work.  Tool jobs are submitted on the pool's execution lane so a
+        # blocked tool cannot consume the session's dispatch slots (AR-16).
         self.pool = pool if pool is not None else getattr(bus, "pool", None) or WorkerPool(DEFAULT_POOL_SIZE)
         self.approvals.runtime = self
 
@@ -234,7 +235,13 @@ class ToolRuntime:
         self._names[call_id] = spec.name
         if ev.payload.get("background"):
             self._background.add(call_id)
-        task = self.pool.spawn(self._execute(ev, spec, token, registry), session_id=ev.session_id)
+        # Tool work runs on the execution lane: a long/blocked tool must never
+        # consume the session's dispatch slots (async ReAct AR-16).
+        task = self.pool.spawn(
+            self._execute(ev, spec, token, registry),
+            session_id=ev.session_id,
+            lane="execution",
+        )
         self.inflight[call_id] = task
 
         def _done(_task, cid=call_id):

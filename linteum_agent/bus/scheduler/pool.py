@@ -21,27 +21,74 @@ DEFAULT_MAX_PER_SESSION = 4
 
 
 class WorkerPool:
-    """Semaphore-gated task spawner with a per-session serialisation gate."""
+    """Semaphore-gated task spawner with per-session serialisation gates.
 
-    def __init__(self, size: int = DEFAULT_SIZE, max_per_session: int = DEFAULT_MAX_PER_SESSION) -> None:
+    Two lanes share the pool's bookkeeping but have independent concurrency
+    budgets:
+
+    * ``dispatch`` (default) — event handlers.  A session's handlers use at
+      most ``max_per_session`` slots.
+    * ``execution`` — long-running tool work.  It gets its own global and
+      per-session gates so a blocked tool can never starve event dispatch
+      (async ReAct AR-16).  ``ToolRuntime`` submits its workers here.
+
+    Both lanes still contribute to ``tasks`` / ``inflight``, so
+    ``bus.wait_until_idle()`` keeps covering tool work.
+    """
+
+    def __init__(
+        self,
+        size: int = DEFAULT_SIZE,
+        max_per_session: int = DEFAULT_MAX_PER_SESSION,
+        *,
+        execution_size: Optional[int] = None,
+        execution_per_session: Optional[int] = None,
+    ) -> None:
         if size <= 0:
             raise ValueError("worker pool size must be positive")
+        if max_per_session <= 0:
+            raise ValueError("per-session limit must be positive")
+        exec_size = size if execution_size is None else execution_size
+        exec_per_session = (
+            max_per_session if execution_per_session is None
+            else execution_per_session
+        )
+        if exec_size <= 0 or exec_per_session <= 0:
+            raise ValueError("execution lane limits must be positive")
         self.size = size
         self.max_per_session = max_per_session
+        self.execution_size = exec_size
+        self.execution_per_session = exec_per_session
         self._sem = asyncio.Semaphore(size)
         self._per_session: dict[str, asyncio.Semaphore] = defaultdict(
             lambda: asyncio.Semaphore(max_per_session)
         )
+        self._exec_sem = asyncio.Semaphore(exec_size)
+        self._per_session_exec: dict[str, asyncio.Semaphore] = defaultdict(
+            lambda: asyncio.Semaphore(exec_per_session)
+        )
         self.tasks: set[asyncio.Task] = set()
 
-    def spawn(self, coro: Awaitable, session_id: Optional[str] = None) -> asyncio.Task:
-        """Schedule ``coro``; returns the task (kept referenced until done)."""
+    def spawn(
+        self,
+        coro: Awaitable,
+        session_id: Optional[str] = None,
+        *,
+        lane: str = "dispatch",
+    ) -> asyncio.Task:
+        """Schedule ``coro`` on ``lane``; returns the task (referenced until done)."""
+        if lane not in ("dispatch", "execution"):
+            raise ValueError(f"unknown worker lane: {lane!r}")
+        global_gate = self._sem if lane == "dispatch" else self._exec_sem
+        session_gates = (
+            self._per_session if lane == "dispatch" else self._per_session_exec
+        )
 
         async def _run():
-            async with self._sem:
+            async with global_gate:
                 if session_id is None:
                     return await coro
-                async with self._per_session[session_id]:
+                async with session_gates[session_id]:
                     return await coro
 
         task = asyncio.create_task(_run())

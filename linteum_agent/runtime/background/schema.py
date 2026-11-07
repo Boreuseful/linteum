@@ -2,8 +2,11 @@
 
 The three names are **not** ``ToolSpec`` entries and never reach
 ``ToolRuntime``: the Agent routes them to ``background.*`` intent events.  The
-host injects these schemas only when ``agent.background.enabled`` is true and at
-least one target is eligible (async ReAct design v0.1 §5.1 / §5.5).
+host injects these schemas only when ``agent.background.enabled`` is true.
+
+``stop`` / ``list_tasks`` are management tools: they stay available even when
+the current mode has no eligible ``start`` target, so a task that is already
+running can still be inspected and stopped (async ReAct design v0.1 §14.5).
 """
 
 from __future__ import annotations
@@ -17,17 +20,22 @@ LIST_TOOL = "list_tasks"
 BACKGROUND_TOOL_NAMES = frozenset({START_TOOL, STOP_TOOL, LIST_TOOL})
 
 
-def background_tool_schemas(targets: Sequence[str]) -> list[dict]:
-    """Build the three function schemas with ``targets`` as ``start.tool`` enum.
+def background_tool_schemas(
+    targets: Sequence[str],
+    *,
+    include_management: bool = False,
+) -> list[dict]:
+    """Build provider schemas for the reserved background tools.
 
-    An empty target list yields ``[]`` — the caller must not inject a ``start``
-    schema whose ``enum`` is empty (§5.5).
+    ``targets`` populates the ``start.tool`` enum.  An empty target list omits
+    ``start`` entirely — an empty enum is invalid (§5.5).  ``include_management``
+    keeps ``stop`` / ``list_tasks`` available without a start target, so a mode
+    switch cannot strand an already-running task (§14.5).
     """
     names = sorted(set(targets))
-    if not names:
-        return []
-    return [
-        {
+    schemas: list[dict] = []
+    if names:
+        schemas.append({
             "type": "function",
             "function": {
                 "name": START_TOOL,
@@ -69,50 +77,53 @@ def background_tool_schemas(targets: Sequence[str]) -> list[dict]:
                     "additionalProperties": False,
                 },
             },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": STOP_TOOL,
-                "description": (
-                    "Request cancellation of a running background task. The "
-                    "task will stop asynchronously; a background notification "
-                    "confirms it."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": {
-                            "type": "string",
-                            "description": "The task_id returned by start().",
+        })
+    if names or include_management:
+        schemas.extend([
+            {
+                "type": "function",
+                "function": {
+                    "name": STOP_TOOL,
+                    "description": (
+                        "Request cancellation of a running background task. The "
+                        "task will stop asynchronously; a background notification "
+                        "confirms it."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {
+                                "type": "string",
+                                "description": "The task_id returned by start().",
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Optional reason for stopping.",
+                            },
                         },
-                        "reason": {
-                            "type": "string",
-                            "description": "Optional reason for stopping.",
-                        },
+                        "required": ["task_id"],
+                        "additionalProperties": False,
                     },
-                    "required": ["task_id"],
-                    "additionalProperties": False,
                 },
             },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": LIST_TOOL,
-                "description": (
-                    "List background tasks for this session that are running or "
-                    "recently finished. Use it after context compaction to "
-                    "recover task ids."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
+            {
+                "type": "function",
+                "function": {
+                    "name": LIST_TOOL,
+                    "description": (
+                        "List background tasks for this session that are running or "
+                        "recently finished. Use it after context compaction to "
+                        "recover task ids."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
                 },
             },
-        },
-    ]
+        ])
+    return schemas
 
 
 __all__ = [

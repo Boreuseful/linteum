@@ -14,6 +14,7 @@ from typing import Optional
 #: Manager-internal states.  ``terminal`` is the only one that never leaks to
 #: the bus; the concrete terminal status is stored in ``terminal["status"]``.
 PENDING_APPROVAL = "pending_approval"
+QUEUED = "queued"
 STARTING = "starting"
 RUNNING = "running"
 STOPPING = "stopping"
@@ -21,7 +22,10 @@ TERMINAL = "terminal"
 
 #: States that occupy a concurrency slot (approval wait included, so a burst of
 #: approvals cannot bypass ``max_running_per_session``).
-ACTIVE_STATES = frozenset({PENDING_APPROVAL, STARTING, RUNNING, STOPPING})
+SLOT_STATES = frozenset({PENDING_APPROVAL, STARTING, RUNNING, STOPPING})
+
+#: Every non-terminal state, including tasks waiting for a free slot.
+ACTIVE_STATES = SLOT_STATES | {QUEUED}
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped", "lost"})
 
@@ -42,6 +46,9 @@ class BackgroundTask:
     started_at: float = 0.0
     started_seq: int = 0
     start_published: bool = False
+    #: True once the start handshake's approval was granted (or was not
+    #: needed), so a later promotion must not ask again.
+    approved: bool = False
     stop_requested_by: Optional[str] = None
     stop_reason: Optional[str] = None
     terminal: Optional[dict] = None
@@ -67,7 +74,9 @@ __all__ = [
     "ACTIVE_STATES",
     "BackgroundTask",
     "PENDING_APPROVAL",
+    "QUEUED",
     "RUNNING",
+    "SLOT_STATES",
     "STARTING",
     "STOPPING",
     "TERMINAL",
