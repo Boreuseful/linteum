@@ -41,7 +41,8 @@ fn render_panel(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let focused = state.focus == Focus::Sidebar && panel == SidebarPanel::Files;
+    let focused = state.focus == Focus::Sidebar
+        && matches!(panel, SidebarPanel::Files | SidebarPanel::Background);
     let title = match panel {
         SidebarPanel::Files if focused => " Files · ↑↓ ".to_owned(),
         SidebarPanel::Files => " Files · Tab ".to_owned(),
@@ -51,8 +52,12 @@ fn render_panel(
             state.subagents.entries.len()
         ),
         SidebarPanel::Background if !background_tasks(state).is_empty() => {
-            let (running, total) = background_counts(state);
-            format!(" Background · {running}/{total} ")
+            let (active, total) = background_counts(state);
+            if focused {
+                format!(" Background · {active}/{total} · ↑↓ ")
+            } else {
+                format!(" Background · {active}/{total} ")
+            }
         }
         _ => format!(" {} ", panel.title()),
     };
@@ -183,11 +188,14 @@ fn subagent_lines(state: &TuiState, width: u16, theme: &Theme) -> Vec<Line<'stat
     lines
 }
 
-fn is_background_running(card: &ToolCard) -> bool {
-    matches!(card.background_status.as_deref(), None | Some("running"))
+fn is_background_active(card: &ToolCard) -> bool {
+    matches!(
+        card.background_status.as_deref(),
+        None | Some("queued" | "running")
+    )
 }
 
-/// Background tool cards, active tasks first, in transcript order otherwise.
+/// Background tool cards, newest first (transcript order is arrival order).
 fn background_tasks(state: &TuiState) -> Vec<&ToolCard> {
     let mut tasks: Vec<&ToolCard> = state
         .transcript
@@ -198,17 +206,29 @@ fn background_tasks(state: &TuiState) -> Vec<&ToolCard> {
             _ => None,
         })
         .collect();
-    tasks.sort_by_key(|card| if is_background_running(card) { 0 } else { 1 });
+    tasks.reverse();
     tasks
+}
+
+/// Highest valid `background_scroll` index (one task per step).
+pub fn background_scroll_limit(state: &TuiState) -> usize {
+    background_tasks(state).len().saturating_sub(1)
 }
 
 fn background_counts(state: &TuiState) -> (usize, usize) {
     let tasks = background_tasks(state);
-    let running = tasks
+    let active = tasks
         .iter()
-        .filter(|card| is_background_running(card))
+        .filter(|card| is_background_active(card))
         .count();
-    (running, tasks.len())
+    (active, tasks.len())
+}
+
+/// Format a Unix timestamp (seconds) as UTC ``HH:MM:SS``.
+fn clock_time(ts: f64) -> String {
+    let secs = ts.max(0.0) as u64;
+    let day = secs % 86_400;
+    format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
 }
 
 fn background_lines(state: &TuiState, _width: u16, theme: &Theme) -> Vec<Line<'static>> {
@@ -217,9 +237,14 @@ fn background_lines(state: &TuiState, _width: u16, theme: &Theme) -> Vec<Line<'s
         return placeholder_lines("no background tasks", theme);
     }
     let mut lines = Vec::new();
-    for card in tasks.iter().take(16) {
+    let start = state
+        .sidebar
+        .background_scroll
+        .min(tasks.len().saturating_sub(1));
+    for card in tasks.iter().skip(start) {
         let status = card.background_status.as_deref().unwrap_or("running");
         let (marker, style) = match status {
+            "queued" => ("◌", theme.muted),
             "running" => ("●", theme.accent),
             "completed" => ("✔", theme.success),
             "failed" | "lost" => ("✖", theme.danger),
@@ -228,11 +253,33 @@ fn background_lines(state: &TuiState, _width: u16, theme: &Theme) -> Vec<Line<'s
         };
         let header = format!("{marker} {} · {status}", card.name);
         lines.push(Line::from(Span::styled(header, style)));
-        let mut detail = format!("  {}", card.task_id.as_deref().unwrap_or("-"));
-        if let Some(duration_ms) = card.background_duration_ms {
-            detail.push_str(&format!(" · {:.1}s", duration_ms as f64 / 1000.0));
+        if let Some(target) = &card.background_target {
+            lines.push(Line::from(Span::styled(
+                format!("  target {target}"),
+                theme.muted,
+            )));
         }
-        lines.push(Line::from(Span::styled(detail, theme.muted)));
+        if let Some(task_id) = card.task_id.as_deref() {
+            let mut detail = format!("  {task_id}");
+            if let Some(duration_ms) = card.background_duration_ms {
+                detail.push_str(&format!(" · {:.1}s", duration_ms as f64 / 1000.0));
+            }
+            lines.push(Line::from(Span::styled(detail, theme.muted)));
+        }
+        // Keep times on their own narrow lines so a 24-column sidebar still
+        // shows them without truncation.
+        if let Some(started) = card.background_started_at {
+            lines.push(Line::from(Span::styled(
+                format!("  start {}", clock_time(started)),
+                theme.muted,
+            )));
+        }
+        if let Some(finished) = card.background_finished_at {
+            lines.push(Line::from(Span::styled(
+                format!("  end {}", clock_time(finished)),
+                theme.muted,
+            )));
+        }
     }
     lines
 }

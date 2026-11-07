@@ -66,6 +66,8 @@ pub struct SidebarState {
     pub rows: Vec<TreeRow>,
     pub selected: usize,
     pub error: Option<String>,
+    /// First background task shown in the Background panel (0 = newest).
+    pub background_scroll: usize,
 }
 
 impl SidebarState {

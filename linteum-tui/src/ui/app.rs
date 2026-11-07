@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 
-use crate::viewmodel::{Effect, Focus, Input, TuiState, UiAction, slash};
+use crate::viewmodel::{Effect, Focus, Input, SidebarPanel, TuiState, UiAction, slash};
 
 use super::theme::Theme;
 use super::{layout, widgets};
@@ -159,6 +159,38 @@ impl App {
             || self.state.focus != Focus::Sidebar
         {
             return None;
+        }
+        // The Background panel is a scrollable task list, not a file tree.
+        if self.state.sidebar.panel == SidebarPanel::Background {
+            let limit = widgets::sidebar::background_scroll_limit(&self.state);
+            let scroll = &mut self.state.sidebar.background_scroll;
+            match key.code {
+                KeyCode::Up => {
+                    *scroll = scroll.saturating_sub(1);
+                    return Some(Vec::new());
+                }
+                KeyCode::Down => {
+                    *scroll = scroll.saturating_add(1).min(limit);
+                    return Some(Vec::new());
+                }
+                KeyCode::PageUp => {
+                    *scroll = scroll.saturating_sub(5);
+                    return Some(Vec::new());
+                }
+                KeyCode::PageDown => {
+                    *scroll = scroll.saturating_add(5).min(limit);
+                    return Some(Vec::new());
+                }
+                KeyCode::Home => {
+                    *scroll = 0;
+                    return Some(Vec::new());
+                }
+                KeyCode::End => {
+                    *scroll = limit;
+                    return Some(Vec::new());
+                }
+                _ => {}
+            }
         }
         let action = match key.code {
             KeyCode::Up => UiAction::SidebarPrevious,

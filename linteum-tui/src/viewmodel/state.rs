@@ -744,8 +744,17 @@ fn apply_tool_result(state: &mut TuiState, frame: &Frame) {
         if let Some(task_id) = str_field(payload, "task_id") {
             card.task_id = Some(task_id.to_owned());
         }
+        if let Some(target) = str_field(payload, "background_target") {
+            card.background_target = Some(target.to_owned());
+        }
         if let Some(duration) = u64_field(payload, "duration_ms") {
             card.background_duration_ms = Some(duration);
+        }
+        if let Some(started) = f64_field(payload, "started_at") {
+            card.background_started_at = Some(started);
+        }
+        if let Some(finished) = f64_field(payload, "finished_at") {
+            card.background_finished_at = Some(finished);
         }
         card.state = if ok {
             ToolState::Success
@@ -785,7 +794,7 @@ fn apply_background_snapshot(state: &mut TuiState, payload: &Value) {
             "stopped" => ToolState::Cancelled,
             _ => ToolState::Started,
         };
-        state.transcript.items.push(Item::Tool(ToolCard {
+        let mut card = ToolCard {
             call_id: task_id.to_owned(),
             name: str_field(task, "name").unwrap_or("task").to_owned(),
             state: card_state,
@@ -793,8 +802,22 @@ fn apply_background_snapshot(state: &mut TuiState, payload: &Value) {
             background_status: Some(status),
             task_id: Some(task_id.to_owned()),
             background_duration_ms: u64_field(task, "duration_ms"),
+            background_started_at: f64_field(task, "started_at"),
+            background_finished_at: f64_field(task, "finished_at"),
             ..Default::default()
-        }));
+        };
+        if card.background_finished_at.is_none()
+            && matches!(
+                card.background_status.as_deref(),
+                Some("completed" | "failed" | "stopped" | "lost")
+            )
+        {
+            card.background_finished_at = card
+                .background_started_at
+                .zip(card.background_duration_ms)
+                .map(|(started, duration)| started + duration as f64 / 1000.0);
+        }
+        state.transcript.items.push(Item::Tool(card));
     }
 }
 
@@ -804,11 +827,18 @@ fn apply_background_started(state: &mut TuiState, frame: &Frame) {
     let start_call_id =
         str_field(payload, "start_call_id").or_else(|| str_field(payload, "call_id"));
     let task_id = str_field(payload, "task_id");
+    let status = str_field(payload, "status").unwrap_or("running");
     if let Some(card) = background_card_mut(state, start_call_id, task_id) {
         card.background = true;
-        card.background_status = Some("running".to_owned());
+        card.background_status = Some(status.to_owned());
         if let Some(task_id) = task_id {
             card.task_id = Some(task_id.to_owned());
+        }
+        if let Some(started) = f64_field(payload, "started_at") {
+            card.background_started_at = Some(started);
+        }
+        if let Some(finished) = f64_field(payload, "finished_at") {
+            card.background_finished_at = Some(finished);
         }
     }
 }
@@ -846,6 +876,13 @@ fn apply_background_terminal(state: &mut TuiState, frame: &Frame) {
         }
         card.background_duration_ms =
             u64_field(payload, "duration_ms").or(card.background_duration_ms);
+        if let Some(started) = f64_field(payload, "started_at") {
+            card.background_started_at = Some(started);
+        }
+        card.background_finished_at = f64_field(payload, "finished_at")
+            .or(card.background_started_at.zip(card.background_duration_ms).map(
+                |(started, duration)| started + duration as f64 / 1000.0,
+            ));
         card.state = state_for_status;
         if output.is_some() {
             card.output = output;
@@ -868,6 +905,12 @@ fn apply_background_terminal(state: &mut TuiState, frame: &Frame) {
     card.state = state_for_status;
     card.output = output;
     card.error = error;
+    if card.background_finished_at.is_none() {
+        card.background_finished_at = card
+            .background_started_at
+            .zip(card.background_duration_ms)
+            .map(|(started, duration)| started + duration as f64 / 1000.0);
+    }
     state.transcript.items.push(Item::Tool(card));
 }
 
@@ -1091,7 +1134,10 @@ fn parse_tool_card(payload: &Value) -> ToolCard {
         background: bool_field(payload, "background").unwrap_or(false),
         background_status: str_field(payload, "background_status").map(str::to_owned),
         task_id: str_field(payload, "task_id").map(str::to_owned),
+        background_target: str_field(payload, "background_target").map(str::to_owned),
         background_duration_ms: u64_field(payload, "duration_ms"),
+        background_started_at: f64_field(payload, "started_at"),
+        background_finished_at: f64_field(payload, "finished_at"),
         ..Default::default()
     }
 }

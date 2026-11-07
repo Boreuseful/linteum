@@ -124,7 +124,7 @@ fn background_panel_shows_running_and_finished_tasks() {
             json!({
                 "call_id": "c1", "name": "bash", "ok": true,
                 "background": true, "task_id": "bg_running",
-                "background_status": "running",
+                "background_status": "running", "started_at": 0.0,
                 "output": "{\"status\":\"started\"}",
             }),
         )),
@@ -137,7 +137,7 @@ fn background_panel_shows_running_and_finished_tasks() {
             json!({
                 "call_id": "c2", "name": "bash", "ok": true,
                 "background": true, "task_id": "bg_done",
-                "background_status": "running",
+                "background_status": "running", "started_at": 0.0,
                 "output": "{\"status\":\"started\"}",
             }),
         )),
@@ -152,6 +152,7 @@ fn background_panel_shows_running_and_finished_tasks() {
                 "kind": "tool", "status": "completed", "ok": true,
                 "duration_ms": 1234, "output": "done",
                 "background": true, "background_status": "completed",
+                "started_at": 0.0, "finished_at": 1.234,
             }),
         )),
     );
@@ -170,6 +171,63 @@ fn background_panel_shows_running_and_finished_tasks() {
     assert!(rendered.contains("bg_done"));
     assert!(rendered.contains("completed"));
     assert!(rendered.contains("1.2s"));
+    assert!(rendered.contains("start 00:00:00"));
+    assert!(rendered.contains("end 00:00:01"));
+}
+
+#[test]
+fn background_panel_shows_queued_tasks() {
+    let mut state = TuiState::default();
+    state.workspace_root = Some("/work/demo".into());
+    reduce(
+        &mut state,
+        Input::Frame(frame(
+            1,
+            "tool.result",
+            json!({
+                "call_id": "c1", "name": "bash", "ok": true,
+                "background": true, "task_id": "bg_queued",
+                "background_status": "queued", "started_at": 0.0,
+                "output": "{\"status\":\"queued\"}",
+            }),
+        )),
+    );
+    let _ = reduce(
+        &mut state,
+        Input::Action(UiAction::SidebarShowPanel(SidebarPanel::Background)),
+    );
+    let rendered = rendered(&state);
+    assert!(rendered.contains("queued"));
+    assert!(rendered.contains("◌"));
+    assert!(rendered.contains("start 00:00:00"));
+}
+
+#[test]
+fn background_failed_start_shows_target_and_start_time() {
+    let mut state = TuiState::default();
+    state.workspace_root = Some("/work/demo".into());
+    reduce(
+        &mut state,
+        Input::Frame(frame(
+            1,
+            "tool.result",
+            json!({
+                "call_id": "c1", "name": "start", "ok": false,
+                "background": true, "background_status": "failed",
+                "background_target": "bash", "started_at": 0.0,
+                "code": "E_BACKGROUND_LIMIT", "error": "queue full",
+                "output": "{\"status\":\"failed\"}",
+            }),
+        )),
+    );
+    let _ = reduce(
+        &mut state,
+        Input::Action(UiAction::SidebarShowPanel(SidebarPanel::Background)),
+    );
+    let rendered = rendered(&state);
+    assert!(rendered.contains("start · failed"));
+    assert!(rendered.contains("target bash"));
+    assert!(rendered.contains("start 00:00:00"));
 }
 
 #[test]
@@ -185,6 +243,72 @@ fn slash_background_command_selects_the_panel() {
     );
     let _ = reduce(&mut state, Input::Action(command.action));
     assert_eq!(state.sidebar.panel, SidebarPanel::Background);
+}
+
+fn background_state(ids: &[&str]) -> TuiState {
+    let mut state = TuiState::default();
+    state.workspace_root = Some("/work/demo".into());
+    for (index, task_id) in ids.iter().enumerate() {
+        reduce(
+            &mut state,
+            Input::Frame(frame(
+                index as u64 + 1,
+                "tool.result",
+                json!({
+                    "call_id": format!("c{index}"),
+                    "name": "bash",
+                    "ok": true,
+                    "background": true,
+                    "task_id": task_id,
+                    "background_status": "running",
+                    "started_at": index as f64,
+                    "output": "{\"status\":\"started\"}",
+                }),
+            )),
+        );
+    }
+    let _ = reduce(
+        &mut state,
+        Input::Action(UiAction::SidebarShowPanel(SidebarPanel::Background)),
+    );
+    state
+}
+
+#[test]
+fn background_panel_lists_newest_tasks_first() {
+    let state = background_state(&["bg_a", "bg_b", "bg_c"]);
+    let rendered = rendered(&state);
+    let a = rendered.find("bg_a").expect("bg_a");
+    let b = rendered.find("bg_b").expect("bg_b");
+    let c = rendered.find("bg_c").expect("bg_c");
+    assert!(c < b && b < a, "newest first: c={c} b={b} a={a}");
+}
+
+#[test]
+fn background_panel_scrolls_with_sidebar_keys() {
+    let ids: Vec<String> = (0..10).map(|index| format!("bg_{index}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let mut app = App::new(background_state(&refs), Theme::dark());
+    app.state.focus = Focus::Sidebar;
+
+    for _ in 0..3 {
+        let effects = app.handle_sidebar_key(key(KeyCode::Down)).unwrap();
+        assert!(effects.is_empty());
+    }
+    assert_eq!(app.state.sidebar.background_scroll, 3);
+    let scrolled = rendered(&app.state);
+    assert!(!scrolled.contains("bg_9"));
+    assert!(scrolled.contains("bg_6"));
+
+    for _ in 0..20 {
+        let _ = app.handle_sidebar_key(key(KeyCode::Down)).unwrap();
+    }
+    assert_eq!(app.state.sidebar.background_scroll, 9);
+
+    let _ = app.handle_sidebar_key(key(KeyCode::Home)).unwrap();
+    assert_eq!(app.state.sidebar.background_scroll, 0);
+    let top = rendered(&app.state);
+    assert!(top.contains("bg_9"));
 }
 
 #[test]
