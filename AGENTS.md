@@ -154,6 +154,24 @@ change requires breaking one, stop and redesign the change.
   `E_BACKGROUND_LIMIT`. `on_user` while busy buffers instead of pre-empting.
   Replay is WAL-derived: `replay_state` never needs `background_tools` or
   `auto_continue`.
+- Turn steering / adoption (`agent.steering.enabled`, default **on**;
+  `agent.session.input_policy` default `"steer"`): a `user.message` arriving
+  mid-turn goes to `step_inbox`; adoptable foreground calls are offered to the
+  manager as `background.adopt.requested`. Manager↔ToolRuntime is a two-phase
+  handshake (`tool.call.adopt.requested` → `tool.call.adopted|rejected` →
+  `background.started{adopted}` / `background.adopt.failed`); ToolRuntime is the
+  authority and rejects approval-pending calls. Pairing is gated by
+  `call_id in pending` + `adopted:true`, not by `promote_pending`; a real
+  terminal that wins the race removes the id and the late Started is ignored.
+  `promote_pending` must be cleared on every path that removes a call from
+  `pending`. Non-adoptable calls continue to block the turn. A steering-routed
+  `background.start.requested{steering:true}` that fails falls back to a
+  foreground `tool.call.requested` with the same call_id, except `E_DENIED` /
+  cancelled. Adopted calls keep the original model call id; the manager maps it
+  through `_by_call` and the projector through `adopted_calls` so
+  `tool.output.delta` still streams. Subagent adoption is **not** implemented.
+  Recovery publishes `background.adopt.failed` for unmatched adopt requests and
+  `lost` for started tasks without a terminal; it never re-executes.
 - Cross-session memory, retrieval/RAG and CQRS projections beyond the session
   catalogue are not implemented yet. Do not assume their APIs exist.
 

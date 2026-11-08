@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import inspect
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping, Optional
 
@@ -73,6 +74,23 @@ class _ApprovalSubject:
     side_effect: str = "dangerous"
 
 
+@dataclass
+class _PendingAdoption:
+    """One adoption handshake in flight with ``ToolRuntime``.
+
+    Provisional only: no ``BackgroundTask`` exists until ``tool.call.adopted``
+    arrives, so a rejected adoption can never leak a running task (§7.2).
+    """
+
+    call_id: str
+    session_id: str
+    tool: str
+    kind: str
+    event_id: str
+    trace_id: str
+    reason: Optional[str] = None
+
+
 class BackgroundTaskManager:
     """Process-local lifecycle owner for background tool/subagent tasks."""
 
@@ -91,10 +109,14 @@ class BackgroundTaskManager:
         artifacts=None,
         clock: Callable[[], float] = time.time,
         subagent_settings_for: Optional[Callable[[], SubagentSettings]] = None,
+        steering_enabled: bool = False,
     ) -> None:
         self.bus = bus
         self.settings = settings
         self.subagent_settings = subagent_settings
+        #: ``agent.steering.enabled`` — accepts adoption and steering-routed
+        #: starts even when the explicit ``start`` feature is off (D8/D9).
+        self.steering_enabled = bool(steering_enabled)
         self._subagent_settings_for = subagent_settings_for
         self._registry_for = registry_for
         self._session_kind = session_kind
@@ -111,6 +133,11 @@ class BackgroundTaskManager:
         #: ``start call id -> task_id`` retained until the task terminal.
         self._by_call: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        #: Provisional adoption handshakes: ``adoption_id -> _PendingAdoption``.
+        self._adoptions: dict[str, _PendingAdoption] = {}
+        #: Minimal recent underlying terminals keyed by ``(session_id, call_id)``.
+        #: Closes the "terminal arrives before the adoption request" race (§7.2).
+        self._recent_terminals: OrderedDict[tuple[str, str], dict] = OrderedDict()
         #: Sessions with a scheduled cross-session promotion task.
         self._promote_pending: set[str] = set()
         self._closed = False
@@ -122,11 +149,14 @@ class BackgroundTaskManager:
             return
         for pattern, handler in (
             ("background.start.requested", self.on_start),
+            ("background.adopt.requested", self.on_adopt),
             ("background.stop.requested", self.on_stop),
             ("background.list.requested", self.on_list),
             ("background.cancel.requested", self.on_cancel),
             ("tool.call.completed", self.on_tool_terminal),
             ("tool.call.failed", self.on_tool_terminal),
+            ("tool.call.adopted", self.on_tool_adopted),
+            ("tool.call.adopt.rejected", self.on_tool_adopt_rejected),
             ("subagent.completed", self.on_subagent_terminal),
             ("subagent.failed", self.on_subagent_terminal),
             ("tool.cancel.requested", self.on_foreground_cancel),
@@ -294,11 +324,9 @@ class BackgroundTaskManager:
         except BackgroundError as exc:
             await self._publish(
                 "background.start.failed",
-                {
-                    "call_id": call_id,
-                    "tool": payload.get("tool"),
-                    **exc.as_payload(),
-                },
+                self._start_failure_payload(
+                    payload, call_id, payload.get("tool"), exc,
+                ),
                 session_id=ev.session_id, trace_id=ev.trace_id, cause_id=ev.id,
             )
             return
@@ -311,11 +339,9 @@ class BackgroundTaskManager:
             )
             await self._publish(
                 "background.start.failed",
-                {
-                    "call_id": call_id,
-                    "tool": payload.get("tool"),
-                    **failure.as_payload(),
-                },
+                self._start_failure_payload(
+                    payload, call_id, payload.get("tool"), failure,
+                ),
                 session_id=ev.session_id, trace_id=ev.trace_id, cause_id=ev.id,
             )
             return
@@ -366,9 +392,14 @@ class BackgroundTaskManager:
         self, ev: Event, call_id: str, payload: Mapping[str, Any],
         *, exclude_task_id: Optional[str] = None, approved: bool = False,
     ) -> tuple[BackgroundTask, Any]:
-        if not self.settings.enabled:
+        steering = bool(payload.get("steering"))
+        if not self.settings.enabled and not (
+            steering and self.steering_enabled
+        ):
             raise BackgroundError(
-                E_BACKGROUND_DISABLED, "background tasks are disabled by the host",
+                E_BACKGROUND_DISABLED,
+                "background tasks are disabled by the host"
+                if not steering else "turn steering is disabled by the host",
             )
         kind = self._session_kind(ev.session_id)
         if kind != "root":
@@ -650,14 +681,22 @@ class BackgroundTaskManager:
                 promote=promote,
             )
             return
+        start_payload = (
+            task.start_event.payload
+            if isinstance(getattr(task.start_event, "payload", None), dict)
+            else {}
+        )
+        payload = self._start_failure_payload(
+            start_payload, call_id, task.name, failure,
+        )
+        if not payload.get("args") and start_payload.get("steering"):
+            # Older events may not carry args; the task kept them for exactly
+            # this foreground fallback.
+            payload["args"] = dict(task.args)
         self._drop_task(task)
         await self._publish(
             "background.start.failed",
-            {
-                "call_id": call_id,
-                "tool": task.name,
-                **failure.as_payload(),
-            },
+            payload,
             session_id=parent.session_id, trace_id=parent.trace_id,
             cause_id=parent.id,
         )
@@ -666,12 +705,25 @@ class BackgroundTaskManager:
             self._schedule_other_promotions(parent.session_id)
 
     @staticmethod
+    def _start_failure_payload(
+        request: Mapping[str, Any], call_id: str, tool, failure: BackgroundError,
+    ) -> dict:
+        payload = {"call_id": call_id, "tool": tool, **failure.as_payload()}
+        if request.get("steering"):
+            # The Agent may retry the same call id foreground (D15); it must
+            # receive the original args without guessing.
+            payload["steering"] = True
+            args = request.get("args")
+            payload["args"] = dict(args) if isinstance(args, dict) else {}
+        return payload
+
+    @staticmethod
     def _started_payload(
         task: BackgroundTask, *, status: Optional[str] = None,
     ) -> dict:
         if status is None:
             status = "queued" if task.status == QUEUED else "running"
-        return {
+        payload = {
             "call_id": task.start_call_id,
             "task_id": task.task_id,
             "name": task.name,
@@ -679,6 +731,345 @@ class BackgroundTaskManager:
             "status": status,
             "started_at": task.started_at,
         }
+        if task.adopted:
+            payload["adopted"] = True
+        return payload
+
+    # -- turn steering: adoption (design v0.1 §7) ---------------------------
+    async def on_adopt(self, ev: Event) -> None:
+        """Open a two-phase adoption of an in-flight foreground call."""
+        async with self._lock(ev.session_id):
+            await self._on_adopt_locked(ev)
+
+    async def _on_adopt_locked(self, ev: Event) -> None:
+        payload = ev.payload if isinstance(ev.payload, dict) else {}
+        call_id = payload.get("call_id")
+        tool = payload.get("tool")
+        kind = payload.get("kind") or "tool"
+        if not isinstance(call_id, str) or not call_id:
+            return
+
+        async def fail(code: str, message: str) -> None:
+            await self._publish_adopt_failure(
+                ev, call_id, tool, kind,
+                BackgroundError(code, message),
+            )
+
+        if not isinstance(tool, str) or not tool:
+            await fail(E_BACKGROUND_ARGS, "adopt.tool must be a non-empty string")
+            return
+        if not (self.settings.enabled or self.steering_enabled):
+            await fail(E_BACKGROUND_DISABLED, "turn steering is disabled")
+            return
+        if kind != "tool":
+            # Phase 1: subagent adoption is designed but not implemented.
+            await fail(
+                E_BACKGROUND_NOT_ALLOWED,
+                f"adoption of {kind!r} calls is not supported in v0.1",
+            )
+            return
+        existing = self._task_for_call(call_id)
+        if existing is not None:
+            # Idempotent retry: re-announce an adopted task so an Agent that
+            # lost the first Started can still pair its tool_call.
+            if existing.adopted and existing.start_published:
+                await self._publish(
+                    "background.started",
+                    self._started_payload(existing, status="running"),
+                    session_id=ev.session_id, trace_id=ev.trace_id,
+                    cause_id=ev.id,
+                )
+            return
+        if self._has_pending_adoption(ev.session_id, call_id):
+            return  # idempotent: handshake already in flight
+        if self._session_kind(ev.session_id) != "root":
+            await fail(
+                E_BACKGROUND_NOT_ALLOWED,
+                "background tasks are only allowed in root sessions",
+            )
+            return
+        if tool not in self.settings.allow:
+            await fail(
+                E_BACKGROUND_NOT_ALLOWED,
+                f"tool {tool!r} is not in agent.background.allow",
+            )
+            return
+
+        try:
+            registry = self._registry_for(ev.session_id)
+            if inspect.isawaitable(registry):
+                registry = await registry
+            spec = registry.spec(tool)
+        except ToolUnavailable as exc:
+            await fail(
+                E_BACKGROUND_NOT_ALLOWED,
+                f"tool {tool!r} is unavailable: {exc}",
+            )
+            return
+        except UnknownTool as exc:
+            await fail(
+                E_BACKGROUND_UNKNOWN_TOOL,
+                f"tool {tool!r} is not registered: {exc}",
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - errors are data
+            await fail(
+                E_BACKGROUND_SPAWN,
+                f"registry unavailable: {type(exc).__name__}: {exc}",
+            )
+            return
+        if getattr(spec, "plugin_id", None) is not None:
+            await fail(
+                E_BACKGROUND_NOT_ALLOWED,
+                f"plugin tool {tool!r} cannot be adopted",
+            )
+            return
+        if not getattr(spec, "backgroundable", False):
+            await fail(
+                E_BACKGROUND_NOT_ALLOWED,
+                f"tool {tool!r} is not background-capable",
+            )
+            return
+
+        # Terminal-first race: the call already finished before the adoption
+        # request was processed.  Announce the (already finished) task so the
+        # Agent can pair its tool_call, then close it with the recorded result.
+        recent = self._recent_terminals.get((ev.session_id, call_id))
+        if recent is not None:
+            await self._adopt_recent(ev, call_id, tool, kind, recent)
+            return
+
+        adoption_id = "ad_" + uuid7()
+        self._adoptions[adoption_id] = _PendingAdoption(
+            call_id=call_id,
+            session_id=ev.session_id,
+            tool=tool,
+            kind=kind,
+            event_id=ev.id,
+            trace_id=ev.trace_id,
+            reason=payload.get("reason"),
+        )
+        try:
+            await self._publish(
+                "tool.call.adopt.requested",
+                {"call_id": call_id, "adoption_id": adoption_id},
+                session_id=ev.session_id, trace_id=ev.trace_id,
+                cause_id=ev.id,
+            )
+        except asyncio.CancelledError:
+            self._adoptions.pop(adoption_id, None)
+            raise
+        except Exception as exc:  # noqa: BLE001 - errors are data
+            self._adoptions.pop(adoption_id, None)
+            await fail(
+                E_BACKGROUND_SPAWN,
+                f"failed to publish adoption request: {type(exc).__name__}: {exc}",
+            )
+
+    def _has_pending_adoption(self, session_id: str, call_id: str) -> bool:
+        return any(
+            pending.session_id == session_id and pending.call_id == call_id
+            for pending in self._adoptions.values()
+        )
+
+    async def _adopt_recent(
+        self, ev: Event, call_id: str, tool: str, kind: str, recent: dict,
+    ) -> None:
+        task = BackgroundTask(
+            task_id="bg_" + uuid7(),
+            start_call_id=call_id,
+            session_id=ev.session_id,
+            name=tool,
+            kind=kind,
+            args={},
+            trace_id=ev.trace_id,
+            start_event_id=ev.id,
+            status=RUNNING,
+            started_at=self.clock(),
+            start_published=True,
+            adopted=True,
+        )
+        self._tasks[task.task_id] = task
+        self._by_call[call_id] = task.task_id
+        try:
+            committed = await self._publish(
+                "background.started",
+                self._started_payload(task, status="running"),
+                session_id=ev.session_id, trace_id=ev.trace_id,
+                cause_id=ev.id,
+            )
+            if committed is None:
+                raise RuntimeError("background.started was not committed")
+        except asyncio.CancelledError:
+            self._drop_task(task)
+            raise
+        except Exception as exc:  # noqa: BLE001 - the task must not hang
+            self._drop_task(task)
+            await self._publish_adopt_failure(
+                ev, call_id, tool, kind,
+                BackgroundError(
+                    E_BACKGROUND_SPAWN,
+                    f"failed to announce adopted task: {exc}",
+                ),
+            )
+            return
+        task.started_seq = int(getattr(committed, "seq", 0) or 0)
+        await self._finish_from_recent(task, recent, cause_id=ev.id)
+
+    async def on_tool_adopted(self, ev: Event) -> None:
+        """``ToolRuntime`` accepted an adoption: materialise the task."""
+        async with self._lock(ev.session_id):
+            payload = ev.payload if isinstance(ev.payload, dict) else {}
+            adoption_id = payload.get("adoption_id")
+            call_id = payload.get("call_id")
+            pending = (
+                self._adoptions.get(adoption_id)
+                if isinstance(adoption_id, str) and adoption_id else None
+            )
+            if pending is None:
+                return  # duplicate or closed provisional
+            if pending.call_id != call_id or pending.session_id != ev.session_id:
+                return  # malformed ack: keep the provisional for the real one
+            self._adoptions.pop(adoption_id, None)
+
+            task = BackgroundTask(
+                task_id="bg_" + uuid7(),
+                start_call_id=call_id,
+                session_id=pending.session_id,
+                name=pending.tool,
+                kind=pending.kind,
+                args={},
+                trace_id=pending.trace_id,
+                start_event_id=pending.event_id,
+                status=RUNNING,
+                started_at=self.clock(),
+                start_published=True,
+                adopted=True,
+            )
+            self._tasks[task.task_id] = task
+            self._by_call[call_id] = task.task_id
+            try:
+                committed = await self._publish(
+                    "background.started",
+                    self._started_payload(task, status="running"),
+                    session_id=pending.session_id, trace_id=pending.trace_id,
+                    cause_id=pending.event_id,
+                )
+                if committed is None:
+                    raise RuntimeError("background.started was not committed")
+            except asyncio.CancelledError:
+                self._drop_task(task)
+                raise
+            except Exception as exc:  # noqa: BLE001 - never leave the Agent waiting
+                self._drop_task(task)
+                await self._publish_adopt_failure(
+                    ev, call_id, pending.tool, pending.kind,
+                    BackgroundError(
+                        E_BACKGROUND_SPAWN,
+                        f"failed to announce adopted task: {exc}",
+                    ),
+                    trace_id=pending.trace_id,
+                    cause_id=pending.event_id,
+                )
+                return
+            task.started_seq = int(getattr(committed, "seq", 0) or 0)
+
+            recent = self._recent_terminals.get((pending.session_id, call_id))
+            if recent is not None:
+                await self._finish_from_recent(
+                    task, recent, cause_id=pending.event_id,
+                )
+
+    async def on_tool_adopt_rejected(self, ev: Event) -> None:
+        """``ToolRuntime`` refused the adoption; close the handshake as failed."""
+        async with self._lock(ev.session_id):
+            payload = ev.payload if isinstance(ev.payload, dict) else {}
+            adoption_id = payload.get("adoption_id")
+            call_id = payload.get("call_id")
+            pending = (
+                self._adoptions.get(adoption_id)
+                if isinstance(adoption_id, str) and adoption_id else None
+            )
+            if pending is None:
+                return
+            if pending.call_id != call_id or pending.session_id != ev.session_id:
+                return
+            self._adoptions.pop(adoption_id, None)
+            code = payload.get("code") or E_BACKGROUND_NOT_ALLOWED
+            message = payload.get("error") or "adoption rejected"
+            info = payload.get("error_info")
+            if not isinstance(info, dict):
+                info = BackgroundError(code, message).as_error_info()
+            await self._publish(
+                "background.adopt.failed",
+                {
+                    "call_id": pending.call_id,
+                    "tool": pending.tool,
+                    "kind": pending.kind,
+                    "code": code,
+                    "error": message,
+                    "error_info": info,
+                },
+                session_id=pending.session_id, trace_id=pending.trace_id,
+                cause_id=pending.event_id,
+            )
+
+    async def _publish_adopt_failure(
+        self, ev: Event, call_id: str, tool, kind: str, failure: BackgroundError,
+        *, trace_id: Optional[str] = None, cause_id: Optional[str] = None,
+    ) -> None:
+        await self._publish(
+            "background.adopt.failed",
+            {
+                "call_id": call_id,
+                "tool": tool,
+                "kind": kind,
+                **failure.as_payload(),
+            },
+            session_id=ev.session_id,
+            trace_id=trace_id or ev.trace_id,
+            cause_id=cause_id or ev.id,
+        )
+
+    def _remember_terminal(
+        self, session_id: str, call_id: str, payload: Mapping[str, Any],
+    ) -> None:
+        key = (session_id, call_id)
+        self._recent_terminals[key] = {
+            "ok": bool(payload.get("ok", True)),
+            "output": payload.get("output"),
+            "output_ref": payload.get("output_ref"),
+            "output_tokens": payload.get("output_tokens"),
+            "code": payload.get("code"),
+            "error": payload.get("error"),
+            "error_info": payload.get("error_info"),
+            "summary": payload.get("summary"),
+            "summary_ref": payload.get("summary_ref"),
+            "usage": payload.get("usage") or {},
+            "rounds": payload.get("rounds"),
+            "child_session_id": payload.get("child_session_id"),
+        }
+        self._recent_terminals.move_to_end(key)
+        while len(self._recent_terminals) > 256:
+            self._recent_terminals.popitem(last=False)
+
+    async def _finish_from_recent(
+        self, task: BackgroundTask, recent: Mapping[str, Any], *,
+        cause_id: Optional[str] = None,
+    ) -> None:
+        if bool(recent.get("ok")):
+            fields = self._tool_output_fields(recent)
+            status = "completed"
+        else:
+            fields = {
+                "code": recent.get("code"),
+                "error": recent.get("error"),
+                "error_info": recent.get("error_info"),
+            }
+            status = "failed"
+        await self._finish_task(task, status, fields, cause_id=cause_id)
 
     # -- approval callbacks (§8.4) -----------------------------------------
     async def _resume_start(self, ev: Event) -> None:
@@ -883,6 +1274,8 @@ class BackgroundTaskManager:
             "status": (task.terminal_status if task.is_terminal else task.status),
             "started_at": task.started_at,
             "duration_ms": duration,
+            "adopted": task.adopted,
+            "start_call_id": task.start_call_id,
         }
 
     # -- cancel (§8.4 / §8.8) ----------------------------------------------
@@ -950,11 +1343,15 @@ class BackgroundTaskManager:
     # -- underlying terminals (§8.7) ---------------------------------------
     async def on_tool_terminal(self, ev: Event) -> None:
         payload = ev.payload if isinstance(ev.payload, dict) else {}
-        if not payload.get("background"):
-            return
+        call_id = payload.get("call_id")
+        background = bool(payload.get("background"))
         async with self._lock(ev.session_id):
-            task = self._tasks.get(payload.get("call_id"))
+            if isinstance(call_id, str) and call_id:
+                self._remember_terminal(ev.session_id, call_id, payload)
+            task = self._task_for_terminal(ev.session_id, call_id)
             if task is None or task.session_id != ev.session_id:
+                return
+            if not background and not task.adopted:
                 return
             if task.is_terminal:
                 return  # T2: first terminal wins
@@ -977,11 +1374,15 @@ class BackgroundTaskManager:
 
     async def on_subagent_terminal(self, ev: Event) -> None:
         payload = ev.payload if isinstance(ev.payload, dict) else {}
-        if not payload.get("background"):
-            return
+        call_id = payload.get("call_id")
+        background = bool(payload.get("background"))
         async with self._lock(ev.session_id):
-            task = self._tasks.get(payload.get("call_id"))
+            if isinstance(call_id, str) and call_id:
+                self._remember_terminal(ev.session_id, call_id, payload)
+            task = self._task_for_terminal(ev.session_id, call_id)
             if task is None or task.session_id != ev.session_id:
+                return
+            if not background and not task.adopted:
                 return
             if task.is_terminal:
                 return
@@ -1079,6 +1480,9 @@ class BackgroundTaskManager:
             "ok": status == "completed",
             **fields,
         }
+        if task.adopted:
+            payload["adopted"] = True
+            payload["start_call_id"] = task.start_call_id
         if status == "stopped":
             # The lifecycle code is stable regardless of the underlying
             # cancellation signal (E_CANCELLED, timeout, forced grace).
@@ -1334,6 +1738,10 @@ class BackgroundTaskManager:
         if task.stop_timer is not None:
             task.stop_timer.cancel()
             task.stop_timer = None
+        for adoption_id, pending in list(self._adoptions.items()):
+            if pending.session_id == task.session_id \
+                    and pending.call_id == task.start_call_id:
+                self._adoptions.pop(adoption_id, None)
 
     # -- stop grace (§8.6) --------------------------------------------------
     def _arm_stop_grace(self, task: BackgroundTask) -> None:
@@ -1370,10 +1778,13 @@ class BackgroundTaskManager:
     async def _request_cancel(self, task: BackgroundTask) -> None:
         if task.status == QUEUED:
             return  # never launched: nothing to cancel
+        # Adopted tasks are keyed by the original model call id in ToolRuntime /
+        # the orchestrator; normal background tasks use their own task_id.
+        target = task.start_call_id if task.adopted else task.task_id
         if task.kind == "tool":
             await self.bus.publish(Event.create(
                 "tool.cancel.requested",
-                {"call_id": task.task_id},
+                {"call_id": target},
                 session_id=task.session_id,
                 trace_id=task.trace_id,
                 cause_id=task.start_event_id,
@@ -1381,7 +1792,7 @@ class BackgroundTaskManager:
         else:
             await self.bus.publish(Event.create(
                 "subagent.cancel.requested",
-                {"call_ids": [task.task_id]},
+                {"call_ids": [target]},
                 session_id=task.session_id,
                 trace_id=task.trace_id,
                 cause_id=task.start_event_id,
@@ -1495,6 +1906,9 @@ class BackgroundTaskManager:
             task_terminals: dict[str, Mapping[str, Any]] = {}
             underlying: dict[str, Event] = {}
             stopping: set[str] = set()
+            adopt_requests: dict[str, Event] = {}
+            adopt_failed: set[str] = set()
+            adopt_announced: set[str] = set()
             fallback_trace = ""
 
             for ev in events:
@@ -1506,8 +1920,14 @@ class BackgroundTaskManager:
                 if ev.type == "background.start.requested" and call_id:
                     starts[call_id] = payload
                     start_events[call_id] = ev
+                elif ev.type == "background.adopt.requested" and call_id:
+                    adopt_requests[call_id] = ev
+                elif ev.type == "background.adopt.failed" and call_id:
+                    adopt_failed.add(call_id)
                 elif ev.type == "background.started" and call_id:
                     started[call_id] = ev
+                    if payload.get("adopted"):
+                        adopt_announced.add(call_id)
                 elif ev.type == "background.start.failed" and call_id:
                     start_terminal.add(call_id)
                 elif ev.type in (
@@ -1518,7 +1938,10 @@ class BackgroundTaskManager:
                 elif ev.type in (
                     "tool.call.completed", "tool.call.failed",
                     "subagent.completed", "subagent.failed",
-                ) and payload.get("background") and call_id:
+                ) and call_id:
+                    # Adopted calls keep the original model call id and may
+                    # not carry ``background:true`` if the crash raced the
+                    # ToolRuntime mark; match both normal and adopted tasks.
                     underlying[call_id] = ev
                 elif ev.type == "background.stop.requested" and payload.get("task_id"):
                     stopping.add(payload["task_id"])
@@ -1529,7 +1952,7 @@ class BackgroundTaskManager:
                     continue
                 self._tasks[task_id] = BackgroundTask(
                     task_id=task_id,
-                    start_call_id="",
+                    start_call_id=str(payload.get("start_call_id") or ""),
                     session_id=session_id,
                     name=str(payload.get("name") or ""),
                     kind=str(payload.get("kind") or "tool"),
@@ -1538,6 +1961,7 @@ class BackgroundTaskManager:
                     start_event_id="",
                     status=TERMINAL,
                     terminal=dict(payload),
+                    adopted=bool(payload.get("adopted")),
                 )
 
             # 2) Tasks that were announced: translate a recorded underlying
@@ -1568,15 +1992,17 @@ class BackgroundTaskManager:
                         started_seq=int(started_ev.seq or 0),
                         start_published=True,
                         start_event=start_ev,
+                        adopted=bool(payload.get("adopted")),
                     )
                     self._tasks[task_id] = task
                     self._by_call[call_id] = task_id
                 if task.is_terminal:
                     continue
-                # Underlying calls are keyed by the task id (the manager's
-                # ``call_id`` for ``tool.call.*`` / ``subagent.*``), not by the
-                # model's original start call id (§6.5).
+                # Normal background calls are keyed by the task id; adopted
+                # calls keep the original model call id (``start_call_id``).
                 terminal_ev = underlying.get(task_id)
+                if terminal_ev is None and task.adopted:
+                    terminal_ev = underlying.get(task.start_call_id)
                 if terminal_ev is None:
                     await self._finish_task(
                         task, "lost", {"reason": "process restart"},
@@ -1617,6 +2043,37 @@ class BackgroundTaskManager:
                     session_id=session_id,
                     trace_id=start_events[call_id].trace_id,
                     cause_id=start_events[call_id].id,
+                )
+
+            # 3.5) Adoptions that never reached ``background.started``: close
+            #      the handshake so S1 holds.  The half-round closer already
+            #      paired the still-pending call as interrupted.
+            for call_id, adopt_ev in adopt_requests.items():
+                if call_id in adopt_announced or call_id in adopt_failed:
+                    continue
+                adopt_payload = (
+                    adopt_ev.payload
+                    if isinstance(adopt_ev.payload, dict) else {}
+                )
+                await self._publish(
+                    "background.adopt.failed",
+                    {
+                        "call_id": call_id,
+                        "tool": adopt_payload.get("tool"),
+                        "kind": adopt_payload.get("kind") or "tool",
+                        "code": E_BACKGROUND_LOST,
+                        "error": "adoption lost after process restart",
+                        "error_info": error_info(
+                            E_BACKGROUND_LOST,
+                            source=ErrorSource.BACKGROUND.value,
+                            message="adoption lost after process restart",
+                            context={"call_id": call_id, "recovered": True},
+                        ).to_dict(),
+                        "recovered": True,
+                    },
+                    session_id=session_id,
+                    trace_id=adopt_ev.trace_id,
+                    cause_id=adopt_ev.id,
                 )
 
     def _register_pending_start(
@@ -1702,6 +2159,11 @@ class BackgroundTaskManager:
         if self.approvals is not None:
             with contextlib.suppress(Exception):
                 self.approvals.cancel(session_id=session_id)
+        for adoption_id, pending in list(self._adoptions.items()):
+            if pending.session_id == session_id:
+                self._adoptions.pop(adoption_id, None)
+        for key in [key for key in self._recent_terminals if key[0] == session_id]:
+            self._recent_terminals.pop(key, None)
         for task in list(self._tasks.values()):
             if task.session_id != session_id:
                 continue
@@ -1806,6 +2268,8 @@ class BackgroundTaskManager:
             return
         self._closed = True
         self.unsubscribe()
+        self._adoptions.clear()
+        self._recent_terminals.clear()
         remaining = [
             task for task in self._tasks.values() if not task.is_terminal
         ]
@@ -1882,6 +2346,21 @@ class BackgroundTaskManager:
         if task_id is None:
             return None
         return self._tasks.get(task_id)
+
+    def _task_for_terminal(
+        self, session_id: str, call_id: Optional[str],
+    ) -> Optional[BackgroundTask]:
+        """Resolve a terminal's call_id for both normal and adopted tasks.
+
+        Normal background tasks publish ``call_id == task_id``; adopted tasks
+        keep the original model call id, mapped through ``_by_call``.
+        """
+        if not call_id:
+            return None
+        task = self._tasks.get(call_id)
+        if task is not None:
+            return task if task.session_id == session_id else None
+        return self._task_for_call(call_id)
 
     def task(self, task_id: str) -> Optional[BackgroundTask]:
         return self._tasks.get(task_id)

@@ -133,14 +133,14 @@ class SessionGateway:
         *,
         limits: Optional["GatewayLimits"] = None,
         history: Optional["HistorySettings"] = None,
-        input_policy: str = "queue",
+        input_policy: str = "steer",
         gap_timeout: float = DEFAULT_GAP_TIMEOUT,
         ring_size: int = DEFAULT_RING_SIZE,
         read_only: bool = False,
         follow: bool = False,
         allow_approval: bool = False,
     ) -> None:
-        if input_policy not in ("queue", "interrupt", "reject"):
+        if input_policy not in ("queue", "steer", "interrupt", "reject"):
             raise ValueError(f"unknown input policy: {input_policy!r}")
         self.host = host
         self.session_id = session_id
@@ -587,7 +587,11 @@ class SessionGateway:
                 )
                 return {**cached, "duplicate": True}
 
-            if (
+            # ``steer`` deliberately accepts input while a turn is in flight:
+            # the Agent buffers it in ``step_inbox`` and adopts foreground calls
+            # so it can land at the turn boundary.  The other policies keep the
+            # historical busy queue.
+            if self.input_policy != "steer" and (
                 self._state.phase != phases.IDLE
                 or self._input_queue
                 or self._published_input_pending

@@ -551,7 +551,8 @@ class AgentHost:
         typo: ``E_CONFIG_UNKNOWN_BACKGROUND_TOOL`` (§14.3).
         """
         settings = cfg.agent.background
-        if not settings.enabled:
+        steering = cfg.agent.steering.enabled
+        if not (settings.enabled or steering):
             return []
         subagent_name = cfg.agent.subagents.tool_name
         known: Optional[set[str]] = None
@@ -576,13 +577,17 @@ class AgentHost:
                 continue
             except UnknownTool:
                 if known is not None and name not in known:
-                    raise ConfigError(
-                        f"unknown background tool {name!r}",
-                        key="agent.background.allow",
-                        code="E_CONFIG_UNKNOWN_BACKGROUND_TOOL",
-                        hint="use a built-in backgroundable tool or the "
-                             "configured subagent tool name",
-                    )
+                    if settings.enabled:
+                        raise ConfigError(
+                            f"unknown background tool {name!r}",
+                            key="agent.background.allow",
+                            code="E_CONFIG_UNKNOWN_BACKGROUND_TOOL",
+                            hint="use a built-in backgroundable tool or the "
+                                 "configured subagent tool name",
+                        )
+                    # Steering-only: the explicit ``start`` feature is off, so
+                    # a stale allow entry is skipped instead of failing startup.
+                    continue
                 continue  # known tool filtered out by the current mode
             # v0.1 non-goal: plugin tools are not background targets, even if a
             # plugin spec sets the capability flag (§2.2 / §19 R6).
@@ -616,22 +621,29 @@ class AgentHost:
             subagent_catalog = SubagentCatalog(cfg.agent.subagents)
 
         enabled = cfg.agent.background.enabled
+        steering = cfg.agent.steering.enabled
         targets = self._background_targets(
             cfg, registry, subagent_tools, workspace=workspace,
         )
         # stop/list_tasks are management tools, not start targets: keep them
-        # injected whenever the feature is on so a mode switch cannot strand an
-        # already-running task (§14.5).  `start` still needs a non-empty enum.
+        # injected whenever either feature is on so a mode switch cannot strand
+        # an already-running task (§14.5).  Explicit `start` still needs
+        # ``background.enabled`` and a non-empty enum; steering creates tasks
+        # on the model's behalf but does not expose the wrapper.
+        include_start = enabled and bool(targets)
+        include_manage = enabled or steering
         bg_schemas = (
-            background_tool_schemas(targets, include_management=True)
-            if enabled else []
+            background_tool_schemas(
+                targets if include_start else (),
+                include_management=include_manage,
+            )
+            if include_manage else []
         )
         background_tools = (
-            frozenset(
-                ({START_TOOL} if targets else set()) | {STOP_TOOL, LIST_TOOL}
-            )
-            if enabled else frozenset()
+            ({START_TOOL} if include_start else set())
+            | ({STOP_TOOL, LIST_TOOL} if include_manage else set())
         )
+        background_tools = frozenset(background_tools)
 
         def schemas() -> list[dict]:
             out = list(registry.schemas())
@@ -647,12 +659,14 @@ class AgentHost:
     ) -> Optional[BackgroundTaskManager]:
         """Build/refresh the manager when the feature is enabled (§8.1)."""
         settings = cfg.agent.background
+        steering = cfg.agent.steering.enabled
         runtime = getattr(self, "tool_runtime", None)
         if runtime is not None:
             runtime.max_background_timeout = settings.max_timeout_s
-        if not settings.enabled:
+        if not (settings.enabled or steering):
             if self.background is not None:
                 self.background.settings_changed(settings, cfg.agent.subagents)
+                self.background.steering_enabled = False
             return self.background
         if self.background is None:
             manager = BackgroundTaskManager(
@@ -673,11 +687,13 @@ class AgentHost:
                 subagent_settings_for=(
                     lambda: self._current_config().agent.subagents
                 ),
+                steering_enabled=steering,
             )
             manager.subscribe()
             self.background = manager
         else:
             self.background.settings_changed(settings, cfg.agent.subagents)
+            self.background.steering_enabled = steering
             self.background.approval_policy = cfg.agent.tools.approval
             self.background.auto_approve = frozenset(cfg.agent.tools.auto_approve)
         return self.background
@@ -997,12 +1013,18 @@ class AgentHost:
             )
             subagent_tools = resolution.subagent_tools
             subagent_settings = cfg.agent.subagents
-            schemas, background_tools, _targets = self._compose_schemas(
+            schemas, background_tools, targets = self._compose_schemas(
                 cfg, registry, subagent_tools, workspace=workspace,
             )
             self._ensure_background_manager(cfg)
             if subagent_tools:
                 self._ensure_orchestrator()
+            subagent_name = cfg.agent.subagents.tool_name
+            promotable_tools = (
+                frozenset(
+                    name for name in targets if name != subagent_name
+                ) if cfg.agent.steering.enabled else frozenset()
+            )
 
             info = await self.service.get_session(session_id)
             if info is None:
@@ -1035,6 +1057,8 @@ class AgentHost:
                     schemas=schemas,
                     subagent_tools=subagent_tools,
                     background_tools=background_tools,
+                    steering=cfg.agent.steering.enabled,
+                    promotable_tools=promotable_tools,
                     commit=commit,
                 )
             except AgentBusy as exc:
@@ -1592,10 +1616,17 @@ class AgentHost:
             budget = self._budget(cfg)
             subagent_tools = resolution.subagent_tools
             subagent_settings = cfg.agent.subagents
-            schemas, background_tools, _targets = self._compose_schemas(
+            schemas, background_tools, targets = self._compose_schemas(
                 cfg, registry, subagent_tools, workspace=workspace,
             )
             background_cfg = cfg.agent.background
+            steering_cfg = cfg.agent.steering
+            subagent_name = cfg.agent.subagents.tool_name
+            promotable_tools = (
+                frozenset(
+                    name for name in targets if name != subagent_name
+                ) if steering_cfg.enabled else frozenset()
+            )
             # The manager must exist before the first start event can be
             # published; an enabled feature with no eligible target simply
             # injects no schema (§5.5).
@@ -1608,6 +1639,8 @@ class AgentHost:
                 "context_policy": policy,
                 "subagent_tools": subagent_tools,
                 "background_tools": background_tools,
+                "steering": steering_cfg.enabled,
+                "promotable_tools": promotable_tools,
                 "auto_continue": background_cfg.auto_continue,
                 "cancel_on_interrupt": background_cfg.cancel_on_interrupt,
             }

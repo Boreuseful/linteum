@@ -49,6 +49,10 @@ class BackgroundTask:
     #: True once the start handshake's approval was granted (or was not
     #: needed), so a later promotion must not ask again.
     approved: bool = False
+    #: True when this task is a foreground call adopted by turn steering.  The
+    #: underlying request was not re-published; ``start_call_id`` is the
+    #: original model call id and the terminal is translated via ``_by_call``.
+    adopted: bool = False
     stop_requested_by: Optional[str] = None
     stop_reason: Optional[str] = None
     terminal: Optional[dict] = None

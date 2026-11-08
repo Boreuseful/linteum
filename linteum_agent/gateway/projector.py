@@ -75,6 +75,10 @@ class ProjectorState:
     background: tuple = ()
     background_running: int = 0
     background_task_ids: tuple = ()
+    #: ``((call_id, task_id), ...)`` for foreground calls adopted by turn
+    #: steering.  Late ``tool.output.delta`` events are routed to the task card
+    #: by the original call id; bounded.
+    adopted_calls: tuple = ()
     #: Current mode summary (``name``/``source``/``digest``/``refresh``).
     mode: Optional[dict] = None
     #: Request ids whose final ``llm.*`` event has already been projected.  A
@@ -210,6 +214,7 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
     background = {task_id: dict(info) for task_id, info in state.background}
     background_running = state.background_running
     background_task_ids = list(state.background_task_ids)
+    adopted_calls = dict(state.adopted_calls)
 
     def _complete_request(request_id: Optional[str]) -> None:
         if request_id and request_id not in completed:
@@ -376,13 +381,19 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
                 "call_id": call_id,
                 "text": _preview_text(payload.get("text", "") or ""),
             }, ephemeral=True))
-        elif call_id in background:
-            # Streaming output of a background task: UI-only, never a state change.
-            frames.append(ProjectedFrame("tool.delta", {
+        elif call_id in background or call_id in adopted_calls:
+            # Streaming output of a background/adopted task: UI-only, never a
+            # state change.  Adopted calls keep the original model call id, so
+            # map it to the task id for the background card.
+            frame = {
                 "call_id": call_id,
                 "background": True,
                 "text": _preview_text(payload.get("text", "") or ""),
-            }, ephemeral=True))
+            }
+            task_id = adopted_calls.get(call_id)
+            if task_id is not None:
+                frame["background_task_id"] = task_id
+            frames.append(ProjectedFrame("tool.delta", frame, ephemeral=True))
         # else: a coalesced delta after the authoritative tool result — drop it.
 
     elif etype in ("tool.call.completed", "tool.call.failed"):
@@ -659,20 +670,28 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         status = payload.get("status")
         if status not in ("queued", "running"):
             status = "running"
+        adopted = bool(payload.get("adopted"))
         if was_pending:
             # Only the first Started pairs the start call.  A later promotion
             # (queued -> running) is a status update and must not emit a second
             # tool.result for the same call.
             output = json.dumps({
-                "status": "queued" if status == "queued" else "started",
+                "status": (
+                    "backgrounded" if adopted
+                    else ("queued" if status == "queued" else "started")
+                ),
                 "task_id": task_id,
                 "tool": payload.get("name"),
                 "kind": payload.get("kind", "tool"),
                 "note": (
-                    "Queued until a background slot is free. "
+                    "Moved to the background because new user input arrived. "
                     "Use stop(task_id=...) to cancel."
-                    if status == "queued"
-                    else "Use stop(task_id=...) to cancel."
+                    if adopted else (
+                        "Queued until a background slot is free. "
+                        "Use stop(task_id=...) to cancel."
+                        if status == "queued"
+                        else "Use stop(task_id=...) to cancel."
+                    )
                 ),
             }, ensure_ascii=False)
             frames.append(ProjectedFrame("tool.result", {
@@ -690,7 +709,8 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
                 # a foreground bash call.
                 "background": True,
                 "task_id": task_id,
-                "background_status": status,
+                "background_status": "backgrounded" if adopted else status,
+                "adopted": adopted,
                 "started_at": event.ts,
             }))
         if isinstance(task_id, str) and task_id:
@@ -702,6 +722,7 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
                     "name": payload.get("name"),
                     "kind": payload.get("kind", "tool"),
                     "status": status,
+                    "adopted": adopted,
                     "started_at": event.ts,
                     "started_seq": int(event.seq or 0),
                     "duration_ms": 0,
@@ -711,6 +732,11 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
                 # Promotion updates queued -> running; never roll back a
                 # terminal task.
                 info["status"] = status
+                info["adopted"] = bool(info.get("adopted")) or adopted
+            if adopted and call_id:
+                adopted_calls[call_id] = task_id
+                while len(adopted_calls) > 64:
+                    adopted_calls.pop(next(iter(adopted_calls)))
             frames.append(ProjectedFrame("background.started", {
                 **dict(info),
                 "start_call_id": call_id,
@@ -840,6 +866,16 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         }))
         background = _trim_background(background)
 
+    elif etype == "background.adopt.failed":
+        frames.append(ProjectedFrame("notice", {
+            "kind": "steering_failed",
+            "call_id": payload.get("call_id"),
+            "tool": payload.get("tool"),
+            "target_kind": payload.get("kind"),
+            "code": payload.get("code"),
+            "error_info": _as_error_info(payload),
+        }))
+
     elif etype == "background.cancel.requested":
         frames.append(ProjectedFrame("notice", {
             "kind": "background_cancel",
@@ -954,6 +990,7 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         background=tuple(background.items()),
         background_running=background_running,
         background_task_ids=tuple(background_task_ids),
+        adopted_calls=tuple(adopted_calls.items()),
         mode=mode,
         completed_requests=tuple(completed),
     )

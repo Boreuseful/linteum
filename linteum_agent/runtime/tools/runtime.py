@@ -28,10 +28,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from collections import OrderedDict
 from collections.abc import Collection, Iterable
 from typing import Callable, Optional
 
 from ...bus.artifact import NullArtifactStore
+from ...bus.errors import ErrorCode
 from ..errors import ErrorSource, error_info
 from ...bus.scheduler.cancel import Cancelled, CancelToken
 from ...bus.scheduler.pool import WorkerPool
@@ -59,6 +61,15 @@ DEFAULT_POOL_SIZE = 16
 LOCATION_ON_CALL = "linteum_agent.runtime.tools.runtime.ToolRuntime.on_call"
 LOCATION_EXECUTE = "linteum_agent.runtime.tools.runtime.ToolRuntime._execute"
 LOCATION_DENY = "linteum_agent.runtime.tools.runtime.ToolRuntime.deny"
+LOCATION_ADOPT = "linteum_agent.runtime.tools.runtime.ToolRuntime.on_adopt"
+
+#: Turn steering error codes (kept local so ``runtime.tools`` never imports
+#: ``runtime.background``; AGENTS.md dependency direction).
+E_BACKGROUND_APPROVAL = ErrorCode.E_BACKGROUND_APPROVAL.value
+E_BACKGROUND_NOT_RUNNING = ErrorCode.E_BACKGROUND_NOT_RUNNING.value
+
+#: How many finished call ids are remembered for late adoption requests.
+FINISHED_CALL_RETAIN = 256
 
 
 class ToolRuntime:
@@ -126,7 +137,17 @@ class ToolRuntime:
         self._names: dict[str, str] = {}
         #: ``call_id`` values issued by the background manager (``background``
         #: payload flag).  Used by cancel scopes and terminal echo (§9.1/§9.2).
+        #: Turn steering adds adopted foreground ids here at runtime.
         self._background: set[str] = set()
+        #: Calls adopted by turn steering (for ``adopted:true`` in deltas and
+        #: terminals).  Subset of ``_background`` once marked.
+        self._adopted: set[str] = set()
+        #: ``call_id -> adoption_id`` for requests that arrived before the
+        #: original ``tool.call.requested`` reached this runtime.
+        self._pending_adopts: dict[str, str] = {}
+        #: Recently finished call ids, so a late adoption can be rejected
+        #: deterministically instead of hanging the manager.
+        self._finished_calls: OrderedDict[str, None] = OrderedDict()
 
         if auto_subscribe:
             self.subscribe()
@@ -134,6 +155,7 @@ class ToolRuntime:
     # -- subscription -------------------------------------------------------
     def subscribe(self) -> None:
         self.bus.on("tool.call.requested", self.on_call)
+        self.bus.on("tool.call.adopt.requested", self.on_adopt)
         self.bus.on("tool.cancel.requested", self.on_cancel)
         self.bus.on("approval.granted", self.on_approval)
         self.bus.on("approval.denied", self.on_denial)
@@ -191,6 +213,12 @@ class ToolRuntime:
         policy = await self._effective_approval_policy(ev.session_id)
         gate = spec.requires_approval and policy != "allow"
         if gate and not (background and approved):
+            adoption_id = await self._resolve_pending_adopt(ev, call_id)
+            if adoption_id:
+                await self._reject_adopt(
+                    ev, call_id, adoption_id, E_BACKGROUND_APPROVAL,
+                    "approval required",
+                )
             if policy == "deny":
                 await self._fail(ev, call_id,
                                  f"approval required but policy is 'deny': {name}",
@@ -202,6 +230,83 @@ class ToolRuntime:
 
         # ④ fire-and-forget on the worker pool (non-blocking)
         await self._spawn(ev, spec, registry)
+
+    # -- turn steering: adoption handshake (design v0.1 §8) -----------------
+    async def on_adopt(self, ev) -> None:
+        """Answer the manager's ``tool.call.adopt.requested`` (S7).
+
+        This runtime is the authority on whether an in-flight foreground call
+        can be re-owned as a background task.  It answers exactly once per
+        request: ``tool.call.adopted`` or ``tool.call.adopt.rejected``.
+        """
+        payload = ev.payload if isinstance(ev.payload, dict) else {}
+        call_id = payload.get("call_id")
+        adoption_id = payload.get("adoption_id")
+        if (not isinstance(call_id, str) or not call_id
+                or not isinstance(adoption_id, str) or not adoption_id):
+            return
+
+        # Approval-pending calls are not adoptable in v0.1 (§12.2): the gate
+        # was already opened for a foreground decision, and cancelling it later
+        # would leave the adopted task without a terminal.
+        if call_id in self.approvals.pending:
+            await self._reject_adopt(
+                ev, call_id, adoption_id, E_BACKGROUND_APPROVAL,
+                "call is waiting for approval",
+            )
+            return
+
+        # Already executing (or already registered on the execution lane).
+        if call_id in self.inflight or call_id in self.tokens:
+            self._background.add(call_id)
+            self._adopted.add(call_id)
+            await self._ack_adopt(ev, call_id, adoption_id)
+            return
+
+        # The original ``tool.call.requested`` has not reached this runtime yet.
+        # Buffer the adoption; ``on_call``/``_spawn`` will decide once it does.
+        if call_id in self._pending_adopts:
+            return
+        if call_id in self._finished_calls:
+            await self._reject_adopt(
+                ev, call_id, adoption_id, E_BACKGROUND_NOT_RUNNING,
+                "call already finished",
+            )
+            return
+        self._pending_adopts[call_id] = adoption_id
+
+    async def _ack_adopt(self, ev, call_id: str, adoption_id: str) -> None:
+        await self.bus.publish(ev.child("tool.call.adopted", {
+            "call_id": call_id,
+            "adoption_id": adoption_id,
+        }))
+
+    async def _reject_adopt(
+        self, ev, call_id: str, adoption_id: str, code: str, message: str,
+    ) -> None:
+        info = error_info(
+            code,
+            source=ErrorSource.TOOL.value,
+            location=LOCATION_ADOPT,
+            message=message,
+            enters_history=False,
+        )
+        await self.bus.publish(ev.child("tool.call.adopt.rejected", {
+            "call_id": call_id,
+            "adoption_id": adoption_id,
+            "code": code,
+            "error": message,
+            "error_info": info.to_dict(),
+        }))
+
+    async def _resolve_pending_adopt(self, ev, call_id: str) -> Optional[str]:
+        """Pop a buffered adoption for ``call_id``, if any."""
+        return self._pending_adopts.pop(call_id, None)
+
+    def _remember_finished(self, call_id: str) -> None:
+        self._finished_calls[call_id] = None
+        while len(self._finished_calls) > FINISHED_CALL_RETAIN:
+            self._finished_calls.popitem(last=False)
 
     async def resume_approved(self, ev) -> None:
         """Re-enter execution after a human granted the request (§24)."""
@@ -235,6 +340,12 @@ class ToolRuntime:
         self._names[call_id] = spec.name
         if ev.payload.get("background"):
             self._background.add(call_id)
+        # Turn steering: an adoption that raced ahead of the original request
+        # is resolved here, once the call is genuinely being spawned.
+        adoption_id = await self._resolve_pending_adopt(ev, call_id)
+        if adoption_id:
+            self._background.add(call_id)
+            self._adopted.add(call_id)
         # Tool work runs on the execution lane: a long/blocked tool must never
         # consume the session's dispatch slots (async ReAct AR-16).
         task = self.pool.spawn(
@@ -243,6 +354,8 @@ class ToolRuntime:
             lane="execution",
         )
         self.inflight[call_id] = task
+        if adoption_id:
+            await self._ack_adopt(ev, call_id, adoption_id)
 
         def _done(_task, cid=call_id):
             self.inflight.pop(cid, None)
@@ -291,9 +404,12 @@ class ToolRuntime:
     async def _execute(self, ev, spec, token: CancelToken, registry=None) -> None:
         call_id = ev.payload["call_id"]
         reg = self.reg if registry is None else registry
-        background = bool(ev.payload.get("background"))
+        # ``initial_background`` selects the timeout/semaphore at spawn time.
+        # Turn steering may adopt the call later; deltas and the terminal read
+        # the mutable ``_background`` set instead (§8.2).
+        initial_background = bool(ev.payload.get("background"))
         timeout = spec.timeout
-        if background:
+        if initial_background:
             # Only the manager may widen a background call; foreground args can
             # never raise their own timeout (§9.3).
             override = ev.payload.get("timeout_s")
@@ -313,11 +429,16 @@ class ToolRuntime:
             args = spec.validate(ev.payload.get("args") or {})  # schema check
 
             async def progress(payload: dict) -> None:
-                await self.bus.publish(ev.child("tool.output.delta", {
-                    "call_id": call_id, "background": background, **payload,
-                }))
+                delta = {
+                    "call_id": call_id,
+                    "background": call_id in self._background,
+                    **payload,
+                }
+                if call_id in self._adopted:
+                    delta["adopted"] = True
+                await self.bus.publish(ev.child("tool.output.delta", delta))
 
-            async with reg.semaphore(spec.name, background=background):
+            async with reg.semaphore(spec.name, background=initial_background):
                 async with asyncio.timeout(timeout):          # hard timeout
                     out = await self.sandbox.run(spec, args, token, progress, call_id=call_id)
             result = {"ok": True, "output": self._normalise(out)}
@@ -345,14 +466,22 @@ class ToolRuntime:
 
     async def _finish(self, ev, call_id, result: dict, dedup: bool = False) -> None:
         """Externalise oversized output, record the result, publish the outcome."""
+        # Read the mutable markers before clearing them: turn steering may have
+        # adopted this call after spawn (§8.2 / S4).
+        adopted = call_id in self._adopted
+        background = (
+            bool(ev.payload.get("background"))
+            or call_id in self._background
+        )
+        start_call_id = ev.payload.get("start_call_id")
+        if adopted and not start_call_id:
+            start_call_id = call_id
         self.tokens.pop(call_id, None)
         self._sessions.pop(call_id, None)
         self._names.pop(call_id, None)
         self._background.discard(call_id)
-        # Echo the request markers so BackgroundTaskManager can recognise the
-        # terminal as its own (T4 / §6.5).
-        background = bool(ev.payload.get("background"))
-        start_call_id = ev.payload.get("start_call_id")
+        self._adopted.discard(call_id)
+        self._remember_finished(call_id)
 
         ok = bool(result.get("ok"))
         if ok:
@@ -375,12 +504,20 @@ class ToolRuntime:
         }
         if background:
             payload["background"] = True
+        if adopted:
+            payload["adopted"] = True
         if start_call_id:
             payload["start_call_id"] = start_call_id
         await self.bus.publish(ev.child(etype, payload))
 
     async def _fail(self, ev, call_id, message: str, code: str, *,
                     exc=None, retryable: Optional[bool] = None) -> None:
+        # A buffered adoption must not outlive a call that failed before spawn.
+        adoption_id = self._pending_adopts.pop(call_id, None)
+        if adoption_id:
+            await self._reject_adopt(
+                ev, call_id, adoption_id, E_BACKGROUND_NOT_RUNNING, message,
+            )
         if retryable is None:
             retryable = code == E_PLUGIN_UNLOADING
         info = error_info(code, source=ErrorSource.TOOL.value, location=LOCATION_ON_CALL,

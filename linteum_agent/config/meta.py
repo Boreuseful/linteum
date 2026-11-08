@@ -291,6 +291,16 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "type": "int",
         "minimum": 1,
     },
+    # -- agent.steering -------------------------------------------------
+    "agent.steering.enabled": {
+        "title": "Turn 边界插话",
+        "type": "bool",
+        "description": (
+            "用户消息在 LLM/前台工具执行期间到达时，把可后台化的前台调用 "
+            "adoption 为后台任务，使消息在当前 Turn 边界注入。默认开启；"
+            "显式 start 仍需 agent.background.enabled。"
+        ),
+    },
     # -- agent.skills ---------------------------------------------------
     "agent.skills.enabled": {
         "title": "启用 Skills",
@@ -348,8 +358,11 @@ FIELD_META: dict[str, dict[str, Any]] = {
     "agent.session.input_policy": {
         "title": "忙碌输入策略",
         "type": "enum",
-        "enum": ("queue", "interrupt", "reject"),
-        "description": "agent 忙碌时收到新消息的处理方式。",
+        "enum": ("queue", "steer", "interrupt", "reject"),
+        "description": (
+            "agent 忙碌时收到新消息的处理方式。steer：立即发布，由 Agent "
+            "在 Turn 边界注入；queue：等 idle 再释放。"
+        ),
     },
     "agent.session.idle_ttl_ms": {
         "title": "空闲回收 ms",

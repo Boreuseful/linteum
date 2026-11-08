@@ -222,6 +222,20 @@ class BackgroundSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class SteeringSettings:
+    """Turn-boundary steering / foreground-call adoption (design v0.1 §9.1).
+
+    When enabled, a ``user.message`` arriving while a turn is in flight makes
+    the Agent adopt cancellable foreground calls into background tasks so the
+    turn can close at its boundary instead of waiting for a long tool.  It does
+    **not** expose ``start`` to the model; that stays behind
+    :attr:`BackgroundSettings.enabled`.
+    """
+
+    enabled: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class BudgetSettings:
     """Session budget limits (0 = unlimited)."""
 
@@ -235,7 +249,7 @@ class BudgetSettings:
 class SessionSettings:
     """Defaults for newly created sessions."""
 
-    input_policy: str = "queue"          # queue | interrupt | reject
+    input_policy: str = "steer"          # queue | steer | interrupt | reject
     idle_ttl_ms: int = 1_800_000
 
 
@@ -309,6 +323,7 @@ class AgentSettings:
     skills: SkillsSettings = field(default_factory=SkillsSettings)
     subagents: SubagentSettings = field(default_factory=SubagentSettings)
     background: BackgroundSettings = field(default_factory=BackgroundSettings)
+    steering: SteeringSettings = field(default_factory=SteeringSettings)
     budget: BudgetSettings = field(default_factory=BudgetSettings)
     session: SessionSettings = field(default_factory=SessionSettings)
     modes: ModeSettings = field(default_factory=ModeSettings)
@@ -1012,7 +1027,7 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
 
     # -- agent.session --------------------------------------------------
     session = config.agent.session
-    if session.input_policy not in ("queue", "interrupt", "reject"):
+    if session.input_policy not in ("queue", "steer", "interrupt", "reject"):
         _issue(issues, "agent.session.input_policy", "E_CONFIG_ENUM",
                f"unknown input policy {session.input_policy!r}")
     if session.idle_ttl_ms < 0:

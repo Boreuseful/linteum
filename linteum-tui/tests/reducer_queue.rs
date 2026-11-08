@@ -79,6 +79,54 @@ fn send_creates_sending_entry_before_result() {
 }
 
 #[test]
+fn send_while_thinking_still_emits_user_message() {
+    let mut s = state();
+    s.session = Some(SessionView {
+        phase: "thinking".into(),
+        ..Default::default()
+    });
+    s.composer.text = "steer now".into();
+
+    let effects = reduce(&mut s, Input::Action(UiAction::Send));
+
+    assert_eq!(s.queue.entries.len(), 1);
+    assert_eq!(s.queue.entries[0].state, QueueEntryState::Sending);
+    assert!(s.composer.text.is_empty());
+    assert!(
+        matches!(effects[0], Effect::SendCommand(ref c) if c.name == "user.message")
+    );
+}
+
+#[test]
+fn steer_accepted_while_busy_delivers_on_frame() {
+    let mut s = state();
+    s.session = Some(SessionView {
+        phase: "thinking".into(),
+        ..Default::default()
+    });
+    s.composer.text = "steer now".into();
+    reduce(&mut s, Input::Action(UiAction::Send));
+    let id = s.queue.entries[0].client_message_id.clone();
+
+    // `input_policy=steer` accepts immediately: accepted=true, queued=false.
+    reduce(&mut s, Input::CommandResult(result_ok(&id, true, false)));
+    assert_eq!(s.queue.entries[0].state, QueueEntryState::Sending);
+
+    reduce(
+        &mut s,
+        Input::Frame(frame(
+            "user.message",
+            2,
+            serde_json::json!({"text": "steer now", "client_message_id": id}),
+        )),
+    );
+    assert!(s.queue.entries.is_empty());
+    assert_eq!(s.transcript.items.len(), 1);
+    // The message is delivered without leaving the busy phase.
+    assert_eq!(s.session.as_ref().unwrap().phase, "thinking");
+}
+
+#[test]
 fn frame_before_result_delivers_once() {
     let mut s = state();
     s.composer.text = "hello".into();

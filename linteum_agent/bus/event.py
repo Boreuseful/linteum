@@ -66,6 +66,10 @@ KNOWN_TYPES: frozenset = frozenset(
         "tool.call.completed",
         "tool.call.failed",
         "tool.cancel.requested",
+        # Turn steering: two-phase foreground-call adoption (design v0.1 §5)
+        "tool.call.adopt.requested",
+        "tool.call.adopted",
+        "tool.call.adopt.rejected",
         "approval.required",
         "approval.granted",
         "approval.denied",
@@ -92,6 +96,9 @@ KNOWN_TYPES: frozenset = frozenset(
         "background.stopped",
         "background.lost",
         "background.cancel.requested",
+        # Turn steering: Agent asks the manager to adopt an in-flight call
+        "background.adopt.requested",
+        "background.adopt.failed",
         "agent.paused",
         "agent.resumed",
         "agent.completed",

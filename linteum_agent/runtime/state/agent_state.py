@@ -115,6 +115,11 @@ class AgentState:
     #: ``start`` / ``stop`` / ``list_tasks`` calls).  Task ids never enter
     #: ``pending`` (async ReAct design v0.1 T3).
     pending_background: set = field(default_factory=set)
+    #: Foreground calls for which ``background.adopt.requested`` was published
+    #: and no outcome has arrived yet.  Bookkeeping only: pairing an adopted
+    #: call is gated by ``call_id in pending`` + ``adopted:true``, because the
+    #: real terminal may win the race and remove the id first (steering §6.1).
+    promote_pending: set = field(default_factory=set)
     #: ``task_id -> {task_id,name,kind,status,start_call_id,started_seq,
     #: finished_seq,output_ref,code,error}``.  Only references/summaries are
     #: stored — never the full task output (§7.1 / I11).
@@ -176,11 +181,26 @@ class AgentState:
                 "B1: pending_background is not a subset of pending "
                 f"{sorted(self.pending_background - self.pending)}"
             )
+        if not self.promote_pending <= self.pending:  # S3 (steering v0.1)
+            problems.append(
+                "S3: promote_pending is not a subset of pending "
+                f"{sorted(self.promote_pending - self.pending)}"
+            )
+        overlap = self.promote_pending & self.cancelled
+        if overlap:  # S3
+            problems.append(
+                f"S3: promote_pending overlaps cancelled {sorted(overlap)}"
+            )
         if self.phase == phases.IDLE:
             if self.pending_background:  # T5
                 problems.append(
                     "T5: idle with non-empty pending_background "
                     f"{sorted(self.pending_background)}"
+                )
+            if self.promote_pending:  # S3
+                problems.append(
+                    "S3: idle with non-empty promote_pending "
+                    f"{sorted(self.promote_pending)}"
                 )
             if self.step_inbox:  # T5
                 problems.append(
@@ -299,6 +319,7 @@ class AgentState:
             "pending_subagents": sorted(self.pending_subagents),
             "subagent_usage_accounted": sorted(self.subagent_usage_accounted),
             "pending_background": sorted(self.pending_background),
+            "promote_pending": sorted(self.promote_pending),
             "background": {task_id: dict(meta) for task_id, meta in self.background.items()},
             "background_usage_accounted": sorted(self.background_usage_accounted),
             "step_inbox": [dict(message) for message in self.step_inbox],
@@ -334,6 +355,7 @@ class AgentState:
             pending_subagents=set(data.get("pending_subagents", [])),
             subagent_usage_accounted=set(data.get("subagent_usage_accounted", [])),
             pending_background=set(data.get("pending_background", [])),
+            promote_pending=set(data.get("promote_pending", [])),
             background={
                 str(task_id): dict(meta)
                 for task_id, meta in (data.get("background") or {}).items()

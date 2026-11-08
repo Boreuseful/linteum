@@ -22,7 +22,7 @@ import json
 from typing import Optional, Sequence
 
 from ..bus.artifact import NullArtifactStore, hydrate_events
-from ..bus.errors import BusError
+from ..bus.errors import BusError, ErrorCode
 from ..bus.event import INLINE_LIMIT, Event, uuid7
 from .context import ContextBuilder, ContextPolicy, PassthroughContextBuilder, normalise_message
 from .errors import ErrorSource, error_info
@@ -76,6 +76,8 @@ class Agent:
         context_policy: Optional[ContextPolicy] = None,
         subagent_tools: frozenset[str] = frozenset(),
         background_tools: frozenset[str] = frozenset(),
+        steering: bool = False,
+        promotable_tools: frozenset[str] = frozenset(),
         auto_continue: bool = True,
         cancel_on_interrupt: bool = False,
         auto_subscribe: bool = True,
@@ -93,6 +95,11 @@ class Agent:
         #: / ``list_tasks``).  Empty for child sessions and when the feature is
         #: disabled, preserving today's behaviour exactly (D10/D11).
         self._background_tools = frozenset(background_tools)
+        #: Turn steering: adopt in-flight foreground calls at a turn boundary
+        #: and route new calls to the background while user input is pending.
+        self._steering = bool(steering)
+        #: Ordinary tool names eligible for background routing/adoption.
+        self._promotable_tools = frozenset(promotable_tools)
         #: ``agent.background.auto_continue`` — whether an idle session opens a
         #: new step when a completed/failed task terminal arrives (D8).
         self._auto_continue = bool(auto_continue)
@@ -154,6 +161,7 @@ class Agent:
             # task terminals into notifications (§7.1).
             ("background.started", self.on_background_started),
             ("background.start.failed", self.on_background_start_failed),
+            ("background.adopt.failed", self.on_background_adopt_failed),
             ("background.stop.completed", self.on_background_stop_done),
             ("background.stop.failed", self.on_background_stop_done),
             ("background.list.completed", self.on_background_list_done),
@@ -191,6 +199,8 @@ class Agent:
         schemas=_UNSET,
         subagent_tools: Optional[frozenset[str]] = None,
         background_tools: Optional[frozenset[str]] = None,
+        promotable_tools: Optional[frozenset[str]] = None,
+        steering: Optional[bool] = None,
         commit=None,
     ) -> None:
         """Replace the host-owned surface under the reducer lock (§10.2).
@@ -243,6 +253,10 @@ class Agent:
                 self._subagent_tools = frozenset(subagent_tools)
             if background_tools is not None:
                 self._background_tools = frozenset(background_tools)
+            if promotable_tools is not None:
+                self._promotable_tools = frozenset(promotable_tools)
+            if steering is not None:
+                self._steering = bool(steering)
 
     def close(self) -> None:
         """Release the bus subscriptions (alias of :meth:`unsubscribe`)."""
@@ -272,12 +286,79 @@ class Agent:
             self._tick()
             await self._intent("llm.request", ev)
             return
-        # A step is already in flight: buffer the input and do not disturb the
-        # provider stream.  It lands in ``messages`` at the step boundary (D7 /
+        # A turn is already in flight: buffer the input and do not disturb the
+        # provider stream.  It lands in ``messages`` at the turn boundary (D7 /
         # §7.7).  A running compaction is deliberately not cancelled: it will
         # finish and ``_intent`` flushes this message.
         self.state.step_inbox.append(message)
         self._tick()
+        if self._steering and self.state.phase in (
+            phases.ACTING, phases.AWAITING_TOOLS,
+        ):
+            await self._promote_inflight(ev)
+
+    def _call_name(self, call_id: str) -> Optional[str]:
+        """Find the model's tool name for ``call_id`` in recorded messages."""
+        for message in reversed(self.state.messages):
+            for call in message.get("tool_calls") or ():
+                if (call.get("call_id") or call.get("id")) == call_id:
+                    return call.get("name")
+        return None
+
+    def _call_args(self, call_id: str) -> dict:
+        for message in reversed(self.state.messages):
+            for call in message.get("tool_calls") or ():
+                if (call.get("call_id") or call.get("id")) != call_id:
+                    continue
+                args = call.get("args")
+                if not isinstance(args, dict):
+                    args = call.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (TypeError, ValueError):
+                        args = {}
+                return dict(args) if isinstance(args, dict) else {}
+        return {}
+
+    def _has_user_input(self) -> bool:
+        return any(
+            not message.get("background_notification")
+            for message in self.state.step_inbox
+        )
+
+    async def _promote_inflight(self, parent: Event) -> None:
+        """Ask the manager to adopt each adoptable foreground call.
+
+        Bookkeeping only: pairing is gated by ``call_id in pending`` when the
+        manager's ``background.started{adopted}`` arrives (§6.6).
+        """
+        candidates = (
+            self.state.pending
+            - self.state.pending_background
+            - self.state.cancelled
+            - self.state.promote_pending
+        )
+        for call_id in sorted(candidates):
+            name = self._call_name(call_id)
+            if name is None or name not in self._promotable_tools:
+                continue
+            if call_id in self.state.pending_subagents:
+                continue  # phase 1: tools only
+            self.state.promote_pending.add(call_id)
+            self._tick()
+            try:
+                await self._publish(parent.child("background.adopt.requested", {
+                    "call_id": call_id,
+                    "tool": name,
+                    "kind": "tool",
+                    "reason": "user message",
+                }))
+            except BusError:
+                # Not committed: the call keeps running foreground and its
+                # real terminal will close the turn.
+                self.state.promote_pending.discard(call_id)
+                self._tick()
 
     async def on_llm(self, ev: Event) -> None:
         if not self._mine(ev):
@@ -293,6 +374,19 @@ class Agent:
         self.state.observe(ev)
 
         message = dict(ev.payload["message"])
+        # Keep the canonical tool_calls on the assistant message even when a
+        # test/adapter only supplied the top-level ``tool_calls`` list.  The
+        # executor normally already includes them; this is defensive.
+        payload_calls = ev.payload.get("tool_calls") or []
+        if payload_calls and not message.get("tool_calls"):
+            message["tool_calls"] = [
+                {
+                    "id": call.get("call_id") or call.get("id"),
+                    "name": call.get("name"),
+                    "arguments": call.get("args") or call.get("arguments") or {},
+                }
+                for call in payload_calls
+            ]
         if interrupted:
             # keep what the model produced before the interrupt, tag it, and do
             # NOT act on any partial tool call — the round is over (§16.3).
@@ -354,6 +448,22 @@ class Agent:
             if names.get(call.get("call_id")) not in self._background_tools
             and names.get(call.get("call_id")) not in self._subagent_tools
         ]
+        # Turn steering: if user input is already waiting, route eligible new
+        # ordinary calls straight to the background instead of starting them
+        # foreground and immediately adopting them (§6.5).
+        steering_calls = []
+        if self._steering and self._has_user_input():
+            steering_calls = [
+                call for call in tool_calls
+                if names.get(call.get("call_id")) in self._promotable_tools
+            ]
+            routed = {call["call_id"] for call in steering_calls}
+            tool_calls = [
+                call for call in tool_calls if call["call_id"] not in routed
+            ]
+        background_calls = [*background_calls, *steering_calls]
+        steering_ids = {call["call_id"] for call in steering_calls}
+
         self.state.set_phase(phases.ACTING)                 # thinking -> acting
         self.state.pending = {c["call_id"] for c in calls}
         self.state.pending_subagents = {c["call_id"] for c in subagent_calls}
@@ -366,6 +476,17 @@ class Agent:
                 "call_id": call["call_id"],     # host-owned, never model-overridable
             }))
         for call in background_calls:
+            if call["call_id"] in steering_ids:
+                # An ordinary tool routed by steering, not the reserved
+                # ``start`` wrapper.
+                await self._publish(ev.child("background.start.requested", {
+                    "call_id": call["call_id"],
+                    "tool": call["name"],
+                    "args": call.get("args") or {},
+                    "steering": True,
+                    "reason": "user input pending",
+                }))
+                continue
             await self._publish(ev.child(
                 *self._background_intent(call),
             ))
@@ -387,6 +508,11 @@ class Agent:
         call_id = ev.payload["call_id"]
         if call_id in self.state.cancelled:
             return  # result voided by an interrupt: never enters history (§16.3)
+        if call_id not in self.state.pending:
+            # Late/duplicate terminal, or an adopted call already paired via
+            # ``background.started{adopted}``: never write a second tool result.
+            self.state.observe(ev)
+            return
         self.state.observe(ev)
         failed = not ev.payload.get("ok", True)
         output = ev.payload.get("output")
@@ -406,6 +532,7 @@ class Agent:
         self.state.pending.discard(call_id)
         self.state.pending_subagents.discard(call_id)  # defensive replay cleanup
         self.state.pending_background.discard(call_id)
+        self.state.promote_pending.discard(call_id)
         await self._barrier(ev)
 
     async def on_subagent_notice(self, ev: Event) -> None:
@@ -470,6 +597,7 @@ class Agent:
         self.state.pending.discard(call_id)
         self.state.pending_subagents.discard(call_id)
         self.state.pending_background.discard(call_id)
+        self.state.promote_pending.discard(call_id)
 
         # ★ the barrier covers tools and subagents alike (design §3.4)
         await self._barrier(ev)
@@ -554,6 +682,7 @@ class Agent:
         self.state.pending.clear()
         self.state.pending_subagents.clear()
         self.state.pending_background.clear()
+        self.state.promote_pending.clear()
         self.state.pending_compaction = None
         self._flush_inbox()  # T5: idle implies an empty step inbox
         if phases.can_transition(self.state.phase, phases.IDLE):
@@ -689,6 +818,51 @@ class Agent:
         if status not in ("queued", "running"):
             status = "running"
 
+        if payload.get("adopted"):
+            # Turn steering: pair the original tool_call with a synthetic
+            # ``backgrounded`` result.  The gate is ``call_id in pending``, not
+            # ``promote_pending``: the real terminal may have won the race and
+            # already remapped it (§6.7).
+            self.state.promote_pending.discard(call_id)
+            if call_id in self.state.pending:
+                content = json.dumps({
+                    "status": "backgrounded",
+                    "task_id": task_id,
+                    "tool": payload.get("name"),
+                    "kind": payload.get("kind", "tool"),
+                    "note": (
+                        "Moved to the background because new user input "
+                        "arrived. Use stop(task_id=...) to cancel."
+                    ),
+                }, ensure_ascii=False)
+                self.state.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": self._clip_content(content),
+                })
+                self.state.pending.discard(call_id)
+                self.state.pending_background.discard(call_id)
+                if isinstance(task_id, str) and task_id:
+                    self.state.background[task_id] = {
+                        "task_id": task_id,
+                        "name": payload.get("name"),
+                        "kind": payload.get("kind", "tool"),
+                        "status": status,
+                        "start_call_id": call_id,
+                        "started_seq": int(ev.seq or 0),
+                        "finished_seq": None,
+                        "output_ref": None,
+                        "code": None,
+                        "error": None,
+                        "adopted": True,
+                    }
+                await self._barrier(ev)
+                return
+            # The real terminal already paired the call: observe only; do not
+            # record meta or the later background.completed would notify twice.
+            self._tick()
+            return
+
         if (
             call_id in self.state.pending
             and call_id in self.state.pending_background
@@ -724,6 +898,7 @@ class Agent:
                     "output_ref": None,
                     "code": None,
                     "error": None,
+                    "adopted": False,
                 }
             await self._barrier(ev)
             return
@@ -755,6 +930,30 @@ class Agent:
             or call_id not in self.state.pending_background
         ):
             return
+        # Turn steering routed this ordinary call through the background path;
+        # the request never executed.  Fall back to a foreground call (D15) so
+        # capacity/allowlist/assembly failures do not fail a runnable tool.
+        if (
+            payload.get("steering")
+            and not payload.get("recovered")
+            and payload.get("code") not in (
+                ErrorCode.E_DENIED.value,
+                ErrorCode.E_BACKGROUND_CANCELLED.value,
+            )
+        ):
+            name = payload.get("tool") or self._call_name(call_id)
+            args = payload.get("args")
+            if not isinstance(args, dict):
+                args = self._call_args(call_id)
+            if name:
+                self.state.pending_background.discard(call_id)
+                self._tick()
+                await self._publish(ev.child("tool.call.requested", {
+                    "name": name,
+                    "args": args,
+                    "call_id": call_id,
+                }))
+                return
         failure = {
             "status": "failed",
             "code": payload.get("code"),
@@ -771,6 +970,21 @@ class Agent:
         self.state.pending.discard(call_id)
         self.state.pending_background.discard(call_id)
         await self._barrier(ev)
+
+    async def on_background_adopt_failed(self, ev: Event) -> None:
+        """Clear adoption bookkeeping; the call keeps running foreground.
+
+        No tool message is written: the real terminal will pair the call, and
+        the user message stays buffered until that turn boundary (§6.9).
+        """
+        if not self._mine(ev):
+            return
+        self.state.observe(ev)
+        payload = ev.payload if isinstance(ev.payload, dict) else {}
+        call_id = payload.get("call_id")
+        if call_id:
+            self.state.promote_pending.discard(call_id)
+        self._tick()
 
     async def on_background_stop_done(self, ev: Event) -> None:
         """Pair ``background.stop.completed`` / ``.failed`` (§7.4)."""
@@ -959,6 +1173,10 @@ class Agent:
 
     async def _barrier(self, ev: Event) -> None:
         """The convergence barrier for tools, subagents and background calls."""
+        # S3: a call that has left ``pending`` can no longer be waiting for an
+        # adoption outcome.  Individual handlers discard eagerly; this keeps a
+        # checkpoint taken at the barrier from ever carrying a stale id.
+        self.state.promote_pending &= self.state.pending
         if self.state.pending:
             self.state.set_phase(phases.AWAITING_TOOLS)
             self._tick()
@@ -1176,6 +1394,14 @@ class Agent:
             if call_id:
                 self.state.pending.add(call_id)
                 self.state.pending_background.add(call_id)
+        elif etype == "background.adopt.requested":
+            self.state.observe(ev)
+            call_id = ev.payload.get("call_id")
+            if call_id:
+                self.state.pending.add(call_id)
+                self.state.promote_pending.add(call_id)
+        elif etype == "background.adopt.failed":
+            await self.on_background_adopt_failed(ev)
         elif etype == "background.started":
             await self.on_background_started(ev)
         elif etype == "background.start.failed":
@@ -1301,6 +1527,7 @@ class Agent:
             # Approvals are tool calls, never subagent calls.
             self.state.pending_subagents &= approvals
             self.state.pending_background &= approvals
+            self.state.promote_pending.clear()
             self.state.pending_compaction = None
             self.state.interrupt_pending = False
             self._tick()
@@ -1319,6 +1546,7 @@ class Agent:
         self.state.pending.clear()
         self.state.pending_subagents.clear()
         self.state.pending_background.clear()
+        self.state.promote_pending.clear()
         self.state.pending_compaction = None
         self.state.interrupt_pending = False
         if phases.can_transition(self.state.phase, phases.IDLE):
