@@ -14,7 +14,9 @@ numeric / string / array bounds — and raises :class:`~linteum_agent.runtime.to
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -139,6 +141,10 @@ class ToolSpec:
     requires_approval: bool = False
     backend: str = "inproc"
     plugin_id: Optional[str] = None
+    #: Host capability declaration: only a backgroundable spec may be the target
+    #: of ``start(tool, args)`` (async ReAct design v0.1 §5.2 / §14.2).  Plugin
+    #: tools default to ``False`` in v0.1.
+    backgroundable: bool = False
     #: Optional dotted ``module:qualname`` used by out-of-process backends (§23).
     entrypoint: Optional[str] = None
 
@@ -183,6 +189,29 @@ class ToolSpec:
         if self.entrypoint:
             return self.entrypoint
         return f"{self.fn.__module__}:{self.fn.__qualname__}"
+
+    def stable_digest(self) -> str:
+        """sha256 of the fields that define *this implementation* (§9.1).
+
+        The manager records the digest at ``start`` time and ``ToolRuntime``
+        re-computes it before executing a background request.  A mode/plugin
+        change that swapped the implementation therefore fails the task with
+        ``E_BACKGROUND_SPEC_CHANGED`` instead of silently running new code.
+        """
+        payload = {
+            "name": self.name,
+            "side_effect": self.side_effect,
+            "backend": self.backend,
+            "qualified_name": self.qualified_name,
+            "params": self.params,
+            "required_params": list(self.required_params),
+            "requires_approval": self.requires_approval,
+        }
+        blob = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def accepts_progress(self) -> bool:
         """True when ``fn`` declares a ``progress`` parameter (streaming tools)."""

@@ -43,6 +43,7 @@ from typing import (
     runtime_checkable,
 )
 
+from ..bus.artifact import NullArtifactStore, hydrate_events
 from ..bus.bus import InMemoryEventBus
 from ..bus.event import Event, uuid7
 from ..bus.scheduler.cancel import CancelRegistry
@@ -54,6 +55,14 @@ from ..storage.base import SessionInfo, StorageBundle
 from ..storage.service import SessionService
 from ..storage.sqlite import SqliteStorage
 from .agent import Agent, AgentBusy
+from .background import (
+    BACKGROUND_TOOL_NAMES,
+    BackgroundTaskManager,
+    LIST_TOOL,
+    START_TOOL,
+    STOP_TOOL,
+    background_tool_schemas,
+)
 from .compaction import ContextCompactor
 from .context import CompactingContextBuilder, ContextPolicy, PassthroughContextBuilder
 from .interrupt import InterruptController
@@ -341,6 +350,8 @@ class AgentHost:
         #: Lazily built in :meth:`_ensure_orchestrator` (Task 8); ``None`` keeps
         #: hosts that never enable subagents free of the extra subscriptions.
         self.orchestrator = None
+        #: Async ReAct lifecycle owner; ``None`` when the feature is disabled.
+        self.background: Optional[BackgroundTaskManager] = None
         self.workspaces = WorkspaceRegistry(self._workspace_for)
         self._tool_factory_cfg = cfg
         self.tool_registries = WorkspaceToolRegistries(
@@ -357,7 +368,10 @@ class AgentHost:
             approval_policy=cfg.agent.tools.approval,
             approval_policy_for=self.approval_policy_for,
             auto_approve=cfg.agent.tools.auto_approve,
+            max_background_timeout=cfg.agent.background.max_timeout_s,
         )
+        if cfg.agent.background.enabled or cfg.agent.subagents.force_background:
+            self._ensure_background_manager(cfg)
         self.compactor = context_compactor or ContextCompactor(
             self.bus, artifacts=self.storage.artifacts
         )
@@ -507,6 +521,9 @@ class AgentHost:
             "read_file", "write_file", "edit_file", "list_dir", "bash",
             "load_skill", "read_skill_resource",
             cfg.agent.subagents.tool_name,
+            # Async ReAct reserved wrapper names (§5.5): plugins may never
+            # occupy them even while the feature is disabled.
+            *BACKGROUND_TOOL_NAMES,
         })
 
     def _base_tools(self, workspace: Workspace) -> list:
@@ -516,6 +533,175 @@ class AgentHost:
             make_bash_tool(workspace, timeout=cfg.agent.tools.bash_timeout),
             *self.plugins.tool_specs(),
         ]
+
+    # -- async ReAct assembly (§5.5 / §14) ---------------------------------
+    def _background_targets(
+        self, cfg: AppConfig, registry: ToolRegistry,
+        subagent_tools: frozenset[str],
+        *, workspace: Optional[Workspace] = None,
+    ) -> list[str]:
+        """Eligible ``start(tool, args)`` targets for one session's tool table.
+
+        Eligibility is the intersection of the host authorization boundary
+        (``agent.background.allow``), the live tool table, and the capability
+        declaration ``ToolSpec.backgroundable``.  The configured subagent tool
+        is eligible only when subagents are enabled **and** explicitly listed in
+        ``allow`` (no implicit grant, §14.3).  A name that is neither in the
+        live table nor a host-provided tool (mode-filtered) is a configuration
+        typo: ``E_CONFIG_UNKNOWN_BACKGROUND_TOOL`` (§14.3).
+        """
+        settings = cfg.agent.background
+        steering = cfg.agent.steering.enabled
+        if not (settings.enabled or steering):
+            return []
+        subagent_name = cfg.agent.subagents.tool_name
+        known: Optional[set[str]] = None
+        if workspace is not None:
+            known = {
+                spec.name for spec in self._base_tools(workspace)
+            }
+            known.update(registry.names())
+            # Skill loaders may be filtered out by the current mode; they are
+            # still known host tools (and are not backgroundable).
+            known.update({"load_skill", "read_skill_resource"})
+            known.add(subagent_name)
+        targets: list[str] = []
+        for name in settings.allow:
+            if name == subagent_name:
+                if cfg.agent.subagents.enabled and name in subagent_tools:
+                    targets.append(name)
+                continue
+            try:
+                spec = registry.spec(name)
+            except ToolUnavailable:
+                continue
+            except UnknownTool:
+                if known is not None and name not in known:
+                    if settings.enabled:
+                        raise ConfigError(
+                            f"unknown background tool {name!r}",
+                            key="agent.background.allow",
+                            code="E_CONFIG_UNKNOWN_BACKGROUND_TOOL",
+                            hint="use a built-in backgroundable tool or the "
+                                 "configured subagent tool name",
+                        )
+                    # Steering-only: the explicit ``start`` feature is off, so
+                    # a stale allow entry is skipped instead of failing startup.
+                    continue
+                continue  # known tool filtered out by the current mode
+            # v0.1 non-goal: plugin tools are not background targets, even if a
+            # plugin spec sets the capability flag (§2.2 / §19 R6).
+            if spec.backgroundable and spec.plugin_id is None:
+                targets.append(name)
+        return sorted(set(targets))
+
+    def _compose_schemas(
+        self, cfg: AppConfig, registry: ToolRegistry,
+        subagent_tools: frozenset[str],
+        *, workspace: Optional[Workspace] = None,
+    ) -> tuple[Callable[[], list[dict]], frozenset[str], list[str]]:
+        """Build the one schema provider used by every assembly/rebind path.
+
+        Mode switches and rebinds must keep the background schemas; generating
+        all three groups here is what prevents "the model suddenly cannot see
+        its running tasks" after ``session.mode.set`` (§14.5).
+        """
+        subagent_name = cfg.agent.subagents.tool_name
+        subagent_catalog = None
+        if subagent_tools:
+            from .subagents.catalog import SubagentCatalog
+            if registry.has(subagent_name):
+                raise ConfigError(
+                    f"tool {subagent_name!r} is reserved for subagent "
+                    "delegation and cannot be registered",
+                    key="agent.subagents.tool_name",
+                    code="E_CONFIG_TOOL_RESERVED",
+                )
+            registry.reserve(subagent_name)
+            subagent_catalog = SubagentCatalog(cfg.agent.subagents)
+
+        enabled = cfg.agent.background.enabled
+        steering = cfg.agent.steering.enabled
+        force_background = cfg.agent.subagents.force_background
+        targets = self._background_targets(
+            cfg, registry, subagent_tools, workspace=workspace,
+        )
+        # stop/list_tasks are management tools, not start targets: keep them
+        # injected whenever either feature is on so a mode switch cannot strand
+        # an already-running task (§14.5).  Explicit `start` still needs
+        # ``background.enabled`` and a non-empty enum; steering creates tasks
+        # on the model's behalf but does not expose the wrapper.
+        include_start = enabled and bool(targets)
+        include_manage = enabled or steering or force_background
+        bg_schemas = (
+            background_tool_schemas(
+                targets if include_start else (),
+                include_management=include_manage,
+            )
+            if include_manage else []
+        )
+        background_tools = (
+            ({START_TOOL} if include_start else set())
+            | ({STOP_TOOL, LIST_TOOL} if include_manage else set())
+        )
+        background_tools = frozenset(background_tools)
+
+        def schemas() -> list[dict]:
+            out = list(registry.schemas())
+            if subagent_catalog is not None:
+                out.append(subagent_catalog.schema())
+            out.extend(bg_schemas)
+            return out
+
+        return schemas, background_tools, targets
+
+    def _ensure_background_manager(
+        self, cfg: AppConfig,
+    ) -> Optional[BackgroundTaskManager]:
+        """Build/refresh the manager when the feature is enabled (§8.1)."""
+        settings = cfg.agent.background
+        steering = cfg.agent.steering.enabled
+        force_background = bool(cfg.agent.subagents.force_background)
+        runtime = getattr(self, "tool_runtime", None)
+        if runtime is not None:
+            runtime.max_background_timeout = settings.max_timeout_s
+        if not (settings.enabled or steering or force_background):
+            if self.background is not None:
+                self.background.settings_changed(settings, cfg.agent.subagents)
+                self.background.steering_enabled = False
+                self.background.force_background_subagents = False
+            return self.background
+        if self.background is None:
+            manager = BackgroundTaskManager(
+                self.bus,
+                settings=settings,
+                subagent_settings=cfg.agent.subagents,
+                registry_for=self.tool_registries.for_session,
+                session_kind=lambda session_id: (
+                    self._handles[session_id].kind
+                    if session_id in self._handles else None
+                ),
+                approvals=self.approvals,
+                approval_policy=cfg.agent.tools.approval,
+                approval_policy_for=self.approval_policy_for,
+                auto_approve=cfg.agent.tools.auto_approve,
+                artifacts=self.storage.artifacts,
+                clock=time.time,
+                subagent_settings_for=(
+                    lambda: self._current_config().agent.subagents
+                ),
+                steering_enabled=steering,
+                force_background_subagents=force_background,
+            )
+            manager.subscribe()
+            self.background = manager
+        else:
+            self.background.settings_changed(settings, cfg.agent.subagents)
+            self.background.steering_enabled = steering
+            self.background.force_background_subagents = force_background
+            self.background.approval_policy = cfg.agent.tools.approval
+            self.background.auto_approve = frozenset(cfg.agent.tools.auto_approve)
+        return self.background
 
     async def _drain_plugin_tools(
         self, plugin_id: str, names: tuple[str, ...], grace_ms: int,
@@ -831,25 +1017,19 @@ class AgentHost:
                 skill_index=resolution.filtered_skills.index_text,
             )
             subagent_tools = resolution.subagent_tools
-            schemas = registry.schemas
             subagent_settings = cfg.agent.subagents
-            if subagent_tools:
-                from .subagents.catalog import SubagentCatalog
-                if registry.has(subagent_settings.tool_name):
-                    raise ConfigError(
-                        f"tool {subagent_settings.tool_name!r} is reserved "
-                        "for subagent delegation and cannot be registered",
-                        key="agent.subagents.tool_name",
-                        code="E_CONFIG_TOOL_RESERVED",
-                    )
-                registry.reserve(subagent_settings.tool_name)
-                subagent_catalog = SubagentCatalog(subagent_settings)
-
-                def schemas(reg=registry, cat=subagent_catalog):
-                    return [*reg.schemas(), cat.schema()]
-
+            schemas, background_tools, targets = self._compose_schemas(
+                cfg, registry, subagent_tools, workspace=workspace,
+            )
+            self._ensure_background_manager(cfg)
             if subagent_tools:
                 self._ensure_orchestrator()
+            subagent_name = cfg.agent.subagents.tool_name
+            promotable_tools = (
+                frozenset(
+                    name for name in targets if name != subagent_name
+                ) if cfg.agent.steering.enabled else frozenset()
+            )
 
             info = await self.service.get_session(session_id)
             if info is None:
@@ -881,6 +1061,9 @@ class AgentHost:
                     context_policy=policy,
                     schemas=schemas,
                     subagent_tools=subagent_tools,
+                    background_tools=background_tools,
+                    steering=cfg.agent.steering.enabled,
+                    promotable_tools=promotable_tools,
                     commit=commit,
                 )
             except AgentBusy as exc:
@@ -1081,6 +1264,10 @@ class AgentHost:
             await self.orchestrator.close()
         for session_id in list(self._handles):
             self.close_session(session_id)
+        # Background tasks get one last best-effort terminal while the bus is
+        # still alive, then the manager stops accepting starts (§8.11).
+        if self.background is not None:
+            await self.background.close()
         # Plugins unload while the bus can still carry lifecycle events (§13.5).
         await self.plugins.close()
         self.bus.stop()
@@ -1122,6 +1309,7 @@ class AgentHost:
         self._tool_factory_cfg = cfg
         self.tool_runtime.approval_policy = cfg.agent.tools.approval
         self.tool_runtime.auto_approve = frozenset(cfg.agent.tools.auto_approve)
+        self.tool_runtime.max_background_timeout = cfg.agent.background.max_timeout_s
         session_id = options.session_id or uuid7()
 
         async with self._registry_lock:
@@ -1432,22 +1620,22 @@ class AgentHost:
 
             budget = self._budget(cfg)
             subagent_tools = resolution.subagent_tools
-            schemas = registry.schemas
             subagent_settings = cfg.agent.subagents
-            if subagent_tools:
-                from .subagents.catalog import SubagentCatalog
-                if registry.has(subagent_settings.tool_name):
-                    raise ConfigError(
-                        f"tool {subagent_settings.tool_name!r} is reserved for "
-                        "subagent delegation and cannot be registered",
-                        key="agent.subagents.tool_name", code="E_CONFIG_TOOL_RESERVED",
-                    )
-                registry.reserve(subagent_settings.tool_name)
-                subagent_catalog = SubagentCatalog(subagent_settings)
-
-                def schemas(reg=registry, cat=subagent_catalog):
-                    return [*reg.schemas(), cat.schema()]
-
+            schemas, background_tools, targets = self._compose_schemas(
+                cfg, registry, subagent_tools, workspace=workspace,
+            )
+            background_cfg = cfg.agent.background
+            steering_cfg = cfg.agent.steering
+            subagent_name = cfg.agent.subagents.tool_name
+            promotable_tools = (
+                frozenset(
+                    name for name in targets if name != subagent_name
+                ) if steering_cfg.enabled else frozenset()
+            )
+            # The manager must exist before the first start event can be
+            # published; an enabled feature with no eligible target simply
+            # injects no schema (§5.5).
+            manager = self._ensure_background_manager(cfg)
             kwargs = {
                 "model": profile,
                 "schemas": schemas,
@@ -1455,11 +1643,25 @@ class AgentHost:
                 "ctx_builder": builder,
                 "context_policy": policy,
                 "subagent_tools": subagent_tools,
+                "background_tools": background_tools,
+                "steering": steering_cfg.enabled,
+                "force_background_subagents":
+                    cfg.agent.subagents.force_background,
+                "promotable_tools": promotable_tools,
+                "auto_continue": background_cfg.auto_continue,
+                "cancel_on_interrupt": background_cfg.cancel_on_interrupt,
             }
 
             # Restore approvals before closing/reducing the half-round: the calls
             # the gate still owns must be excluded from the "interrupted" sweep.
             events = await self.bus.replay(session_id=info.session_id)
+            artifacts = self.storage.artifacts
+            if artifacts is None:
+                artifacts = NullArtifactStore()
+            # Both the gate and the manager inspect call_id/args at the payload
+            # top level; the bus replaces an oversized payload with an artifact
+            # envelope, so hydrate once and reuse (§8.10 / §9.6).
+            events = await hydrate_events(events, artifacts)
             self.approvals.restore(info.session_id, events)
             pending = self.approvals.pending_ids(info.session_id)
 
@@ -1511,6 +1713,13 @@ class AgentHost:
                 mode_binding=binding,
             )
             self._handles[info.session_id] = handle
+            if manager is not None:
+                # Reconcile against the *full* hydrated WAL: a task that started
+                # before the checkpoint must still be reported, never re-run
+                # (§8.10 / T6).
+                await manager.recover(
+                    info.session_id, events, pending_start_ids=pending,
+                )
             if subagent_settings.enabled:
                 self._ensure_orchestrator()
             return handle
@@ -1567,6 +1776,11 @@ class AgentHost:
         Closing a root cancels its orchestrator work and closes every child
         handle first; children never release a lease of their own (§8.5).
         """
+        # Background tasks belong to the process, not the durable session: stop
+        # them before the reducer is detached.  This is synchronous and
+        # best-effort by design (§8.11).
+        if self.background is not None:
+            self.background.cancel_session(session_id)
         if self.orchestrator is not None:
             self.orchestrator.cancel_parent(session_id)
         handle = self._handles.pop(session_id, None)

@@ -37,6 +37,7 @@ pub enum SidebarPanel {
     Preview,
     Info,
     Subagents,
+    Background,
 }
 
 impl SidebarPanel {
@@ -46,6 +47,7 @@ impl SidebarPanel {
             Self::Preview => "Preview",
             Self::Info => "Info",
             Self::Subagents => "Subagents",
+            Self::Background => "Background",
         }
     }
 }
@@ -64,6 +66,8 @@ pub struct SidebarState {
     pub rows: Vec<TreeRow>,
     pub selected: usize,
     pub error: Option<String>,
+    /// First background task shown in the Background panel (0 = newest).
+    pub background_scroll: usize,
 }
 
 impl SidebarState {

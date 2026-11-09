@@ -348,7 +348,7 @@ def make_bash_tool(ws: Workspace, *, timeout: Optional[float] = None,
         {"command": {"type": "string", "description": "the shell command to run"},
          "cwd": {"type": "string", "description": "subdirectory relative to the workspace root (default '.')"}},
         required=["command"], side_effect="dangerous", concurrency=1,
-        timeout=wall_clock, name="bash",
+        timeout=wall_clock, name="bash", backgroundable=True,
     )
     async def bash(command: str, cwd: str = ".") -> dict:
         if not isinstance(command, str) or not command.strip():

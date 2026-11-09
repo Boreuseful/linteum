@@ -38,6 +38,7 @@ SECTION_TITLES: dict[str, str] = {
     "agent.profiles": "模型 Profiles",
     "agent.context": "上下文",
     "agent.tools": "工具与审批",
+    "agent.background": "后台任务 (Async ReAct)",
     "agent.skills": "Skills",
     "agent.budget": "预算",
     "agent.session": "会话默认值",
@@ -62,6 +63,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "agent.profiles",
     "agent.context",
     "agent.tools",
+    "agent.background",
     "agent.skills",
     "agent.budget",
     "agent.session",
@@ -214,6 +216,100 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "type": "float",
         "minimum": 0.1,
     },
+    # -- agent.background (async ReAct) ---------------------------------
+    "agent.background.enabled": {
+        "title": "启用后台任务",
+        "type": "bool",
+        "description": (
+            "开启后根会话注入 start/stop/list_tasks；默认关闭，现有行为不变。"
+        ),
+    },
+    "agent.background.auto_continue": {
+        "title": "空闲自动续跑",
+        "type": "bool",
+        "description": (
+            "后台任务 completed/failed 且会话空闲时自动发起下一步推理。"
+        ),
+    },
+    "agent.background.allow": {
+        "title": "允许后台执行的工具",
+        "type": "list",
+        "item_type": "str",
+        "description": (
+            "唯一授权边界；空列表表示不允许任何后台任务。子代理工具名必须"
+            "显式写入（仅启用 subagents 不会自动授权）。"
+        ),
+    },
+    "agent.background.max_running_per_session": {
+        "title": "单会话并发任务上限",
+        "type": "int",
+        "minimum": 1,
+    },
+    "agent.background.max_running_total": {
+        "title": "进程级并发任务上限",
+        "type": "int",
+        "minimum": 1,
+    },
+    "agent.background.max_queued_per_session": {
+        "title": "单会话待命任务上限",
+        "type": "int",
+        "minimum": 0,
+        "description": (
+            "并发已满时新 start 进入 queued 待命；超过此上限才返回 "
+            "E_BACKGROUND_LIMIT。0 表示不排队（旧行为）。"
+        ),
+    },
+    "agent.background.max_terminal_tasks": {
+        "title": "终态任务保留数",
+        "type": "int",
+        "minimum": 1,
+        "description": "manager/UI 保留的终态元数据上限；reducer 使用固定 32。",
+    },
+    "agent.background.default_timeout_s": {
+        "title": "后台默认超时（秒）",
+        "type": "float",
+        "minimum": 0.0,
+    },
+    "agent.background.max_timeout_s": {
+        "title": "后台超时上限（秒）",
+        "type": "float",
+        "minimum": 0.0,
+    },
+    "agent.background.stop_grace_ms": {
+        "title": "停止宽限期（毫秒）",
+        "type": "int",
+        "minimum": 0,
+        "description": "发出取消后等待底层终态的时间；超时强制 stopped。",
+    },
+    "agent.background.cancel_on_interrupt": {
+        "title": "中断时取消后台任务",
+        "type": "bool",
+        "description": "默认 false：用户中断只停前台，后台任务继续运行。",
+    },
+    "agent.background.max_output_bytes": {
+        "title": "单任务输出上限（字节）",
+        "type": "int",
+        "minimum": 1,
+    },
+    # -- agent.steering -------------------------------------------------
+    "agent.steering.enabled": {
+        "title": "Turn 边界插话",
+        "type": "bool",
+        "description": (
+            "用户消息在 LLM/前台工具执行期间到达时，把可后台化的前台调用 "
+            "adoption 为后台任务，使消息在当前 Turn 边界注入。默认开启；"
+            "显式 start 仍需 agent.background.enabled。"
+        ),
+    },
+    # -- agent.subagents ------------------------------------------------
+    "agent.subagents.force_background": {
+        "title": "子代理强制后台",
+        "type": "bool",
+        "description": (
+            "开启后所有 spawn_subagent 调用直接作为后台任务启动，不阻塞当前 "
+            "Turn；要求 agent.subagents.tool_name 已写入 agent.background.allow。"
+        ),
+    },
     # -- agent.skills ---------------------------------------------------
     "agent.skills.enabled": {
         "title": "启用 Skills",
@@ -271,8 +367,11 @@ FIELD_META: dict[str, dict[str, Any]] = {
     "agent.session.input_policy": {
         "title": "忙碌输入策略",
         "type": "enum",
-        "enum": ("queue", "interrupt", "reject"),
-        "description": "agent 忙碌时收到新消息的处理方式。",
+        "enum": ("queue", "steer", "interrupt", "reject"),
+        "description": (
+            "agent 忙碌时收到新消息的处理方式。steer：立即发布，由 Agent "
+            "在 Turn 边界注入；queue：等 idle 再释放。"
+        ),
     },
     "agent.session.idle_ttl_ms": {
         "title": "空闲回收 ms",

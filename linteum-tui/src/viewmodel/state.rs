@@ -379,6 +379,10 @@ impl TuiState {
             "tool.started" => apply_tool_started(self, frame),
             "tool.delta" => apply_tool_delta(self, frame),
             "tool.result" => apply_tool_result(self, frame),
+            "background.started" => apply_background_started(self, frame),
+            "background.result" | "background.failed" | "background.stopped" => {
+                apply_background_terminal(self, frame)
+            }
             "subagent.requested" | "subagent.started" | "subagent.progress" | "subagent.result"
             | "subagent.error" => self.subagents.apply_frame(frame),
             "approval.required" => {
@@ -481,6 +485,7 @@ fn apply_snapshot(state: &mut TuiState, frame: &Frame, replay: bool) {
         state.last_error = serde_json::from_value(error.clone()).ok();
     }
     super::modes::apply_snapshot(state, payload);
+    apply_background_snapshot(state, payload);
     state.connection = if replay {
         ConnectionState::Replaying
     } else {
@@ -730,6 +735,27 @@ fn apply_tool_result(state: &mut TuiState, frame: &Frame) {
         .get("error_info")
         .and_then(|value| serde_json::from_value(value.clone()).ok());
     if let Some(card) = tool_card_mut(state, &call_id) {
+        if bool_field(payload, "background").unwrap_or(false) {
+            card.background = true;
+        }
+        if let Some(status) = str_field(payload, "background_status") {
+            card.background_status = Some(status.to_owned());
+        }
+        if let Some(task_id) = str_field(payload, "task_id") {
+            card.task_id = Some(task_id.to_owned());
+        }
+        if let Some(target) = str_field(payload, "background_target") {
+            card.background_target = Some(target.to_owned());
+        }
+        if let Some(duration) = u64_field(payload, "duration_ms") {
+            card.background_duration_ms = Some(duration);
+        }
+        if let Some(started) = f64_field(payload, "started_at") {
+            card.background_started_at = Some(started);
+        }
+        if let Some(finished) = f64_field(payload, "finished_at") {
+            card.background_finished_at = Some(finished);
+        }
         card.state = if ok {
             ToolState::Success
         } else if code == Some("E_DENIED") {
@@ -744,6 +770,177 @@ fn apply_tool_result(state: &mut TuiState, frame: &Frame) {
         card.error = error;
     }
     state.pending_tools.remove(&call_id);
+}
+
+/// Recreate background task cards from a snapshot (attach/reconnect path).
+fn apply_background_snapshot(state: &mut TuiState, payload: &Value) {
+    let Some(tasks) = payload.get("background").and_then(Value::as_array) else {
+        return;
+    };
+    for task in tasks {
+        let Some(task_id) = str_field(task, "task_id").filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let already = state.transcript.items.iter().any(
+            |item| matches!(item, Item::Tool(card) if card.task_id.as_deref() == Some(task_id)),
+        );
+        if already {
+            continue;
+        }
+        let status = str_field(task, "status").unwrap_or("running").to_owned();
+        let card_state = match status.as_str() {
+            "completed" => ToolState::Success,
+            "failed" | "lost" => ToolState::Failure,
+            "stopped" => ToolState::Cancelled,
+            _ => ToolState::Started,
+        };
+        let mut card = ToolCard {
+            call_id: task_id.to_owned(),
+            name: str_field(task, "name").unwrap_or("task").to_owned(),
+            state: card_state,
+            background: true,
+            background_status: Some(status),
+            task_id: Some(task_id.to_owned()),
+            background_duration_ms: u64_field(task, "duration_ms"),
+            background_started_at: f64_field(task, "started_at"),
+            background_finished_at: f64_field(task, "finished_at"),
+            ..Default::default()
+        };
+        if card.background_finished_at.is_none()
+            && matches!(
+                card.background_status.as_deref(),
+                Some("completed" | "failed" | "stopped" | "lost")
+            )
+        {
+            card.background_finished_at = card
+                .background_started_at
+                .zip(card.background_duration_ms)
+                .map(|(started, duration)| started + duration as f64 / 1000.0);
+        }
+        state.transcript.items.push(Item::Tool(card));
+    }
+}
+
+/// Mark the tool card created by a background `start(...)` as a background task.
+fn apply_background_started(state: &mut TuiState, frame: &Frame) {
+    let payload = &frame.payload;
+    let start_call_id =
+        str_field(payload, "start_call_id").or_else(|| str_field(payload, "call_id"));
+    let task_id = str_field(payload, "task_id");
+    let status = str_field(payload, "status").unwrap_or("running");
+    if let Some(card) = background_card_mut(state, start_call_id, task_id) {
+        card.background = true;
+        card.background_status = Some(status.to_owned());
+        if let Some(task_id) = task_id {
+            card.task_id = Some(task_id.to_owned());
+        }
+        if let Some(started) = f64_field(payload, "started_at") {
+            card.background_started_at = Some(started);
+        }
+        if let Some(finished) = f64_field(payload, "finished_at") {
+            card.background_finished_at = Some(finished);
+        }
+    }
+}
+
+/// Update the same card with the task terminal and the real task output.
+fn apply_background_terminal(state: &mut TuiState, frame: &Frame) {
+    let payload = &frame.payload;
+    let task_id = str_field(payload, "task_id");
+    let start_call_id = str_field(payload, "start_call_id");
+    let name = str_field(payload, "name").unwrap_or("task");
+    let status = str_field(payload, "status")
+        .unwrap_or("completed")
+        .to_owned();
+    state
+        .activity
+        .push("background", format!("background {name} {status}"));
+    let output = payload
+        .get("output")
+        .map(render_value)
+        .or_else(|| payload.get("summary").map(render_value));
+    let error = payload
+        .get("error_info")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let state_for_status = match status.as_str() {
+        "completed" => ToolState::Success,
+        "stopped" | "lost" => ToolState::Cancelled,
+        _ => ToolState::Failure,
+    };
+
+    if let Some(card) = background_card_mut(state, start_call_id, task_id) {
+        card.background = true;
+        card.background_status = Some(status);
+        if let Some(task_id) = task_id {
+            card.task_id = Some(task_id.to_owned());
+        }
+        card.background_duration_ms =
+            u64_field(payload, "duration_ms").or(card.background_duration_ms);
+        if let Some(started) = f64_field(payload, "started_at") {
+            card.background_started_at = Some(started);
+        }
+        card.background_finished_at = f64_field(payload, "finished_at")
+            .or(card.background_started_at.zip(card.background_duration_ms).map(
+                |(started, duration)| started + duration as f64 / 1000.0,
+            ));
+        card.state = state_for_status;
+        if output.is_some() {
+            card.output = output;
+        }
+        if error.is_some() {
+            card.error = error;
+        }
+        return;
+    }
+
+    // No Started card was seen (e.g. an attach after the start): create a
+    // standalone background task card instead of dropping the terminal.
+    let call_id = start_call_id.or(task_id).unwrap_or("").to_owned();
+    let mut card = parse_tool_card(payload);
+    card.call_id = call_id;
+    card.name = name.to_owned();
+    card.background = true;
+    card.background_status = Some(status);
+    card.task_id = task_id.map(str::to_owned);
+    card.state = state_for_status;
+    card.output = output;
+    card.error = error;
+    if card.background_finished_at.is_none() {
+        card.background_finished_at = card
+            .background_started_at
+            .zip(card.background_duration_ms)
+            .map(|(started, duration)| started + duration as f64 / 1000.0);
+    }
+    state.transcript.items.push(Item::Tool(card));
+}
+
+fn background_card_mut<'a>(
+    state: &'a mut TuiState,
+    start_call_id: Option<&str>,
+    task_id: Option<&str>,
+) -> Option<&'a mut ToolCard> {
+    if let Some(call_id) = start_call_id.filter(|call_id| !call_id.is_empty()) {
+        // Probe immutably first so the later mutable lookup does not overlap a
+        // borrow that may have to outlive the whole function.
+        let exists = state
+            .transcript
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Tool(card) if card.call_id == call_id));
+        if exists {
+            return tool_card_mut(state, call_id);
+        }
+    }
+    if let Some(task_id) = task_id {
+        for item in state.transcript.items.iter_mut() {
+            if let Item::Tool(card) = item
+                && card.task_id.as_deref() == Some(task_id)
+            {
+                return Some(card);
+            }
+        }
+    }
+    None
 }
 
 fn apply_approval_resolved(state: &mut TuiState, frame: &Frame) {
@@ -934,6 +1131,13 @@ fn parse_tool_card(payload: &Value) -> ToolCard {
         args: payload
             .get("args")
             .map(|value| serde_json::to_string_pretty(value).unwrap_or_default()),
+        background: bool_field(payload, "background").unwrap_or(false),
+        background_status: str_field(payload, "background_status").map(str::to_owned),
+        task_id: str_field(payload, "task_id").map(str::to_owned),
+        background_target: str_field(payload, "background_target").map(str::to_owned),
+        background_duration_ms: u64_field(payload, "duration_ms"),
+        background_started_at: f64_field(payload, "started_at"),
+        background_finished_at: f64_field(payload, "finished_at"),
         ..Default::default()
     }
 }

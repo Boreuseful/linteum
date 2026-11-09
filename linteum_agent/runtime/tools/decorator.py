@@ -31,6 +31,7 @@ def tool(
     name: Optional[str] = None,
     plugin_id: Optional[str] = None,
     entrypoint: Optional[str] = None,
+    backgroundable: bool = False,
 ) -> Callable[[Callable], Callable]:
     """Decorator factory attaching a :class:`ToolSpec` to ``fn``.
 
@@ -57,6 +58,7 @@ def tool(
             ),
             plugin_id=plugin_id,
             entrypoint=entrypoint,
+            backgroundable=backgroundable,
         )
         fn.__tool_spec__ = spec  # type: ignore[attr-defined]
         return fn

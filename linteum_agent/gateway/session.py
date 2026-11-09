@@ -33,6 +33,7 @@ from ..config.schema import ConfigError
 from ..runtime.state import phases
 from .errors import (
     E_APPROVAL_GONE,
+    E_BACKGROUND_DISABLED,
     E_BAD_FRAME,
     E_BUSY,
     E_INTERNAL,
@@ -132,14 +133,14 @@ class SessionGateway:
         *,
         limits: Optional["GatewayLimits"] = None,
         history: Optional["HistorySettings"] = None,
-        input_policy: str = "queue",
+        input_policy: str = "steer",
         gap_timeout: float = DEFAULT_GAP_TIMEOUT,
         ring_size: int = DEFAULT_RING_SIZE,
         read_only: bool = False,
         follow: bool = False,
         allow_approval: bool = False,
     ) -> None:
-        if input_policy not in ("queue", "interrupt", "reject"):
+        if input_policy not in ("queue", "steer", "interrupt", "reject"):
             raise ValueError(f"unknown input policy: {input_policy!r}")
         self.host = host
         self.session_id = session_id
@@ -498,7 +499,7 @@ class SessionGateway:
         """Route one validated command; returns the ``result`` payload."""
         if self.read_only and cmd.name in (
             "user.message", "user.interrupt", "agent.resume",
-            "session.mode.set",
+            "session.mode.set", "session.task.stop",
         ):
             raise GatewayError(
                 E_SESSION_LOCKED,
@@ -559,6 +560,10 @@ class SessionGateway:
                 return await self._artifact(cmd, connection)
             if cmd.name == "session.context":
                 return await self._context()
+            if cmd.name == "session.tasks":
+                return self._tasks_result()
+            if cmd.name == "session.task.stop":
+                return await self._task_stop(cmd, connection)
             if cmd.name == "session.get":
                 return {"session_id": self.session_id, "snapshot": self.snapshot()}
         raise GatewayError(
@@ -582,7 +587,11 @@ class SessionGateway:
                 )
                 return {**cached, "duplicate": True}
 
-            if (
+            # ``steer`` deliberately accepts input while a turn is in flight:
+            # the Agent buffers it in ``step_inbox`` and adopts foreground calls
+            # so it can land at the turn boundary.  The other policies keep the
+            # historical busy queue.
+            if self.input_policy != "steer" and (
                 self._state.phase != phases.IDLE
                 or self._input_queue
                 or self._published_input_pending
@@ -878,6 +887,44 @@ class SessionGateway:
         target = function if isinstance(function, dict) else schema
         name = target.get("name")
         return name if isinstance(name, str) else None
+
+    # -- background tasks (§15.2) -----------------------------------------
+    def _require_background(self) -> None:
+        cfg = self.host.current_config()
+        if not (
+            cfg.agent.background.enabled
+            or cfg.agent.subagents.force_background
+        ):
+            raise GatewayError(
+                E_BACKGROUND_DISABLED,
+                "background tasks are disabled by the host",
+                location=LOCATION_SESSION,
+            )
+
+    def _tasks_result(self) -> dict:
+        self._require_background()
+        return {
+            "session_id": self.session_id,
+            "tasks": [dict(info) for _, info in self._state.background],
+        }
+
+    async def _task_stop(
+        self, cmd: Command, connection: "ClientConnection",
+    ) -> dict:
+        self._require_background()
+        task_id = cmd.args["task_id"]
+        committed = await self._publish(Event.create(
+            "background.cancel.requested",
+            {
+                "task_id": task_id,
+                "reason": cmd.args.get("reason") or "client stop",
+                "requested_by": "client",
+                "client_id": connection.id,
+            },
+            session_id=self.session_id,
+            trace_id=cmd.trace_id,
+        ))
+        return {**_receipt(committed), "task_id": task_id}
 
     # -- subscribe / replay ----------------------------------------------
     async def _subscribe(self, cmd: Command, connection: "ClientConnection") -> dict:

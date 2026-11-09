@@ -58,15 +58,22 @@ class SubagentCatalog:
     # -- schema -------------------------------------------------------------
     def schema(self) -> dict:
         """The provider-facing function schema (design §6.1)."""
+        description = (
+            "Delegate a task to an independent child agent with its own "
+            "context. The child cannot see this conversation; it only "
+            "sees the task/instructions/context/environment you write."
+        )
+        if self.settings.force_background:
+            description += (
+                " This call returns immediately with a task_id; the final "
+                "summary arrives later as a background notification. Use "
+                "stop/list_tasks to manage it."
+            )
         return {
             "type": "function",
             "function": {
                 "name": self.settings.tool_name,
-                "description": (
-                    "Delegate a task to an independent child agent with its own "
-                    "context. The child cannot see this conversation; it only "
-                    "sees the task/instructions/context/environment you write."
-                ),
+                "description": description,
                 "parameters": {
                     "type": "object",
                     "properties": {

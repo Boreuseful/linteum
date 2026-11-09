@@ -9,6 +9,8 @@ Layers, bottom-up:
 * :mod:`linteum_agent.runtime.context` — :class:`ContextPlan` + deterministic digest.
 * :mod:`linteum_agent.runtime.compaction` — deterministic summary effect for context compaction.
 * :mod:`linteum_agent.runtime.agent` — the pure, event-driven :class:`Agent` reducer.
+* :mod:`linteum_agent.runtime.background` — :class:`BackgroundTaskManager`:
+  ``start``/``stop``/``list_tasks`` lifecycle, async ReAct notifications.
 * :mod:`linteum_agent.runtime.host` — :class:`AgentHost`: storage/bus/LLM/tools
   assembly, one agent per session, restore and pending-approval recovery.
 * :mod:`linteum_agent.runtime.modes` — session-scoped mode definitions, catalog,
@@ -29,6 +31,7 @@ Importing this package has no side effects so hosts can load submodules lazily.
 
 __all__ = [
     "agent",
+    "background",
     "host",
     "state",
     "context",

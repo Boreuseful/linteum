@@ -302,6 +302,24 @@ class AgentClient:
             session_id=session_id,
         )
 
+    async def session_tasks(self, session_id: str) -> dict:
+        """List this session's background tasks (§15.2)."""
+        return await self.command(
+            "session.tasks", {"session_id": session_id},
+            session_id=session_id,
+        )
+
+    async def stop_task(
+        self, session_id: str, task_id: str, *, reason: Optional[str] = None,
+    ) -> dict:
+        """Request cancellation of one background task (§15.2)."""
+        args: dict = {"session_id": session_id, "task_id": task_id}
+        if reason is not None:
+            args["reason"] = reason
+        return await self.command(
+            "session.task.stop", args, session_id=session_id,
+        )
+
     async def list_sessions(self, *, limit: int = 50, offset: int = 0,
                             workspace: Optional[str] = None) -> dict:
         args: dict = {"limit": limit, "offset": offset}

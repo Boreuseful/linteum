@@ -8,6 +8,8 @@ runtime. Change the library only.
 - `linteum_agent/bus/` — Event envelope, RCU router, per-origin WFQ, WAL,
   artifacts, backpressure/coalescing, namespace guards, metrics.
 - `linteum_agent/runtime/agent.py` — pure Agent reducer.
+- `linteum_agent/runtime/background/` — `BackgroundTaskManager`: async ReAct
+  `start`/`stop`/`list_tasks` lifecycle, approval handshake, recovery.
 - `linteum_agent/runtime/state/` — AgentState, phase machine, checkpoints.
 - `linteum_agent/runtime/context.py` — derived ContextPlan + deterministic digest.
 - `linteum_agent/runtime/compaction.py` — deterministic context summary effect.
@@ -114,9 +116,11 @@ change requires breaking one, stop and redesign the change.
 - `bus.publish` marks the event deduped and assigns `seq` before the WAL append
   (`bus/bus.py`). A WAL failure can drop a retry or leave a `seq` gap. On a
   reopened store the bus seeds `seq`/dedup from the WAL before the first publish.
-- `WorkerPool` allows 4 concurrent handlers per session
-  (`bus/scheduler/pool.py:20-34`); reducer serialisation and tool parallelism are
-  not separated.
+- `WorkerPool` has two per-session lanes: `dispatch` (event handlers, default 4)
+  and `execution` (`ToolRuntime` workers, default 4). They use independent
+  semaphores, so a blocked tool cannot starve event dispatch; both still count
+  toward `wait_until_idle()`. Background-task admission
+  (`max_running_per_session`) caps execution independently.
 - Capability plugins (`runtime/plugins`) are implemented for tools/skills/modes;
   hooks, adapters, transport plugins, plugin KV and remote install remain
   unimplemented. Plugins run **in-process** and are trusted like the host.
@@ -133,6 +137,41 @@ change requires breaking one, stop and redesign the change.
   code. An allowlist supplied by an environment override is rejected with
   `E_PLUGIN_CONFIG`. The TUI gates `Ctrl+E`/`Ctrl+D` on both the
   `plugins.manage` feature and `plugin.list.manage`.
+- Async ReAct / background tasks (`agent.background.enabled`, default **off**):
+  `start`/`stop`/`list_tasks` are host-reserved names routed by the Agent, not
+  `ToolSpec` entries. `BackgroundTaskManager` is the sole `background.*`
+  subscriber; `ToolRuntime` and `SubagentOrchestrator` stay the sole subscribers
+  of their own intent events and only echo `background`/`start_call_id`.
+  Background work is process-local: restart recovery publishes `lost`, never
+  re-executes. `state.pending_background` holds only start/stop/list call ids;
+  `state.background` holds references only. Task terminals are user-role
+  notification messages (never `tool` messages), and `state.step_inbox` defers
+  user messages/notifications until the current step's tool results are paired.
+  A start beyond `max_running_per_session` / `max_running_total` is accepted as
+  `queued` (up to `max_queued_per_session`) instead of failing; promotion
+  re-emits `background.started{status:"running"}` for the same task_id and must
+  **not** pair the start call a second time. Only a full queue fails with
+  `E_BACKGROUND_LIMIT`. `on_user` while busy buffers instead of pre-empting.
+  Replay is WAL-derived: `replay_state` never needs `background_tools` or
+  `auto_continue`.
+- Turn steering / adoption (`agent.steering.enabled`, default **on**;
+  `agent.session.input_policy` default `"steer"`): a `user.message` arriving
+  mid-turn goes to `step_inbox`; adoptable foreground calls are offered to the
+  manager as `background.adopt.requested`. Manager↔ToolRuntime is a two-phase
+  handshake (`tool.call.adopt.requested` → `tool.call.adopted|rejected` →
+  `background.started{adopted}` / `background.adopt.failed`); ToolRuntime is the
+  authority and rejects approval-pending calls. Pairing is gated by
+  `call_id in pending` + `adopted:true`, not by `promote_pending`; a real
+  terminal that wins the race removes the id and the late Started is ignored.
+  `promote_pending` must be cleared on every path that removes a call from
+  `pending`. Non-adoptable calls continue to block the turn. A steering-routed
+  `background.start.requested{steering:true}` that fails falls back to a
+  foreground `tool.call.requested` with the same call_id, except `E_DENIED` /
+  cancelled. Adopted calls keep the original model call id; the manager maps it
+  through `_by_call` and the projector through `adopted_calls` so
+  `tool.output.delta` still streams. Subagent adoption is **not** implemented.
+  Recovery publishes `background.adopt.failed` for unmatched adopt requests and
+  `lost` for started tasks without a terminal; it never re-executes.
 - Cross-session memory, retrieval/RAG and CQRS projections beyond the session
   catalogue are not implemented yet. Do not assume their APIs exist.
 

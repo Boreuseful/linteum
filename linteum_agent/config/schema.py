@@ -195,6 +195,48 @@ class SubagentSettings:
     max_usd: float = 0.0
     max_rounds: int = 0
     max_wall_ms: int = 0
+    #: When true, every ``spawn_subagent`` call is routed to the background
+    #: manager instead of entering ``pending_subagents``.  The configured tool
+    #: must also appear in ``agent.background.allow`` (validated at assembly).
+    force_background: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundSettings:
+    """Async ReAct / background task policy (async React design v0.1 §14.1).
+
+    ``allow`` is the *authorization boundary*: it is the only place a host opts
+    a tool (or the configured subagent tool) into ``start(tool, args)``.  An
+    empty tuple means no background task is ever accepted, and enabling
+    subagents alone does not grant background subagent execution.
+    """
+
+    enabled: bool = False
+    auto_continue: bool = True
+    allow: tuple[str, ...] = ("bash",)
+    max_running_per_session: int = 4
+    max_running_total: int = 8
+    max_queued_per_session: int = 8
+    max_terminal_tasks: int = 32
+    default_timeout_s: float = 3600.0
+    max_timeout_s: float = 86400.0
+    stop_grace_ms: int = 2000
+    cancel_on_interrupt: bool = False
+    max_output_bytes: int = 1_048_576
+
+
+@dataclass(frozen=True, slots=True)
+class SteeringSettings:
+    """Turn-boundary steering / foreground-call adoption (design v0.1 §9.1).
+
+    When enabled, a ``user.message`` arriving while a turn is in flight makes
+    the Agent adopt cancellable foreground calls into background tasks so the
+    turn can close at its boundary instead of waiting for a long tool.  It does
+    **not** expose ``start`` to the model; that stays behind
+    :attr:`BackgroundSettings.enabled`.
+    """
+
+    enabled: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +253,7 @@ class BudgetSettings:
 class SessionSettings:
     """Defaults for newly created sessions."""
 
-    input_policy: str = "queue"          # queue | interrupt | reject
+    input_policy: str = "steer"          # queue | steer | interrupt | reject
     idle_ttl_ms: int = 1_800_000
 
 
@@ -284,6 +326,8 @@ class AgentSettings:
     tools: ToolSettings = field(default_factory=ToolSettings)
     skills: SkillsSettings = field(default_factory=SkillsSettings)
     subagents: SubagentSettings = field(default_factory=SubagentSettings)
+    background: BackgroundSettings = field(default_factory=BackgroundSettings)
+    steering: SteeringSettings = field(default_factory=SteeringSettings)
     budget: BudgetSettings = field(default_factory=BudgetSettings)
     session: SessionSettings = field(default_factory=SessionSettings)
     modes: ModeSettings = field(default_factory=ModeSettings)
@@ -934,6 +978,16 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
                    "E_CONFIG_PROFILE_NOT_FOUND",
                    f"profile {profile!r} is not defined",
                    hint=f"available profiles: {', '.join(profile_names)}")
+    if subagents.force_background and subagents.enabled \
+            and subagents.tool_name not in config.agent.background.allow:
+        _issue(
+            issues,
+            "agent.subagents.force_background",
+            "E_CONFIG_FORCE_BACKGROUND_ALLOW",
+            f"force_background requires {subagents.tool_name!r} in "
+            "agent.background.allow",
+            hint="add the subagent tool name to agent.background.allow",
+        )
     for name in ("default_tools", "allowed_tools"):
         for index, tool in enumerate(getattr(subagents, name)):
             if not isinstance(tool, str) or not tool.strip():
@@ -946,6 +1000,37 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
     if subagents.max_usd < 0:
         _issue(issues, "agent.subagents.max_usd", "E_CONFIG_RANGE", "must be >= 0")
 
+    # -- agent.background -----------------------------------------------
+    background = config.agent.background
+    if background.max_running_per_session < 1:
+        _issue(issues, "agent.background.max_running_per_session",
+               "E_CONFIG_RANGE", "must be >= 1")
+    if background.max_running_total < background.max_running_per_session:
+        _issue(issues, "agent.background.max_running_total", "E_CONFIG_RANGE",
+               "must be >= max_running_per_session")
+    if background.max_queued_per_session < 0:
+        _issue(issues, "agent.background.max_queued_per_session",
+               "E_CONFIG_RANGE", "must be >= 0")
+    if background.max_terminal_tasks < 1:
+        _issue(issues, "agent.background.max_terminal_tasks",
+               "E_CONFIG_RANGE", "must be >= 1")
+    if background.default_timeout_s <= 0:
+        _issue(issues, "agent.background.default_timeout_s",
+               "E_CONFIG_RANGE", "must be > 0")
+    if background.max_timeout_s < background.default_timeout_s:
+        _issue(issues, "agent.background.max_timeout_s", "E_CONFIG_RANGE",
+               "must be >= default_timeout_s")
+    if background.stop_grace_ms < 0:
+        _issue(issues, "agent.background.stop_grace_ms", "E_CONFIG_RANGE",
+               "must be >= 0")
+    if background.max_output_bytes <= 0:
+        _issue(issues, "agent.background.max_output_bytes", "E_CONFIG_RANGE",
+               "must be > 0")
+    for index, name in enumerate(background.allow):
+        if not isinstance(name, str) or not name.strip():
+            _issue(issues, f"agent.background.allow.{index}",
+                   "E_CONFIG_RANGE", "must be a non-empty string")
+
     # -- agent.budget ---------------------------------------------------
     budget = config.agent.budget
     for name in ("tokens", "wall_ms", "rounds"):
@@ -956,7 +1041,7 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
 
     # -- agent.session --------------------------------------------------
     session = config.agent.session
-    if session.input_policy not in ("queue", "interrupt", "reject"):
+    if session.input_policy not in ("queue", "steer", "interrupt", "reject"):
         _issue(issues, "agent.session.input_policy", "E_CONFIG_ENUM",
                f"unknown input policy {session.input_policy!r}")
     if session.idle_ttl_ms < 0:
@@ -1113,6 +1198,7 @@ __all__ = [
     "DEFAULT_PROVIDER",
     "AgentSettings",
     "AppConfig",
+    "BackgroundSettings",
     "BackpressureSettings",
     "BudgetSettings",
     "CheckpointSettings",

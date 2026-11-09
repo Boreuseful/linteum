@@ -6,13 +6,19 @@ the design surfaces race-condition bugs early instead of letting them replay
 into divergence.
 
 ```
-idle ──user.message──▶ thinking ──llm.completed(no tools)──▶ idle
-                         │  └─llm.completed(with tools)──▶ acting ─▶ awaiting_tools
-                         │                                        │  ├─tool.call.*▶ acting
-                         │                                        │  ├─pending=∅──▶ thinking
-                         │                                        │  └─approval.required▶ awaiting_approval
-                         └─user.interrupt──▶ idle                ...
+idle ──user.message──▶ thinking ──llm.completed(no tools, inbox empty)──▶ idle
+  │                      │  └─llm.completed(no tools, inbox non-empty)──▶ thinking (new step)
+  │                      └─llm.completed(with tools)──▶ acting ─▶ awaiting_tools
+  │                                                              │  ├─tool/subagent/background.started▶ ...
+  │                                                              │  ├─pending=∅──▶ thinking
+  │                                                              │  └─approval.required▶ awaiting_approval
+  │                                                              └─user.interrupt──▶ idle
+  └─background.completed/failed(auto_continue)──▶ thinking
 ```
+
+``idle`` explicitly **allows** a non-empty ``state.background``: background tasks
+are not part of the foreground barrier (async ReAct design v0.1 T5).  Only
+``pending`` / ``pending_background`` / ``step_inbox`` must be empty at idle.
 """
 
 from __future__ import annotations

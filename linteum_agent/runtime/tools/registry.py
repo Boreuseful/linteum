@@ -32,6 +32,10 @@ class ToolRegistry:
     def __init__(self, *, reserved: Iterable[str] = ()) -> None:
         self._specs: dict[str, ToolSpec] = {}
         self._sem: dict[str, asyncio.Semaphore] = {}
+        #: Independent per-tool gates for background calls.  A long-running
+        #: background ``bash`` must not block foreground calls of the same tool
+        #: (async ReAct design v0.1 §9.1).  Created lazily at the spec's size.
+        self._bg_sem: dict[str, asyncio.Semaphore] = {}
         self._draining: set[str] = set()
         self._reserved: set[str] = set(reserved)
         self._lock = asyncio.Lock()
@@ -53,6 +57,7 @@ class ToolRegistry:
             for spec in batch:
                 self._specs[spec.name] = spec
                 self._sem[spec.name] = asyncio.Semaphore(spec.concurrency)
+                self._bg_sem.pop(spec.name, None)
                 self._draining.discard(spec.name)
 
     async def register(self, spec: ToolSpec) -> None:
@@ -67,6 +72,7 @@ class ToolRegistry:
                 if spec is not None:
                     removed.append(spec)
                 self._sem.pop(name, None)
+                self._bg_sem.pop(name, None)
                 self._draining.discard(name)
         return removed
 
@@ -91,9 +97,20 @@ class ToolRegistry:
         """Function-calling schemas for the live (non-draining) tools."""
         return [s.json_schema() for name, s in self._specs.items() if name not in self._draining]
 
-    def semaphore(self, name: str) -> asyncio.Semaphore:
-        """The per-tool concurrency gate (Checklist #6)."""
-        return self._sem[name]
+    def semaphore(self, name: str, *, background: bool = False) -> asyncio.Semaphore:
+        """The per-tool concurrency gate (Checklist #6).
+
+        Background calls use a **separate** gate of the same size, so a long
+        background ``bash`` cannot starve foreground calls of that tool.
+        """
+        if not background:
+            return self._sem[name]
+        gate = self._bg_sem.get(name)
+        if gate is None:
+            spec = self._specs[name]
+            gate = asyncio.Semaphore(spec.concurrency)
+            self._bg_sem[name] = gate
+        return gate
 
     def names(self) -> tuple[str, ...]:
         return tuple(self._specs)

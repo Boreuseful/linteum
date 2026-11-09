@@ -28,15 +28,18 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from collections import OrderedDict
 from collections.abc import Collection, Iterable
 from typing import Callable, Optional
 
 from ...bus.artifact import NullArtifactStore
+from ...bus.errors import ErrorCode
 from ..errors import ErrorSource, error_info
 from ...bus.scheduler.cancel import Cancelled, CancelToken
 from ...bus.scheduler.pool import WorkerPool
 from .errors import (
     E_BAD_ARGS,
+    E_BACKGROUND_SPEC_CHANGED,
     E_CANCELLED,
     E_DENIED,
     E_PLUGIN_UNLOADING,
@@ -58,6 +61,15 @@ DEFAULT_POOL_SIZE = 16
 LOCATION_ON_CALL = "linteum_agent.runtime.tools.runtime.ToolRuntime.on_call"
 LOCATION_EXECUTE = "linteum_agent.runtime.tools.runtime.ToolRuntime._execute"
 LOCATION_DENY = "linteum_agent.runtime.tools.runtime.ToolRuntime.deny"
+LOCATION_ADOPT = "linteum_agent.runtime.tools.runtime.ToolRuntime.on_adopt"
+
+#: Turn steering error codes (kept local so ``runtime.tools`` never imports
+#: ``runtime.background``; AGENTS.md dependency direction).
+E_BACKGROUND_APPROVAL = ErrorCode.E_BACKGROUND_APPROVAL.value
+E_BACKGROUND_NOT_RUNNING = ErrorCode.E_BACKGROUND_NOT_RUNNING.value
+
+#: How many finished call ids are remembered for late adoption requests.
+FINISHED_CALL_RETAIN = 256
 
 
 class ToolRuntime:
@@ -79,6 +91,7 @@ class ToolRuntime:
         approval_policy: str = "ask",
         approval_policy_for: Optional[Callable[[str], Optional[str]]] = None,
         auto_approve: Collection[str] = (),
+        max_background_timeout: float = 86400.0,
     ) -> None:
         if approval_policy not in ("ask", "allow", "deny"):
             raise ValueError(
@@ -109,8 +122,11 @@ class ToolRuntime:
         chosen = artifacts if artifacts is not None else getattr(bus, "artifacts", None)
         self.artifacts = chosen if chosen is not None else NullArtifactStore()
         self.inline_limit = inline_limit
-        # Sharing the bus pool makes ``bus.wait_until_idle()`` cover tool work;
-        # inject a private pool to isolate tool concurrency from event dispatch.
+        #: Upper bound for ``background: true`` timeouts (``0`` = no clamp).
+        self.max_background_timeout = float(max_background_timeout or 0.0)
+        # Sharing the bus pool keeps ``bus.wait_until_idle()`` covering tool
+        # work.  Tool jobs are submitted on the pool's execution lane so a
+        # blocked tool cannot consume the session's dispatch slots (AR-16).
         self.pool = pool if pool is not None else getattr(bus, "pool", None) or WorkerPool(DEFAULT_POOL_SIZE)
         self.approvals.runtime = self
 
@@ -119,6 +135,19 @@ class ToolRuntime:
         self._sessions: dict[str, str] = {}
         #: ``call_id -> tool name`` for the drain bookkeeping (§8.10).
         self._names: dict[str, str] = {}
+        #: ``call_id`` values issued by the background manager (``background``
+        #: payload flag).  Used by cancel scopes and terminal echo (§9.1/§9.2).
+        #: Turn steering adds adopted foreground ids here at runtime.
+        self._background: set[str] = set()
+        #: Calls adopted by turn steering (for ``adopted:true`` in deltas and
+        #: terminals).  Subset of ``_background`` once marked.
+        self._adopted: set[str] = set()
+        #: ``call_id -> adoption_id`` for requests that arrived before the
+        #: original ``tool.call.requested`` reached this runtime.
+        self._pending_adopts: dict[str, str] = {}
+        #: Recently finished call ids, so a late adoption can be rejected
+        #: deterministically instead of hanging the manager.
+        self._finished_calls: OrderedDict[str, None] = OrderedDict()
 
         if auto_subscribe:
             self.subscribe()
@@ -126,6 +155,7 @@ class ToolRuntime:
     # -- subscription -------------------------------------------------------
     def subscribe(self) -> None:
         self.bus.on("tool.call.requested", self.on_call)
+        self.bus.on("tool.call.adopt.requested", self.on_adopt)
         self.bus.on("tool.cancel.requested", self.on_cancel)
         self.bus.on("approval.granted", self.on_approval)
         self.bus.on("approval.denied", self.on_denial)
@@ -136,6 +166,12 @@ class ToolRuntime:
         call_id = ev.payload.get("call_id")
         if not name or not call_id:
             return  # malformed intent — nothing to pair (I3 only binds well-formed calls)
+
+        #: Background calls were approved by ``BackgroundTaskManager`` during the
+        #: ``start`` handshake.  ``approved`` alone is never trusted: only
+        #: ``background and approved`` skips the gate (§9.1).
+        background = bool(ev.payload.get("background"))
+        approved = bool(ev.payload.get("approved"))
 
         try:
             registry = await self._registry_for_session(ev.session_id)
@@ -155,11 +191,34 @@ class ToolRuntime:
         # ② immediate acknowledgement so the UI knows the call was accepted
         await self.bus.publish(ev.child("tool.call.started", {
             "call_id": call_id, "name": name, "side_effect": spec.side_effect,
+            "background": background,
         }))
 
-        # ③ approval-gated: suspend, do not execute
+        # ②b spec pinning: a background task must run the implementation that was
+        # approved at ``start`` time.  A mode/plugin change fails the task cleanly
+        # instead of silently executing new code (§9.1 / R6).
+        expected_digest = ev.payload.get("spec_digest")
+        if background and expected_digest:
+            if spec.stable_digest() != expected_digest:
+                await self._fail(
+                    ev, call_id,
+                    f"tool spec changed since start: {name}",
+                    E_BACKGROUND_SPEC_CHANGED,
+                    retryable=False,
+                )
+                return
+
+        # ③ approval-gated: suspend, do not execute.  A background call has
+        # already passed the manager's approval handshake.
         policy = await self._effective_approval_policy(ev.session_id)
-        if spec.requires_approval and policy != "allow":
+        gate = spec.requires_approval and policy != "allow"
+        if gate and not (background and approved):
+            adoption_id = await self._resolve_pending_adopt(ev, call_id)
+            if adoption_id:
+                await self._reject_adopt(
+                    ev, call_id, adoption_id, E_BACKGROUND_APPROVAL,
+                    "approval required",
+                )
             if policy == "deny":
                 await self._fail(ev, call_id,
                                  f"approval required but policy is 'deny': {name}",
@@ -171,6 +230,83 @@ class ToolRuntime:
 
         # ④ fire-and-forget on the worker pool (non-blocking)
         await self._spawn(ev, spec, registry)
+
+    # -- turn steering: adoption handshake (design v0.1 §8) -----------------
+    async def on_adopt(self, ev) -> None:
+        """Answer the manager's ``tool.call.adopt.requested`` (S7).
+
+        This runtime is the authority on whether an in-flight foreground call
+        can be re-owned as a background task.  It answers exactly once per
+        request: ``tool.call.adopted`` or ``tool.call.adopt.rejected``.
+        """
+        payload = ev.payload if isinstance(ev.payload, dict) else {}
+        call_id = payload.get("call_id")
+        adoption_id = payload.get("adoption_id")
+        if (not isinstance(call_id, str) or not call_id
+                or not isinstance(adoption_id, str) or not adoption_id):
+            return
+
+        # Approval-pending calls are not adoptable in v0.1 (§12.2): the gate
+        # was already opened for a foreground decision, and cancelling it later
+        # would leave the adopted task without a terminal.
+        if call_id in self.approvals.pending:
+            await self._reject_adopt(
+                ev, call_id, adoption_id, E_BACKGROUND_APPROVAL,
+                "call is waiting for approval",
+            )
+            return
+
+        # Already executing (or already registered on the execution lane).
+        if call_id in self.inflight or call_id in self.tokens:
+            self._background.add(call_id)
+            self._adopted.add(call_id)
+            await self._ack_adopt(ev, call_id, adoption_id)
+            return
+
+        # The original ``tool.call.requested`` has not reached this runtime yet.
+        # Buffer the adoption; ``on_call``/``_spawn`` will decide once it does.
+        if call_id in self._pending_adopts:
+            return
+        if call_id in self._finished_calls:
+            await self._reject_adopt(
+                ev, call_id, adoption_id, E_BACKGROUND_NOT_RUNNING,
+                "call already finished",
+            )
+            return
+        self._pending_adopts[call_id] = adoption_id
+
+    async def _ack_adopt(self, ev, call_id: str, adoption_id: str) -> None:
+        await self.bus.publish(ev.child("tool.call.adopted", {
+            "call_id": call_id,
+            "adoption_id": adoption_id,
+        }))
+
+    async def _reject_adopt(
+        self, ev, call_id: str, adoption_id: str, code: str, message: str,
+    ) -> None:
+        info = error_info(
+            code,
+            source=ErrorSource.TOOL.value,
+            location=LOCATION_ADOPT,
+            message=message,
+            enters_history=False,
+        )
+        await self.bus.publish(ev.child("tool.call.adopt.rejected", {
+            "call_id": call_id,
+            "adoption_id": adoption_id,
+            "code": code,
+            "error": message,
+            "error_info": info.to_dict(),
+        }))
+
+    async def _resolve_pending_adopt(self, ev, call_id: str) -> Optional[str]:
+        """Pop a buffered adoption for ``call_id``, if any."""
+        return self._pending_adopts.pop(call_id, None)
+
+    def _remember_finished(self, call_id: str) -> None:
+        self._finished_calls[call_id] = None
+        while len(self._finished_calls) > FINISHED_CALL_RETAIN:
+            self._finished_calls.popitem(last=False)
 
     async def resume_approved(self, ev) -> None:
         """Re-enter execution after a human granted the request (§24)."""
@@ -202,8 +338,24 @@ class ToolRuntime:
         self.tokens[call_id] = token
         self._sessions[call_id] = ev.session_id
         self._names[call_id] = spec.name
-        task = self.pool.spawn(self._execute(ev, spec, token, registry), session_id=ev.session_id)
+        if ev.payload.get("background"):
+            self._background.add(call_id)
+        # Turn steering: an adoption that raced ahead of the original request
+        # is resolved here, once the call is genuinely being spawned.
+        adoption_id = await self._resolve_pending_adopt(ev, call_id)
+        if adoption_id:
+            self._background.add(call_id)
+            self._adopted.add(call_id)
+        # Tool work runs on the execution lane: a long/blocked tool must never
+        # consume the session's dispatch slots (async ReAct AR-16).
+        task = self.pool.spawn(
+            self._execute(ev, spec, token, registry),
+            session_id=ev.session_id,
+            lane="execution",
+        )
         self.inflight[call_id] = task
+        if adoption_id:
+            await self._ack_adopt(ev, call_id, adoption_id)
 
         def _done(_task, cid=call_id):
             self.inflight.pop(cid, None)
@@ -252,6 +404,22 @@ class ToolRuntime:
     async def _execute(self, ev, spec, token: CancelToken, registry=None) -> None:
         call_id = ev.payload["call_id"]
         reg = self.reg if registry is None else registry
+        # ``initial_background`` selects the timeout/semaphore at spawn time.
+        # Turn steering may adopt the call later; deltas and the terminal read
+        # the mutable ``_background`` set instead (§8.2).
+        initial_background = bool(ev.payload.get("background"))
+        timeout = spec.timeout
+        if initial_background:
+            # Only the manager may widen a background call; foreground args can
+            # never raise their own timeout (§9.3).
+            override = ev.payload.get("timeout_s")
+            if override is not None:
+                try:
+                    timeout = float(override)
+                except (TypeError, ValueError):
+                    timeout = spec.timeout
+            if self.max_background_timeout > 0:
+                timeout = min(timeout, self.max_background_timeout)
         try:
             cached = await self.results.get(call_id)          # idempotency: check first
             if cached is not None:
@@ -261,10 +429,17 @@ class ToolRuntime:
             args = spec.validate(ev.payload.get("args") or {})  # schema check
 
             async def progress(payload: dict) -> None:
-                await self.bus.publish(ev.child("tool.output.delta", {"call_id": call_id, **payload}))
+                delta = {
+                    "call_id": call_id,
+                    "background": call_id in self._background,
+                    **payload,
+                }
+                if call_id in self._adopted:
+                    delta["adopted"] = True
+                await self.bus.publish(ev.child("tool.output.delta", delta))
 
-            async with reg.semaphore(spec.name):              # per-tool concurrency gate
-                async with asyncio.timeout(spec.timeout):    # hard timeout
+            async with reg.semaphore(spec.name, background=initial_background):
+                async with asyncio.timeout(timeout):          # hard timeout
                     out = await self.sandbox.run(spec, args, token, progress, call_id=call_id)
             result = {"ok": True, "output": self._normalise(out)}
         except asyncio.CancelledError:                        # I19 — never swallow
@@ -278,7 +453,7 @@ class ToolRuntime:
             result = self._error(E_CANCELLED, "cancelled", exc=exc,
                                  location=LOCATION_EXECUTE, enters_history=False)
         except TimeoutError as exc:
-            result = self._error(E_TIMEOUT, f"timeout after {spec.timeout}s", exc=exc,
+            result = self._error(E_TIMEOUT, f"timeout after {timeout}s", exc=exc,
                                  location=LOCATION_EXECUTE, retryable=True)
         except ValidationError as exc:
             result = {"ok": False, **exc.as_payload(location=LOCATION_EXECUTE)}
@@ -291,9 +466,22 @@ class ToolRuntime:
 
     async def _finish(self, ev, call_id, result: dict, dedup: bool = False) -> None:
         """Externalise oversized output, record the result, publish the outcome."""
+        # Read the mutable markers before clearing them: turn steering may have
+        # adopted this call after spawn (§8.2 / S4).
+        adopted = call_id in self._adopted
+        background = (
+            bool(ev.payload.get("background"))
+            or call_id in self._background
+        )
+        start_call_id = ev.payload.get("start_call_id")
+        if adopted and not start_call_id:
+            start_call_id = call_id
         self.tokens.pop(call_id, None)
         self._sessions.pop(call_id, None)
         self._names.pop(call_id, None)
+        self._background.discard(call_id)
+        self._adopted.discard(call_id)
+        self._remember_finished(call_id)
 
         ok = bool(result.get("ok"))
         if ok:
@@ -310,13 +498,30 @@ class ToolRuntime:
             await self.results.put(call_id, result)           # idempotency: record after
 
         etype = "tool.call.completed" if ok else "tool.call.failed"
-        await self.bus.publish(ev.child(etype, {
-            "call_id": call_id, "name": ev.payload.get("name"), "dedup": dedup, **result,
-        }))
+        payload = {
+            "call_id": call_id, "name": ev.payload.get("name"),
+            "dedup": dedup, **result,
+        }
+        if background:
+            payload["background"] = True
+        if adopted:
+            payload["adopted"] = True
+        if start_call_id:
+            payload["start_call_id"] = start_call_id
+        await self.bus.publish(ev.child(etype, payload))
 
-    async def _fail(self, ev, call_id, message: str, code: str, *, exc=None) -> None:
+    async def _fail(self, ev, call_id, message: str, code: str, *,
+                    exc=None, retryable: Optional[bool] = None) -> None:
+        # A buffered adoption must not outlive a call that failed before spawn.
+        adoption_id = self._pending_adopts.pop(call_id, None)
+        if adoption_id:
+            await self._reject_adopt(
+                ev, call_id, adoption_id, E_BACKGROUND_NOT_RUNNING, message,
+            )
+        if retryable is None:
+            retryable = code == E_PLUGIN_UNLOADING
         info = error_info(code, source=ErrorSource.TOOL.value, location=LOCATION_ON_CALL,
-                          message=message, exc=exc, retryable=(code == E_PLUGIN_UNLOADING))
+                          message=message, exc=exc, retryable=retryable)
         await self._finish(ev, call_id,
                            {"ok": False, "code": code, "error": message, "error_info": info.to_dict()})
 
@@ -330,8 +535,26 @@ class ToolRuntime:
             await self._cancel_call(call_id)
             return
         session_id = ev.payload.get("session_id") or ev.session_id
-        self.approvals.cancel(session_id=session_id)
-        for cid in [c for c, s in self._sessions.items() if s == session_id]:
+        # ``scope`` is a pure additive field (§9.2): omitting it keeps the
+        # historical "cancel every foreground call" behaviour.
+        scope = ev.payload.get("scope") or "foreground"
+        if scope == "background":
+            matches = [
+                cid for cid, sid in self._sessions.items()
+                if sid == session_id and cid in self._background
+            ]
+        elif scope == "all":
+            self.approvals.cancel(session_id=session_id)
+            matches = [cid for cid, sid in self._sessions.items() if sid == session_id]
+        else:  # foreground (default, backward compatible)
+            # A background start's approval also belongs to the foreground
+            # scope, so session-level invalidation stays unchanged (§9.2).
+            self.approvals.cancel(session_id=session_id)
+            matches = [
+                cid for cid, sid in self._sessions.items()
+                if sid == session_id and cid not in self._background
+            ]
+        for cid in matches:
             await self._cancel_call(cid)
 
     async def _cancel_call(self, call_id: str) -> None:

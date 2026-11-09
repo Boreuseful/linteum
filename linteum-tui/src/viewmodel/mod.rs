@@ -894,6 +894,7 @@ fn open_sidebar_panel(state: &mut TuiState, panel: SidebarPanel) -> Vec<Effect> 
     // Selecting a panel means "show that panel", not "keep the last split".
     // `/split` opts back into the multi-panel layout explicitly.
     state.sidebar.layout = SidebarLayout::Merged;
+    state.sidebar.background_scroll = 0;
     state.focus = Focus::Composer;
     let root = sidebar_root(state);
     state

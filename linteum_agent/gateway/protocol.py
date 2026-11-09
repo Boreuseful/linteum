@@ -75,6 +75,8 @@ KNOWN_COMMANDS: frozenset = frozenset(
         "history.read",
         "artifact.read",
         "session.context",
+        "session.tasks",
+        "session.task.stop",
         "mode.list",
         "session.mode.set",
         "plugin.list",
@@ -301,6 +303,18 @@ def validate_command(cmd: "Command") -> None:
     if cmd.name == "session.context":
         if command_session_id(cmd) is None:
             raise _bad("session.context requires session_id")
+        return
+
+    if cmd.name == "session.tasks":
+        if command_session_id(cmd) is None:
+            raise _bad("session.tasks requires session_id")
+        return
+
+    if cmd.name == "session.task.stop":
+        if command_session_id(cmd) is None:
+            raise _bad("session.task.stop requires session_id")
+        _string(args, "task_id", required=True)
+        _string(args, "reason")
         return
 
     if cmd.name == "mode.list":
