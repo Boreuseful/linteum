@@ -195,6 +195,10 @@ class SubagentSettings:
     max_usd: float = 0.0
     max_rounds: int = 0
     max_wall_ms: int = 0
+    #: When true, every ``spawn_subagent`` call is routed to the background
+    #: manager instead of entering ``pending_subagents``.  The configured tool
+    #: must also appear in ``agent.background.allow`` (validated at assembly).
+    force_background: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -974,6 +978,16 @@ def validate_config(config: AppConfig, *, effective: bool = False) -> list[Issue
                    "E_CONFIG_PROFILE_NOT_FOUND",
                    f"profile {profile!r} is not defined",
                    hint=f"available profiles: {', '.join(profile_names)}")
+    if subagents.force_background and subagents.enabled \
+            and subagents.tool_name not in config.agent.background.allow:
+        _issue(
+            issues,
+            "agent.subagents.force_background",
+            "E_CONFIG_FORCE_BACKGROUND_ALLOW",
+            f"force_background requires {subagents.tool_name!r} in "
+            "agent.background.allow",
+            hint="add the subagent tool name to agent.background.allow",
+        )
     for name in ("default_tools", "allowed_tools"):
         for index, tool in enumerate(getattr(subagents, name)):
             if not isinstance(tool, str) or not tool.strip():

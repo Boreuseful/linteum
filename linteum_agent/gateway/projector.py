@@ -538,24 +538,29 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
     # -- subagent domain --------------------------------------------------
     elif etype == "subagent.spawn.requested":
         call_id = payload.get("call_id")
+        # Foreground and manager-owned children feed the same Subagents view.
+        # Only a foreground child enters the pending barrier (T3).
+        frames.append(ProjectedFrame("subagent.requested", {
+            "call_id": call_id,
+            "title": payload.get("title"),
+            "task": _preview_text(payload.get("task", "") or ""),
+            "tools": list(payload.get("tools") or ()),
+            "model_profile": payload.get("model_profile"),
+        }))
         if payload.get("background"):
-            # Manager-owned child: same rule as background tool calls (§15.1).
+            # Manager-owned child: keep the tool-name mapping for cancel
+            # notices, but never touch pending or the foreground phase.
             if call_id:
                 tool_names[call_id] = payload.get("title") or "spawn_subagent"
         else:
-            frames.append(ProjectedFrame("subagent.requested", {
-                "call_id": call_id,
-                "title": payload.get("title"),
-                "task": _preview_text(payload.get("task", "") or ""),
-                "tools": list(payload.get("tools") or ()),
-                "model_profile": payload.get("model_profile"),
-            }))
             if call_id:
                 pending.add(call_id)
                 tool_names[call_id] = "spawn_subagent"
             phase = phases.AWAITING_TOOLS
 
     elif etype == "subagent.started":
+        # Background children emit the same frame as foreground ones; the
+        # background card remains the task lifecycle surface (unified view D2).
         frames.append(ProjectedFrame("subagent.started", {
             "call_id": payload.get("call_id"),
             "child_session_id": payload.get("child_session_id"),
@@ -570,6 +575,7 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
         }))
 
     elif etype == "subagent.progress":
+        # UI-only progress for both foreground and background children.
         frames.append(ProjectedFrame("subagent.progress", {
             "call_id": payload.get("call_id"),
             "child_session_id": payload.get("child_session_id"),
@@ -584,54 +590,57 @@ def project(event, state: ProjectorState) -> tuple[list[ProjectedFrame], Project
 
     elif etype == "subagent.completed":
         call_id = payload.get("call_id")
+        was_pending = call_id is not None and call_id in pending
+        frames.append(ProjectedFrame("subagent.result", {
+            "call_id": call_id,
+            "child_session_id": payload.get("child_session_id"),
+            "title": payload.get("title"),
+            "ok": True,
+            "finish": payload.get("finish", "completed"),
+            "summary": _preview_text(payload.get("summary", "") or ""),
+            "summary_ref": payload.get("summary_ref"),
+            "summary_truncated": bool(payload.get("summary_truncated", False)),
+            "usage": payload.get("usage") or {},
+            "rounds": payload.get("rounds"),
+            "duration_ms": payload.get("duration_ms"),
+            "model_profile": payload.get("model_profile"),
+        }))
+        tool_names.pop(call_id, None)
         if payload.get("background"):
-            # The task view terminal is ``background.completed``; emit nothing
-            # for the foreground transcript and do not touch phase/pending.
+            # Manager-owned child: the lifecycle terminal is
+            # ``background.completed``; this frame only feeds the Subagents
+            # view.  Never touch the foreground barrier or phase (T3).
             pass
         else:
-            was_pending = call_id is not None and call_id in pending
-            frames.append(ProjectedFrame("subagent.result", {
-                "call_id": call_id,
-                "child_session_id": payload.get("child_session_id"),
-                "title": payload.get("title"),
-                "ok": True,
-                "finish": payload.get("finish", "completed"),
-                "summary": _preview_text(payload.get("summary", "") or ""),
-                "summary_ref": payload.get("summary_ref"),
-                "summary_truncated": bool(payload.get("summary_truncated", False)),
-                "usage": payload.get("usage") or {},
-                "rounds": payload.get("rounds"),
-                "duration_ms": payload.get("duration_ms"),
-                "model_profile": payload.get("model_profile"),
-            }))
             pending.discard(call_id)
-            tool_names.pop(call_id, None)
             approvals.pop(call_id, None)
             if was_pending:
                 phase = phases.THINKING if not pending else phases.AWAITING_TOOLS
 
     elif etype == "subagent.failed":
         call_id = payload.get("call_id")
+        was_pending = call_id is not None and call_id in pending
+        info = _as_error_info(payload)
+        frames.append(ProjectedFrame("subagent.error", {
+            "call_id": call_id,
+            "child_session_id": payload.get("child_session_id"),
+            "title": payload.get("title"),
+            "ok": False,
+            "finish": payload.get("finish", "error"),
+            "code": payload.get("code"),
+            "error": payload.get("error"),
+            "error_info": info,
+            "usage": payload.get("usage") or {},
+            "rounds": payload.get("rounds"),
+            "duration_ms": payload.get("duration_ms"),
+        }))
+        tool_names.pop(call_id, None)
         if payload.get("background"):
+            # A background child's failure is not the parent session's error:
+            # do not set ``last_error`` or close the foreground phase.
             pass
         else:
-            was_pending = call_id is not None and call_id in pending
-            info = _as_error_info(payload)
-            frames.append(ProjectedFrame("subagent.error", {
-                "call_id": call_id,
-                "child_session_id": payload.get("child_session_id"),
-                "title": payload.get("title"),
-                "ok": False,
-                "finish": payload.get("finish", "error"),
-                "code": payload.get("code"),
-                "error": payload.get("error"),
-                "error_info": info,
-                "usage": payload.get("usage") or {},
-                "rounds": payload.get("rounds"),
-                "duration_ms": payload.get("duration_ms"),
-            }))
             pending.discard(call_id)
-            tool_names.pop(call_id, None)
             approvals.pop(call_id, None)
             last_error = info or last_error
             if was_pending:

@@ -5,6 +5,8 @@ reducer state:
 
 * validate the host authorization boundary (``agent.background.allow`` plus
   ``ToolSpec.backgroundable``), mint ``task_id`` values and enforce limits;
+* accept a forced start for the configured subagent tool even when the
+  explicit ``start`` wrapper is disabled (``agent.subagents.force_background``);
 * run the approval handshake **before** execution (a dangerous command must be
   approved while the foreground step waits);
 * publish ``background.started`` first, then the existing
@@ -110,6 +112,7 @@ class BackgroundTaskManager:
         clock: Callable[[], float] = time.time,
         subagent_settings_for: Optional[Callable[[], SubagentSettings]] = None,
         steering_enabled: bool = False,
+        force_background_subagents: bool = False,
     ) -> None:
         self.bus = bus
         self.settings = settings
@@ -117,6 +120,9 @@ class BackgroundTaskManager:
         #: ``agent.steering.enabled`` — accepts adoption and steering-routed
         #: starts even when the explicit ``start`` feature is off (D8/D9).
         self.steering_enabled = bool(steering_enabled)
+        #: ``agent.subagents.force_background`` — accept ``forced:true`` starts
+        #: for the configured subagent tool even when explicit ``start`` is off.
+        self.force_background_subagents = bool(force_background_subagents)
         self._subagent_settings_for = subagent_settings_for
         self._registry_for = registry_for
         self._session_kind = session_kind
@@ -392,15 +398,19 @@ class BackgroundTaskManager:
         self, ev: Event, call_id: str, payload: Mapping[str, Any],
         *, exclude_task_id: Optional[str] = None, approved: bool = False,
     ) -> tuple[BackgroundTask, Any]:
+        forced = bool(payload.get("forced"))
         steering = bool(payload.get("steering"))
         if not self.settings.enabled and not (
             steering and self.steering_enabled
-        ):
-            raise BackgroundError(
-                E_BACKGROUND_DISABLED,
-                "background tasks are disabled by the host"
-                if not steering else "turn steering is disabled by the host",
+        ) and not (forced and self.force_background_subagents):
+            message = (
+                "forced background subagents are disabled by the host"
+                if forced else (
+                    "turn steering is disabled by the host"
+                    if steering else "background tasks are disabled by the host"
+                )
             )
+            raise BackgroundError(E_BACKGROUND_DISABLED, message)
         kind = self._session_kind(ev.session_id)
         if kind != "root":
             raise BackgroundError(
@@ -427,6 +437,16 @@ class BackgroundTaskManager:
             )
 
         subagent_settings = self.current_subagent_settings()
+        if forced and tool_name != subagent_settings.tool_name:
+            raise BackgroundError(
+                E_BACKGROUND_NOT_ALLOWED,
+                "forced background is only valid for the subagent tool, "
+                f"got {tool_name!r}",
+                context={
+                    "tool": tool_name,
+                    "subagent_tool": subagent_settings.tool_name,
+                },
+            )
         spec = None
         needs_approval = False
 
@@ -715,6 +735,10 @@ class BackgroundTaskManager:
             payload["steering"] = True
             args = request.get("args")
             payload["args"] = dict(args) if isinstance(args, dict) else {}
+        if request.get("forced"):
+            # Audit only; the Agent pairs this failure with the original call
+            # and never retries it as a foreground tool (D5).
+            payload["forced"] = True
         return payload
 
     @staticmethod

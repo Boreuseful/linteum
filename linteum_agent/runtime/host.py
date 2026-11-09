@@ -370,7 +370,7 @@ class AgentHost:
             auto_approve=cfg.agent.tools.auto_approve,
             max_background_timeout=cfg.agent.background.max_timeout_s,
         )
-        if cfg.agent.background.enabled:
+        if cfg.agent.background.enabled or cfg.agent.subagents.force_background:
             self._ensure_background_manager(cfg)
         self.compactor = context_compactor or ContextCompactor(
             self.bus, artifacts=self.storage.artifacts
@@ -622,6 +622,7 @@ class AgentHost:
 
         enabled = cfg.agent.background.enabled
         steering = cfg.agent.steering.enabled
+        force_background = cfg.agent.subagents.force_background
         targets = self._background_targets(
             cfg, registry, subagent_tools, workspace=workspace,
         )
@@ -631,7 +632,7 @@ class AgentHost:
         # ``background.enabled`` and a non-empty enum; steering creates tasks
         # on the model's behalf but does not expose the wrapper.
         include_start = enabled and bool(targets)
-        include_manage = enabled or steering
+        include_manage = enabled or steering or force_background
         bg_schemas = (
             background_tool_schemas(
                 targets if include_start else (),
@@ -660,13 +661,15 @@ class AgentHost:
         """Build/refresh the manager when the feature is enabled (§8.1)."""
         settings = cfg.agent.background
         steering = cfg.agent.steering.enabled
+        force_background = bool(cfg.agent.subagents.force_background)
         runtime = getattr(self, "tool_runtime", None)
         if runtime is not None:
             runtime.max_background_timeout = settings.max_timeout_s
-        if not (settings.enabled or steering):
+        if not (settings.enabled or steering or force_background):
             if self.background is not None:
                 self.background.settings_changed(settings, cfg.agent.subagents)
                 self.background.steering_enabled = False
+                self.background.force_background_subagents = False
             return self.background
         if self.background is None:
             manager = BackgroundTaskManager(
@@ -688,12 +691,14 @@ class AgentHost:
                     lambda: self._current_config().agent.subagents
                 ),
                 steering_enabled=steering,
+                force_background_subagents=force_background,
             )
             manager.subscribe()
             self.background = manager
         else:
             self.background.settings_changed(settings, cfg.agent.subagents)
             self.background.steering_enabled = steering
+            self.background.force_background_subagents = force_background
             self.background.approval_policy = cfg.agent.tools.approval
             self.background.auto_approve = frozenset(cfg.agent.tools.auto_approve)
         return self.background
@@ -1640,6 +1645,8 @@ class AgentHost:
                 "subagent_tools": subagent_tools,
                 "background_tools": background_tools,
                 "steering": steering_cfg.enabled,
+                "force_background_subagents":
+                    cfg.agent.subagents.force_background,
                 "promotable_tools": promotable_tools,
                 "auto_continue": background_cfg.auto_continue,
                 "cancel_on_interrupt": background_cfg.cancel_on_interrupt,

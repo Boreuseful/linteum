@@ -890,7 +890,11 @@ class SessionGateway:
 
     # -- background tasks (§15.2) -----------------------------------------
     def _require_background(self) -> None:
-        if not self.host.current_config().agent.background.enabled:
+        cfg = self.host.current_config()
+        if not (
+            cfg.agent.background.enabled
+            or cfg.agent.subagents.force_background
+        ):
             raise GatewayError(
                 E_BACKGROUND_DISABLED,
                 "background tasks are disabled by the host",

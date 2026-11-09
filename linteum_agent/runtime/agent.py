@@ -77,6 +77,7 @@ class Agent:
         subagent_tools: frozenset[str] = frozenset(),
         background_tools: frozenset[str] = frozenset(),
         steering: bool = False,
+        force_background_subagents: bool = False,
         promotable_tools: frozenset[str] = frozenset(),
         auto_continue: bool = True,
         cancel_on_interrupt: bool = False,
@@ -98,6 +99,9 @@ class Agent:
         #: Turn steering: adopt in-flight foreground calls at a turn boundary
         #: and route new calls to the background while user input is pending.
         self._steering = bool(steering)
+        #: ``agent.subagents.force_background`` — route every reserved
+        #: ``spawn_subagent`` call straight to the background manager.
+        self._force_background_subagents = bool(force_background_subagents)
         #: Ordinary tool names eligible for background routing/adoption.
         self._promotable_tools = frozenset(promotable_tools)
         #: ``agent.background.auto_continue`` — whether an idle session opens a
@@ -448,6 +452,14 @@ class Agent:
             if names.get(call.get("call_id")) not in self._background_tools
             and names.get(call.get("call_id")) not in self._subagent_tools
         ]
+        forced_ids: set[str] = set()
+        if self._force_background_subagents and subagent_calls:
+            # Forced mode is an entry policy, not adoption: the call is a
+            # background task from its first event and never enters
+            # ``pending_subagents`` (force-background design D1/D2).
+            forced_ids = {c["call_id"] for c in subagent_calls}
+            background_calls = [*background_calls, *subagent_calls]
+            subagent_calls = []
         # Turn steering: if user input is already waiting, route eligible new
         # ordinary calls straight to the background instead of starting them
         # foreground and immediately adopting them (§6.5).
@@ -471,11 +483,28 @@ class Agent:
         self.state.set_phase(phases.AWAITING_TOOLS)         # acting -> awaiting_tools
         self._tick()
         for call in subagent_calls:
+            # ``background`` / ``start_call_id`` are host/manager-owned routing
+            # keys: a model must not be able to smuggle them through its tool
+            # args and turn a foreground spawn into a manager-owned child.
+            args = {
+                key: value
+                for key, value in dict(call.get("args") or {}).items()
+                if key not in ("background", "start_call_id")
+            }
             await self._publish(ev.child("subagent.spawn.requested", {
-                **dict(call.get("args") or {}),
+                **args,
                 "call_id": call["call_id"],     # host-owned, never model-overridable
             }))
         for call in background_calls:
+            if call["call_id"] in forced_ids:
+                await self._publish(ev.child("background.start.requested", {
+                    "call_id": call["call_id"],
+                    "tool": call.get("name"),
+                    "args": call.get("args") or {},
+                    "forced": True,
+                    "reason": "subagents are background-only",
+                }))
+                continue
             if call["call_id"] in steering_ids:
                 # An ordinary tool routed by steering, not the reserved
                 # ``start`` wrapper.
@@ -1376,6 +1405,12 @@ class Agent:
             self.state.observe(ev)
         elif etype == "subagent.spawn.requested":
             self.state.observe(ev)
+            if ev.payload.get("background"):
+                # Manager-owned child: ``call_id`` is a task_id, never a model
+                # call.  The start call was already paired by
+                # ``background.started``; task terminals are reduced from
+                # ``background.*`` facts (T3 / force-background design §3.11).
+                return
             call_id = ev.payload.get("call_id")
             if call_id:
                 # Trust the WAL fact, not the *current* host configuration: a

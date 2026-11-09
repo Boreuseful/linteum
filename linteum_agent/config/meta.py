@@ -301,6 +301,15 @@ FIELD_META: dict[str, dict[str, Any]] = {
             "显式 start 仍需 agent.background.enabled。"
         ),
     },
+    # -- agent.subagents ------------------------------------------------
+    "agent.subagents.force_background": {
+        "title": "子代理强制后台",
+        "type": "bool",
+        "description": (
+            "开启后所有 spawn_subagent 调用直接作为后台任务启动，不阻塞当前 "
+            "Turn；要求 agent.subagents.tool_name 已写入 agent.background.allow。"
+        ),
+    },
     # -- agent.skills ---------------------------------------------------
     "agent.skills.enabled": {
         "title": "启用 Skills",
