@@ -221,10 +221,7 @@ class SessionGateway:
                 self._unsub = None
             raise
 
-        if state.mode is None:
-            seeded = await self._seed_initial_mode()
-            if seeded is not None:
-                state = replace(state, mode=seeded)
+        state = await self._seed_state_mode(state)
         self._state = state
         self._expected = (events[-1].seq + 1) if events else 1
         self._started = True
@@ -242,6 +239,9 @@ class SessionGateway:
         handle = lookup(self.session_id) if callable(lookup) else None
         if handle is not None and getattr(handle, "mode", None) is not None:
             return {
+                # Same shape as the `mode` frame and `snapshot_payload`: the
+                # web/TUI clients key their binding on the canonical id.
+                "id": f"{handle.mode.source_id}/{handle.mode.name}",
                 "name": handle.mode.name,
                 "source": handle.mode.source_id,
                 "digest": handle.mode.digest,
@@ -258,13 +258,28 @@ class SessionGateway:
         name = metadata.get("mode")
         if not name:
             return None
+        source = metadata.get("mode_source")
         return {
+            "id": f"{source}/{name}" if source else name,
             "name": name,
-            "source": metadata.get("mode_source"),
+            "source": source,
             "digest": metadata.get("mode_digest"),
             "from": None,
             "refresh": False,
         }
+
+    async def _seed_state_mode(self, state: ProjectorState) -> ProjectorState:
+        """Fill the initial mode when the WAL has no ``system.mode.changed``.
+
+        Replay rebuilds history from scratch, so a session that never switched
+        modes would otherwise report ``mode: null`` in its snapshot even though
+        the host bound one at activation. Live state and every replay-derived
+        snapshot (subscribe, history) share this seed.
+        """
+        if state.mode is not None:
+            return state
+        seeded = await self._seed_initial_mode()
+        return replace(state, mode=seeded) if seeded is not None else state
 
     async def close(self) -> None:
         if self._closed:
@@ -952,6 +967,7 @@ class SessionGateway:
         connection.resume_session(self.session_id)  # an explicit subscribe lifts a gap pause
         try:
             entries, state = await self._replay_entries(after_seq)
+            state = await self._seed_state_mode(state)
             await connection.send_replay_frame(Frame.create(
                 "snapshot",
                 snapshot_payload(state),
@@ -1090,6 +1106,7 @@ class SessionGateway:
             next_seq = event.seq
             included += 1
 
+        state = await self._seed_state_mode(state)
         payload = {
             "after_seq": after_seq,
             "next_seq": next_seq,
