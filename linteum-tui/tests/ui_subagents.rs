@@ -122,6 +122,30 @@ fn context_renders_messages_and_replay_note() {
 }
 
 #[test]
+fn context_shows_paging_and_truncation_notes() {
+    let mut state = TuiState::default();
+    state.subagents.apply_context_result(&json!({
+        "session_id": "child-1",
+        "kind": "subagent",
+        "source": "live",
+        "system_blocks_included": true,
+        "messages_total": 5,
+        "offset": 0,
+        "next_offset": 2,
+        "has_more": true,
+        "truncated": true,
+        "messages": [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+        ],
+    }));
+    let rendered = joined(&subagent_context_lines(&state, &Theme::dark()));
+    assert!(rendered.contains("messages 2 / 5"));
+    assert!(rendered.contains("loading more"));
+    assert!(rendered.contains("truncated to fit"));
+}
+
+#[test]
 fn context_scroll_stops_at_the_last_screenful_and_hides_the_page() {
     let mut state = TuiState::default();
     let messages: Vec<_> = (0..40)

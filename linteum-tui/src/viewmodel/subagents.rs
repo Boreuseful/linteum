@@ -5,11 +5,12 @@
 //! into the parent transcript (context isolation); the TUI fetches them on
 //! demand with the read-only `session.context` command.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::protocol::{ErrorInfo, Frame};
 
 use super::state::UsageView;
+use super::{CommandSpec, Effect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SubagentStatus {
@@ -111,6 +112,14 @@ pub struct SubagentContextView {
     pub estimated_tokens: u64,
     pub tools: Vec<String>,
     pub messages: Vec<ContextMessage>,
+    /// Total provider messages in the full plan (not just the loaded pages).
+    pub messages_total: u64,
+    /// Offset this page started at.
+    pub offset: u64,
+    /// Offset the next page must start at.
+    pub next_offset: u64,
+    pub has_more: bool,
+    pub truncated: bool,
 }
 
 impl SubagentContextView {
@@ -119,7 +128,29 @@ impl SubagentContextView {
             .get("session_id")
             .and_then(Value::as_str)
             .ok_or_else(|| "context response is missing session_id".to_owned())?;
-        let mut view = Self {
+        let mut messages = Vec::new();
+        for message in value
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            messages.push(ContextMessage {
+                role: string_field(message, "role").unwrap_or_else(|| "unknown".to_owned()),
+                text: message_text(message),
+            });
+        }
+        // Older gateways return the whole plan and omit the paging fields.
+        let messages_total = value
+            .get("messages_total")
+            .and_then(Value::as_u64)
+            .unwrap_or(messages.len() as u64);
+        let offset = value.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let next_offset = value
+            .get("next_offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(messages_total);
+        Ok(Self {
             session_id: session_id.to_owned(),
             kind: string_field(value, "kind").unwrap_or_else(|| "unknown".to_owned()),
             phase: string_field(value, "phase"),
@@ -135,20 +166,19 @@ impl SubagentContextView {
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
             tools: string_list(value.get("tools")),
-            messages: Vec::new(),
-        };
-        for message in value
-            .get("messages")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            view.messages.push(ContextMessage {
-                role: string_field(message, "role").unwrap_or_else(|| "unknown".to_owned()),
-                text: message_text(message),
-            });
-        }
-        Ok(view)
+            messages,
+            messages_total,
+            offset,
+            next_offset,
+            has_more: value
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            truncated: value
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
     }
 }
 
@@ -159,6 +189,8 @@ pub struct SubagentsState {
     pub detail: Option<SubagentContextView>,
     /// Child session id whose `session.context` request is in flight.
     pub loading: Option<String>,
+    /// Offset expected from the next page; stale replies fail this check.
+    pub expected_offset: u64,
     pub error: Option<String>,
     pub scroll: usize,
 }
@@ -338,16 +370,74 @@ impl SubagentsState {
         }
     }
 
-    pub fn apply_context_result(&mut self, value: &Value) {
-        self.loading = None;
-        match SubagentContextView::from_value(value) {
-            Ok(view) => {
-                self.detail = Some(view);
-                self.error = None;
-                self.scroll = 0;
+    /// Apply one `session.context` page.
+    ///
+    /// The first page replaces the detail; continuation pages append.  Returns
+    /// the follow-up command when the gateway reports `has_more`, so the whole
+    /// provider plan is fetched without a user gesture (the pre-paging client
+    /// expected every message in one response).
+    pub fn apply_context_result(&mut self, value: &Value) -> Option<Effect> {
+        let view = match SubagentContextView::from_value(value) {
+            Ok(view) => view,
+            Err(error) => {
+                self.loading = None;
+                self.error = Some(error);
+                return None;
             }
-            Err(error) => self.error = Some(error),
+        };
+        if let Some(expected_child) = self.loading.as_deref()
+            && expected_child != view.session_id
+        {
+            return None;
         }
+        if view.offset != self.expected_offset {
+            return None; // a reload superseded this page
+        }
+        if self.loading.is_none() && view.offset > 0 {
+            return None; // no continuation is in flight
+        }
+
+        let append = view.offset > 0
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.session_id == view.session_id);
+        let mut view = view;
+        if append {
+            if let Some(existing) = self.detail.take() {
+                view.messages.splice(0..0, existing.messages);
+                view.truncated |= existing.truncated;
+            }
+            self.detail = Some(view);
+        } else {
+            self.detail = Some(view);
+            self.scroll = 0;
+        }
+        self.error = None;
+
+        let (session_id, has_more, offset, next_offset) = {
+            let detail = self.detail.as_ref().expect("detail assigned above");
+            (
+                detail.session_id.clone(),
+                detail.has_more,
+                detail.offset,
+                detail.next_offset,
+            )
+        };
+        if has_more && next_offset > offset {
+            self.loading = Some(session_id.clone());
+            self.expected_offset = next_offset;
+            let mut args = Map::new();
+            args.insert("offset".into(), Value::from(next_offset));
+            return Some(Effect::SendCommand(CommandSpec {
+                name: "session.context".to_owned(),
+                args,
+                session_id: Some(session_id),
+            }));
+        }
+        self.loading = None;
+        self.expected_offset = next_offset;
+        None
     }
 }
 

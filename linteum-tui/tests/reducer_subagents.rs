@@ -154,6 +154,127 @@ fn open_selected_subagent_requests_child_context() {
 }
 
 #[test]
+fn context_pages_are_requested_and_appended() {
+    let mut state = TuiState::default();
+    state.subagents.loading = Some("child-1".into());
+
+    let first = CommandResult {
+        v: 1,
+        id: "r1".into(),
+        reply_to: "c1".into(),
+        ok: true,
+        result: json!({
+            "context": {
+                "session_id": "child-1",
+                "kind": "subagent",
+                "phase": "acting",
+                "round": 2,
+                "source": "live",
+                "system_blocks_included": true,
+                "digest": "abc123",
+                "estimated_tokens": 42,
+                "tools": [],
+                "messages_total": 2,
+                "offset": 0,
+                "next_offset": 1,
+                "has_more": true,
+                "truncated": false,
+                "messages": [{"role": "user", "content": "one"}],
+            },
+        }),
+        error: None,
+        name: Some("session.context".into()),
+    };
+    let effects = reduce(&mut state, Input::CommandResult(first));
+    assert_eq!(state.subagents.detail.as_ref().unwrap().messages.len(), 1);
+    assert_eq!(state.subagents.loading.as_deref(), Some("child-1"));
+    assert_eq!(state.subagents.expected_offset, 1);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendCommand(command)
+            if command.name == "session.context"
+                && command.session_id.as_deref() == Some("child-1")
+                && command.args.get("offset").and_then(serde_json::Value::as_u64) == Some(1)
+    )));
+
+    let second = CommandResult {
+        v: 1,
+        id: "r2".into(),
+        reply_to: "c2".into(),
+        ok: true,
+        result: json!({
+            "context": {
+                "session_id": "child-1",
+                "kind": "subagent",
+                "phase": "acting",
+                "round": 2,
+                "source": "live",
+                "system_blocks_included": true,
+                "digest": "abc123",
+                "estimated_tokens": 42,
+                "tools": [],
+                "messages_total": 2,
+                "offset": 1,
+                "next_offset": 2,
+                "has_more": false,
+                "truncated": false,
+                "messages": [{"role": "assistant", "content": "two"}],
+            },
+        }),
+        error: None,
+        name: Some("session.context".into()),
+    };
+    let effects = reduce(&mut state, Input::CommandResult(second));
+    let detail = state.subagents.detail.as_ref().expect("context detail");
+    assert_eq!(detail.messages.len(), 2);
+    assert_eq!(detail.messages[1].role, "assistant");
+    assert_eq!(detail.messages_total, 2);
+    assert!(!detail.has_more);
+    assert!(state.subagents.loading.is_none());
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        Effect::SendCommand(command) if command.name == "session.context"
+    )));
+}
+
+#[test]
+fn stale_context_page_is_ignored() {
+    let mut state = TuiState::default();
+    state.subagents.loading = Some("child-1".into());
+    state.subagents.expected_offset = 7;
+
+    let stale = CommandResult {
+        v: 1,
+        id: "r1".into(),
+        reply_to: "c1".into(),
+        ok: true,
+        result: json!({
+            "context": {
+                "session_id": "child-1",
+                "kind": "subagent",
+                "source": "live",
+                "messages_total": 9,
+                "offset": 3,
+                "next_offset": 4,
+                "has_more": true,
+                "messages": [{"role": "user", "content": "stale"}],
+            },
+        }),
+        error: None,
+        name: Some("session.context".into()),
+    };
+    let effects = reduce(&mut state, Input::CommandResult(stale));
+
+    assert!(state.subagents.detail.is_none());
+    assert_eq!(state.subagents.expected_offset, 7);
+    assert!(state.subagents.loading.is_some());
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        Effect::SendCommand(command) if command.name == "session.context"
+    )));
+}
+
+#[test]
 fn context_result_populates_messages_and_digest() {
     let mut state = TuiState::default();
     state.subagents.loading = Some("child-1".into());

@@ -71,7 +71,9 @@ pub fn subagent_list_lines(state: &TuiState, theme: &Theme) -> Vec<Line<'static>
 
 pub fn subagent_context_lines(state: &TuiState, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    if let Some(child) = &state.subagents.loading {
+    if let Some(child) = &state.subagents.loading
+        && state.subagents.detail.is_none()
+    {
         lines.push(Line::from(Span::styled(
             format!("Loading context for {}…", short(child)),
             theme.muted,
@@ -121,6 +123,22 @@ pub fn subagent_context_lines(state: &TuiState, theme: &Theme) -> Vec<Line<'stat
             "system blocks are not persisted for completed children",
             theme.warning,
         )));
+    }
+    let loaded = context.messages.len() as u64;
+    if context.has_more || loaded != context.messages_total {
+        lines.push(Line::from(Span::styled(
+            format!("messages {loaded} / {}", context.messages_total),
+            theme.muted,
+        )));
+    }
+    if context.truncated {
+        lines.push(Line::from(Span::styled(
+            "some messages were truncated to fit the gateway frame",
+            theme.warning,
+        )));
+    }
+    if context.has_more {
+        lines.push(Line::from(Span::styled("loading more…", theme.muted)));
     }
     lines.push(Line::from(""));
     if context.messages.is_empty() {

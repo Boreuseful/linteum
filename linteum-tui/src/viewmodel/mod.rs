@@ -515,6 +515,7 @@ fn open_selected_subagent(state: &mut TuiState) -> Vec<Effect> {
         })];
     };
     state.subagents.loading = Some(child_id.clone());
+    state.subagents.expected_offset = 0;
     state.subagents.detail = None;
     state.subagents.error = None;
     state.subagents.scroll = 0;
@@ -680,7 +681,7 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
             mode_effects.extend(modes::apply_set_result(state, &result.result));
         }
         if let Some(context) = result.result.get("context") {
-            state.subagents.apply_context_result(context);
+            effects.extend(state.subagents.apply_context_result(context));
         }
         if result.result.get("subscribed").and_then(Value::as_bool) == Some(true) {
             state.connection = ConnectionState::Live;
@@ -720,6 +721,7 @@ fn reduce_command_result(state: &mut TuiState, result: &CommandResult) -> Vec<Ef
         }
         if state.subagents.loading.take().is_some() {
             state.subagents.error = Some(format!("{}: {}", error.code, error.message));
+            state.subagents.expected_offset = 0;
         }
         if state.plugins.managing || state.plugins.applying {
             plugin_effects.extend(plugins::apply_manage_error(state, error));
