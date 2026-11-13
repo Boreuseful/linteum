@@ -38,6 +38,9 @@ from .errors import (
 #: Major protocol version.  ``hello`` negotiates it; there is no minor version.
 PROTOCOL_VERSION = 1
 
+#: Upper bound for one ``session.context`` message page.
+MAX_CONTEXT_PAGE = 500
+
 #: Feature flags advertised by ``hello``.
 FEATURES: tuple = (
     "view",
@@ -303,6 +306,11 @@ def validate_command(cmd: "Command") -> None:
     if cmd.name == "session.context":
         if command_session_id(cmd) is None:
             raise _bad("session.context requires session_id")
+        include_messages = args.get("include_messages")
+        if include_messages is not None and not isinstance(include_messages, bool):
+            raise _bad("session.context.include_messages must be a boolean")
+        _integer(args, "offset", minimum=0)
+        _integer(args, "limit", minimum=1, maximum=MAX_CONTEXT_PAGE)
         return
 
     if cmd.name == "session.tasks":
