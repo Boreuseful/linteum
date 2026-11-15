@@ -42,12 +42,12 @@ from ..runtime.plugins.errors import PluginError, PluginManifestError, PluginNot
 from .config_scope import LIVE, runtime_scope
 from .errors import (
     E_CONFIG_COMPOSITE_UNSUPPORTED,
+    E_CONFIG_IO,
     E_CONFIG_LOCAL_ONLY,
     E_CONFIG_MANAGE_DISABLED,
     E_CONFIG_PROFILE_EXISTS,
     E_CONFIG_PROFILE_INCOMPLETE,
     E_CONFIG_PROFILE_IN_USE,
-    E_CONFIG_PROFILE_NAME,
     E_CONFIG_PROFILE_NOT_FOUND,
     E_CONFIG_PROFILE_RESERVED,
     E_CONFIG_RANGE,
