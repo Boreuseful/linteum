@@ -187,28 +187,38 @@ class ConfigStore:
             return ""
         return hashlib.sha256(data).hexdigest()
 
-    def load_raw(self) -> dict:
-        """Return the raw YAML mapping (``{}`` when the file is missing/empty)."""
+    def load_raw_with_revision(self) -> tuple[dict, str]:
+        """Read the file bytes once; return (parsed YAML, sha256 of those bytes)."""
         try:
-            text = self.path.read_text(encoding="utf-8")
+            data = self.path.read_bytes()
+        except FileNotFoundError:
+            return {}, ""
         except OSError as exc:
-            if isinstance(exc, FileNotFoundError):
-                return {}
             raise ConfigError(f"cannot read config file {self.path}: {exc}",
                               key="", code="E_CONFIG_IO") from exc
-        if not text.strip():
-            return {}
+        revision = hashlib.sha256(data).hexdigest()
+        if not data.strip():
+            return {}, revision
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ConfigError(f"invalid UTF-8 in {self.path}: {exc}",
+                              key="", code="E_CONFIG_PARSE") from exc
         try:
             raw = yaml.safe_load(text)
         except yaml.YAMLError as exc:
             raise ConfigError(f"invalid YAML in {self.path}: {exc}",
                               key="", code="E_CONFIG_PARSE") from exc
         if raw is None:
-            return {}
+            return {}, revision
         if not isinstance(raw, Mapping):
             raise ConfigError(f"config root in {self.path} must be a mapping",
                               key="", code="E_CONFIG_PARSE")
-        return dict(raw)
+        return dict(raw), revision
+
+    def load_raw(self) -> dict:
+        """Return the raw YAML mapping (``{}`` when the file is missing/empty)."""
+        return self.load_raw_with_revision()[0]
 
     def load(self, *, create: bool = False) -> AppConfig:
         """Load and validate the config.

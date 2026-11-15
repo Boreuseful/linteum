@@ -18,17 +18,40 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import itertools
+import json
 import time
 import uuid
-from typing import Optional
+from dataclasses import fields
+from typing import Any, Mapping, Optional
 
+from ..config.meta import (
+    MAX_LIST_ITEMS,
+    FieldSpec,
+    field_specs,
+    get_spec,
+    is_writable_spec,
+)
 from ..config.options import SessionOptions
-from ..config.schema import AppConfig, ConfigError, GatewaySettings
-from ..config.service import ConfigService, EffectiveConfig
+from ..config.schema import AppConfig, ConfigError, GatewaySettings, LLMConfig, app_to_dict
+from ..config.service import ConfigService, EffectiveConfig, env_var_for
 from ..runtime.host import AgentHost, SessionLocked, SessionNotFound
 from ..runtime.plugins.errors import PluginError, PluginManifestError, PluginNotFound
+from .config_scope import runtime_scope
 from .errors import (
+    E_CONFIG_COMPOSITE_UNSUPPORTED,
+    E_CONFIG_LOCAL_ONLY,
+    E_CONFIG_MANAGE_DISABLED,
+    E_CONFIG_PROFILE_EXISTS,
+    E_CONFIG_PROFILE_INCOMPLETE,
+    E_CONFIG_PROFILE_IN_USE,
+    E_CONFIG_PROFILE_NAME,
+    E_CONFIG_PROFILE_NOT_FOUND,
+    E_CONFIG_PROFILE_RESERVED,
+    E_CONFIG_RANGE,
+    E_CONFIG_READONLY,
+    E_CONFIG_UNAVAILABLE,
     E_INTERNAL,
     E_PAYLOAD_TOO_LARGE,
     E_PLUGIN_CONFIG,
@@ -77,6 +100,41 @@ REPLAY_POLL_SECONDS = 0.001
 REPLAY_DRAIN_TIMEOUT = 30.0
 
 logger = get_logger("server")
+
+#: Fixed client-facing messages for config failures.  ``ConfigError`` messages
+#: can embed the offending value (e.g. an API key pasted into an enum field) or
+#: YAML source, so the original exception is never forwarded as ``detail``.
+_CONFIG_SAFE_MESSAGES = {
+    "E_CONFIG_UNKNOWN": "unknown configuration key",
+    "E_CONFIG_TYPE": "invalid configuration value",
+    "E_CONFIG_RANGE": "configuration value is out of range",
+    "E_CONFIG_ENUM": "configuration value is not allowed",
+    "E_CONFIG_JSON": "configuration value must be valid JSON",
+    "E_CONFIG_KEY_OVERLAP": "configuration keys overlap",
+    "E_CONFIG_COMPOSITE_UNSUPPORTED": "composite configuration keys are not editable",
+    "E_CONFIG_CONFLICT": "configuration changed since it was read",
+    "E_CONFIG_PARSE": "configuration file is not valid YAML",
+    "E_CONFIG_IO": "configuration file is not readable",
+    "E_CONFIG_PROVIDER_CONFLICT": "provider settings conflict with another profile",
+    "E_CONFIG_PROVIDER_PARAMS": "provider request defaults differ between profiles",
+    "E_CONFIG_PROFILE_NOT_FOUND": "configured profile does not exist",
+    "E_CONFIG_FORCE_BACKGROUND_ALLOW": "force_background requires agent.background.allow",
+    "E_CONFIG_PROFILE_IN_USE": "profile is still referenced",
+    "E_CONFIG_PROFILE_EXISTS": "profile already exists",
+    "E_CONFIG_PROFILE_INCOMPLETE": "profile is missing required fields",
+    "E_CONFIG_PROFILE_RESERVED": "profile name is reserved",
+    "E_CONFIG_PROFILE_NAME": "invalid profile name",
+}
+
+#: Profile names that must never be created (they collide with the secret
+#: masking of ``agent.profiles`` leaves or with ``agent.llm`` itself).
+_RESERVED_PROFILE_NAMES = frozenset({"api_key", "password", "secret", "token"})
+
+#: Upper bound for one scalar-list write (web-config Phase 3 §6.3.3).
+CONFIG_MAX_LIST_ITEMS = MAX_LIST_ITEMS
+
+#: Editable leaves of a named LLM profile (``LLMConfig`` fields).
+_LLM_FIELDS = frozenset(f.name for f in fields(LLMConfig))
 
 
 class ClientConnection:
@@ -437,6 +495,9 @@ class GatewayServer:
         self._instance_id = instance_id or uuid.uuid4().hex
         # §11.5.4: capture at startup (apply_scope=restart), never per command.
         self._manage_enabled = self._initial_manage_enabled()
+        # web-config §6.1: same startup-capture model for configuration writes.
+        self._config_manage_enabled = self._initial_config_manage_enabled()
+        self._config_lock = asyncio.Lock()
 
         self._gateways: dict[str, SessionGateway] = {}
         self._gateway_locks: dict[str, asyncio.Lock] = {}
@@ -464,6 +525,15 @@ class GatewayServer:
             return bool(self._fixed_settings.plugins.manage)
         try:
             return bool(self._current_config().gateway.plugins.manage)
+        except Exception:  # noqa: BLE001 - an invalid config is already fatal elsewhere
+            return False
+
+    def _initial_config_manage_enabled(self) -> bool:
+        """``gateway.config.manage`` as seen when this server started."""
+        if self._fixed_settings is not None:
+            return bool(self._fixed_settings.config.manage)
+        try:
+            return bool(self._current_config().gateway.config.manage)
         except Exception:  # noqa: BLE001 - an invalid config is already fatal elsewhere
             return False
 
@@ -624,6 +694,24 @@ class GatewayServer:
         if command.name == "plugin.reload":
             self._require_plugin_runtime(connection)
             return await self._plugin_reload(command)
+        if command.name == "config.get":
+            return await self._config_get(connection, command)
+        if command.name == "config.set":
+            return await self._config_set(connection, command)
+        if command.name == "config.unset":
+            return await self._config_unset(connection, command)
+        if command.name == "config.profile.set":
+            return await self._config_profile_set(connection, command)
+        if command.name == "config.profile.delete":
+            return await self._config_profile_delete(connection, command)
+        if command.name == "config.profile.duplicate":
+            return await self._config_profile_duplicate(connection, command)
+        if command.name == "config.fallback.set":
+            return await self._config_fallback_set(connection, command)
+        if command.name == "config.fallback.delete":
+            return await self._config_fallback_delete(connection, command)
+        if command.name == "config.fallback.move":
+            return await self._config_fallback_move(connection, command)
         if command.name == "session.list":
             return await self._session_list(command)
         if command.name == "session.children":
@@ -995,6 +1083,714 @@ class GatewayServer:
             "restart_required": restart_required,
             "warnings": [],
         }
+
+    # -- config management (web-config §6) ---------------------------------
+    def _require_config_read(self, connection: ClientConnection) -> ConfigService:
+        """``config.get`` is local-or-managed; secrets stay masked either way."""
+        if not self._config_manage_enabled and not getattr(
+            connection.transport, "is_local", True
+        ):
+            raise GatewayError(
+                E_CONFIG_MANAGE_DISABLED,
+                "configuration is not readable from a remote connection",
+                location=LOCATION_SERVER,
+                context={
+                    "hint": "enable gateway.config.manage and restart the gateway",
+                },
+            )
+        return self._config_service_or_error()
+
+    def _require_config_write(self, connection: ClientConnection) -> ConfigService:
+        """Writes need ``gateway.config.manage`` **and** a local transport."""
+        if not self._config_manage_enabled:
+            raise GatewayError(
+                E_CONFIG_MANAGE_DISABLED,
+                "configuration management is disabled",
+                location=LOCATION_SERVER,
+                context={
+                    "hint": "enable gateway.config.manage and restart the gateway",
+                },
+            )
+        if not getattr(connection.transport, "is_local", True):
+            raise GatewayError(
+                E_CONFIG_LOCAL_ONLY,
+                "configuration writes require a local connection",
+                location=LOCATION_SERVER,
+                context={
+                    "hint": "only embedded, stdio or loopback clients may write",
+                },
+            )
+        return self._config_service_or_error()
+
+    def _config_service_or_error(self) -> ConfigService:
+        service = self.config_service
+        if service is None:
+            raise GatewayError(
+                E_CONFIG_UNAVAILABLE,
+                "configuration service is not available",
+                location=LOCATION_SERVER,
+            )
+        return service
+
+    @staticmethod
+    def _config_gateway_error(
+        exc: ConfigError, service: ConfigService,
+    ) -> GatewayError:
+        """Map a config failure without echoing values or YAML source."""
+        context: dict = {"config_code": exc.code}
+        if exc.key:
+            context["key"] = exc.key
+        if exc.hint:
+            context["hint"] = exc.hint
+        if exc.code == "E_CONFIG_CONFLICT":
+            context["current_revision"] = service.revision()
+        if exc.code in ("E_CONFIG_PARSE", "E_CONFIG_IO"):
+            context["path"] = service.path()
+        return GatewayError(
+            exc.code,
+            _CONFIG_SAFE_MESSAGES.get(exc.code, "configuration error"),
+            location=LOCATION_SERVER,
+            context=context,
+        )
+
+    @staticmethod
+    def _config_specs(effective: EffectiveConfig,
+                      sections: Optional[list[str]]) -> list[FieldSpec]:
+        specs = field_specs(effective.config)
+        if not sections:
+            return specs
+        wanted = set(sections)
+        return [
+            spec for spec in specs
+            if spec.section in wanted
+            or any(spec.key == value or spec.key.startswith(value + ".")
+                   for value in wanted)
+        ]
+
+    async def _config_get(self, connection: ClientConnection,
+                          command: Command) -> dict:
+        self._require_config_read(connection)
+        service = self._config_service_or_error()
+        sections = command.args.get("sections")
+        include_schema = command.args.get("include_schema")
+        if include_schema is None:
+            include_schema = True
+        include_fields = command.args.get("include_fields")
+        if include_fields is None:
+            include_fields = True
+
+        def _read() -> dict:
+            effective = service.effective(strict=False)
+            specs = self._config_specs(effective, sections)
+            values = effective.values() if include_fields else {}
+            schema = service.schema() if include_schema else None
+            if schema is not None and sections:
+                wanted = set(sections)
+                schema["sections"] = [
+                    section for section in schema["sections"]
+                    if section["key"] in wanted
+                    or any(section["key"].startswith(value + ".")
+                           for value in wanted)
+                ]
+            fields: dict = {}
+            if include_fields:
+                for spec in specs:
+                    value = dict(values[spec.key])
+                    if value.get("source") == "env":
+                        value["env_var"] = env_var_for(spec.key, service.prefix)
+                    fields[spec.key] = value
+            return {
+                "revision": effective.revision,
+                "path": service.path(),
+                "exists": service.exists(),
+                "manage": self._config_manage_enabled,
+                "writable": (
+                    self._config_manage_enabled
+                    and getattr(connection.transport, "is_local", True)
+                ),
+                "schema": schema,
+                "fields": fields,
+                "runtime_scopes": (
+                    {spec.key: runtime_scope(spec.key) for spec in specs}
+                    if include_fields else {}
+                ),
+                "issues": [issue.to_dict() for issue in effective.issues],
+            }
+
+        try:
+            return await asyncio.to_thread(_read)
+        except ConfigError as exc:
+            raise self._config_gateway_error(exc, service) from exc
+
+    @staticmethod
+    def _config_check_list_limits(changes: Mapping[str, Any]) -> None:
+        """Reject oversized scalar-list writes before touching the file."""
+        for key, value in changes.items():
+            spec = get_spec(key)
+            if spec.type != "list":
+                continue
+            items = value
+            if isinstance(value, str):
+                try:
+                    items = json.loads(value)
+                except (TypeError, ValueError):
+                    continue  # coerce_value will produce E_CONFIG_JSON
+            if (isinstance(items, (list, tuple))
+                    and len(items) > CONFIG_MAX_LIST_ITEMS):
+                raise GatewayError(
+                    E_CONFIG_RANGE,
+                    "configuration list is too long",
+                    location=LOCATION_SERVER,
+                    context={"key": key, "maximum": CONFIG_MAX_LIST_ITEMS},
+                )
+
+    def _config_prepare(self, service: ConfigService,
+                        keys) -> None:
+        """Reject env-owned and composite keys before touching the file."""
+        effective = service.effective(strict=False)
+        for key in keys:
+            if effective.source(key) == "env":
+                raise GatewayError(
+                    E_CONFIG_READONLY,
+                    f"{key} is overridden by the environment",
+                    location=LOCATION_SERVER,
+                    context={
+                        "key": key,
+                        "env_var": env_var_for(key, service.prefix),
+                        "hint": "unset the environment variable and restart",
+                    },
+                )
+            spec = get_spec(key)
+            if key == "agent.plugins.allow":
+                raise GatewayError(
+                    E_CONFIG_COMPOSITE_UNSUPPORTED,
+                    "agent.plugins.allow is managed by the plugin runtime",
+                    location=LOCATION_SERVER,
+                    context={
+                        "key": key,
+                        "hint": "use plugin.set_allowed from the Plugins page",
+                    },
+                )
+            if not is_writable_spec(spec):
+                raise GatewayError(
+                    E_CONFIG_COMPOSITE_UNSUPPORTED,
+                    "composite configuration keys are not editable",
+                    location=LOCATION_SERVER,
+                    context={
+                        "key": key,
+                        "hint": (
+                            "edit this key in YAML or use a structured command"
+                        ),
+                    },
+                )
+
+    @staticmethod
+    def _config_result(change_set, service: ConfigService) -> dict:
+        apply_result = service.apply(change_set)
+        return {
+            "revision": change_set.revision,
+            "changed": bool(change_set.changes),
+            "changes": [change.to_dict() for change in change_set.changes],
+            "apply": {
+                "declared": {
+                    "live": list(apply_result.applied_live),
+                    "new_session": list(apply_result.requires_new_session),
+                    "restart": list(apply_result.requires_restart),
+                },
+                "runtime": {
+                    change.key: runtime_scope(change.key)
+                    for change in change_set.changes
+                },
+            },
+            "warnings": [issue.to_dict() for issue in apply_result.warnings],
+        }
+
+    @staticmethod
+    def _config_expected_revision(service: ConfigService,
+                                  expected: Optional[str]) -> None:
+        if expected == "" and service.exists() and service.revision() == "":
+            raise GatewayError(
+                E_CONFIG_IO,
+                "configuration file is not readable",
+                location=LOCATION_SERVER,
+                context={"path": service.path()},
+            )
+
+    async def _config_set(self, connection: ClientConnection,
+                          command: Command) -> dict:
+        service = self._require_config_write(connection)
+        persist = bool(command.args.get("persist", True))
+        expected = command.args.get("expected_revision")
+        changes = dict(command.args["changes"])
+
+        def _apply() -> dict:
+            self._config_expected_revision(service, expected)
+            self._config_check_list_limits(changes)
+            self._config_prepare(service, changes)
+            change_set = service.update(
+                changes, expected_revision=expected, persist=persist,
+            )
+            return self._config_result(change_set, service)
+
+        try:
+            async with self._config_lock:
+                result = await asyncio.to_thread(_apply)
+        except ConfigError as exc:
+            raise self._config_gateway_error(exc, service) from exc
+        self._config_audit(connection, result, persist)
+        return result
+
+    async def _config_unset(self, connection: ClientConnection,
+                            command: Command) -> dict:
+        service = self._require_config_write(connection)
+        expected = command.args["expected_revision"]
+        keys = list(command.args["keys"])
+
+        def _apply() -> dict:
+            self._config_expected_revision(service, expected)
+            self._config_prepare(service, keys)
+            change_set = service.unset_many(
+                keys, expected_revision=expected, persist=True,
+            )
+            return self._config_result(change_set, service)
+
+        try:
+            async with self._config_lock:
+                result = await asyncio.to_thread(_apply)
+        except ConfigError as exc:
+            raise self._config_gateway_error(exc, service) from exc
+        self._config_audit(connection, result, True)
+        return result
+
+    def _config_audit(self, connection: ClientConnection, result: dict,
+                      persist: bool, *,
+                      action: Optional[str] = None,
+                      target: Optional[str] = None,
+                      extra: Optional[Mapping[str, Any]] = None) -> None:
+        if not persist or not result.get("changed"):
+            return
+        record = {
+            "kind": "config",
+            "level": "info",
+            "msg": f"config update ({len(result['changes'])} key(s))",
+            "ts": time.time(),
+            "revision": result["revision"],
+            "changed": True,
+            "keys": [change["key"] for change in result["changes"]],
+            "client_id": connection.id,
+            "transport": type(connection.transport).__name__,
+        }
+        if action:
+            record["action"] = action
+        if target is not None:
+            record["target"] = target
+        if extra:
+            record.update(extra)
+        self.host._log(record)
+
+    # -- named LLM profiles and fallbacks (web-llm-profiles §5.3–§5.6) -----
+    @staticmethod
+    def _config_file_config(service: ConfigService) -> AppConfig:
+        """The validated file-level config (defaults when the file is missing)."""
+        return service.store.load(create=False)
+
+    @staticmethod
+    def _config_effective(service: ConfigService) -> EffectiveConfig:
+        """The merged runtime view, with warnings instead of raised errors."""
+        return service.effective(strict=False)
+
+    @staticmethod
+    def _config_composite_readonly(service: ConfigService, key: str) -> None:
+        """Raise ``E_CONFIG_READONLY`` when a composite key comes from the env."""
+        if service.effective(strict=False).source(key) == "env":
+            raise GatewayError(
+                E_CONFIG_READONLY,
+                f"{key} is overridden by the environment",
+                location=LOCATION_SERVER,
+                context={
+                    "key": key,
+                    "env_var": env_var_for(key, service.prefix),
+                    "hint": "unset the environment variable and restart",
+                },
+            )
+
+    @staticmethod
+    def _merge_llm_values(
+        existing: Mapping[str, Any],
+        values: Mapping[str, Any],
+        *,
+        creating: bool,
+    ) -> dict:
+        """Merge a partial LLM values dict over the raw file values (§5.3).
+
+        Omitting a field keeps the stored value (or ``None`` for a new
+        profile); a literal ``null`` clears it.  A new profile must set
+        ``provider`` and ``model``.
+        """
+        unknown = sorted(set(values) - _LLM_FIELDS)
+        if unknown:
+            raise GatewayError(
+                "E_CONFIG_UNKNOWN",
+                "unknown configuration value",
+                location=LOCATION_SERVER,
+                context={"hint": "values must be LLM profile fields"},
+            )
+        merged = dict(existing)
+        merged.update(dict(values))
+        if creating and (not merged.get("provider") or not merged.get("model")):
+            raise GatewayError(
+                E_CONFIG_PROFILE_INCOMPLETE,
+                "profile is missing required fields",
+                location=LOCATION_SERVER,
+                context={"hint": "provider and model are required for a new profile"},
+            )
+        return merged
+
+    @staticmethod
+    def _config_fallback_bounds(length: int, index: int) -> None:
+        """Reject a fallback index outside ``[0, len)`` without mutating (§5.6)."""
+        if 0 <= index < length:
+            return
+        raise GatewayError(
+            E_CONFIG_RANGE,
+            "fallback index is out of range",
+            location=LOCATION_SERVER,
+            context={
+                "key": "agent.fallbacks",
+                "index": index,
+                "count": length,
+            },
+        )
+
+    @staticmethod
+    def _config_reserved_profile_name(name: str, *, creating: bool) -> None:
+        """Reject secret-like names; ``default`` may not name a *new* profile."""
+        if name in _RESERVED_PROFILE_NAMES:
+            raise GatewayError(
+                E_CONFIG_PROFILE_RESERVED,
+                "profile name is reserved",
+                location=LOCATION_SERVER,
+                context={
+                    "name": name,
+                    "hint": "choose a different profile name",
+                },
+            )
+        if creating and name == "default":
+            raise GatewayError(
+                E_CONFIG_PROFILE_RESERVED,
+                "profile name 'default' is reserved for agent.llm",
+                location=LOCATION_SERVER,
+                context={
+                    "name": name,
+                    "hint": "edit agent.llm through config.profile.set {name: default}",
+                },
+            )
+
+    async def _sessions_using_profile(self, name: str) -> list[str]:
+        """Best-effort session catalogue scan for ``metadata.profile`` (§5.4)."""
+        matching: list[str] = []
+        offset = 0
+        limit = 200
+        cap = 10_000
+        while len(matching) < cap:
+            infos = await self.host.list_sessions(
+                limit=limit, offset=offset, include_subagents=True,
+            )
+            if not infos:
+                break
+            for info in infos:
+                if str(info.metadata.get("profile") or "") == name:
+                    matching.append(info.session_id)
+                if len(matching) >= cap:
+                    break
+            if len(infos) < limit:
+                break
+            offset += len(infos)
+        return matching
+
+    async def _config_profile_set(self, connection: ClientConnection,
+                                  command: Command) -> dict:
+        """Create/edit a named LLM profile; ``default`` edits ``agent.llm`` (§5.3)."""
+        service = self._require_config_write(connection)
+        name = str(command.args["name"])
+        values = dict(command.args["values"])
+        expected = command.args.get("expected_revision")
+
+        def _apply() -> dict:
+            self._config_expected_revision(service, expected)
+            file_config = self._config_file_config(service)
+            if name == "default":
+                updates = {
+                    f"agent.llm.{key}": value for key, value in values.items()
+                }
+                effective = self._config_effective(service)
+                for key in updates:
+                    if effective.source(key) == "env":
+                        raise GatewayError(
+                            E_CONFIG_READONLY,
+                            f"{key} is overridden by the environment",
+                            location=LOCATION_SERVER,
+                            context={
+                                "key": key,
+                                "env_var": env_var_for(key, service.prefix),
+                                "hint": "unset the environment variable and restart",
+                            },
+                        )
+                change_set = service.update(
+                    updates, expected_revision=expected,
+                )
+                return self._config_result(change_set, service)
+            self._config_composite_readonly(service, "agent.profiles")
+            profiles = app_to_dict(file_config)["agent"]["profiles"]
+            creating = name not in profiles
+            self._config_reserved_profile_name(name, creating=creating)
+            merged = self._merge_llm_values(
+                profiles.get(name, {}), values, creating=creating,
+            )
+            profiles[name] = merged
+            change_set = service.update(
+                {"agent.profiles": profiles}, expected_revision=expected,
+            )
+            return self._config_result(change_set, service)
+
+        try:
+            async with self._config_lock:
+                result = await asyncio.to_thread(_apply)
+        except ConfigError as exc:
+            raise self._config_gateway_error(exc, service) from exc
+        self._config_audit(connection, result, True,
+                           action="profile.set", target=name)
+        return result
+
+    async def _config_profile_delete(self, connection: ClientConnection,
+                                     command: Command) -> dict:
+        """Delete a named profile behind reference guards (§5.4)."""
+        service = self._require_config_write(connection)
+        name = str(command.args["name"])
+        expected = command.args.get("expected_revision")
+        confirm = bool(command.args.get("confirm_in_use", False))
+        if name == "default":
+            raise GatewayError(
+                E_CONFIG_PROFILE_RESERVED,
+                "profile name 'default' is reserved for agent.llm",
+                location=LOCATION_SERVER,
+                context={
+                    "name": name,
+                    "hint": "edit agent.llm through config.profile.set {name: default}",
+                },
+            )
+        if not confirm:
+            sessions = await self._sessions_using_profile(name)
+            if sessions:
+                raise GatewayError(
+                    E_CONFIG_PROFILE_IN_USE,
+                    "profile is still referenced by historical sessions",
+                    location=LOCATION_SERVER,
+                    context={
+                        "referenced_by": "sessions",
+                        "count": len(sessions),
+                        "sample_session_ids": sessions[:5],
+                        "hint": (
+                            "re-send with confirm_in_use=true to delete anyway; "
+                            "those sessions will fail to recover"
+                        ),
+                    },
+                )
+
+        def _apply() -> dict:
+            self._config_expected_revision(service, expected)
+            self._config_composite_readonly(service, "agent.profiles")
+            file_config = self._config_file_config(service)
+            profiles = app_to_dict(file_config)["agent"]["profiles"]
+            if name not in profiles:
+                raise GatewayError(
+                    E_CONFIG_PROFILE_NOT_FOUND,
+                    "profile does not exist",
+                    location=LOCATION_SERVER,
+                    context={"name": name},
+                )
+            effective = self._config_effective(service)
+            references = (
+                ("agent.default_profile",
+                 effective.config.agent.default_profile),
+                ("agent.subagents.default_model_profile",
+                 effective.config.agent.subagents.default_model_profile),
+                ("agent.subagents.allowed_model_profiles",
+                 name if name in effective.config.agent.subagents.allowed_model_profiles
+                 else None),
+            )
+            for path, value in references:
+                if value == name:
+                    raise GatewayError(
+                        E_CONFIG_PROFILE_IN_USE,
+                        "profile is still referenced by the configuration",
+                        location=LOCATION_SERVER,
+                        context={
+                            "referenced_by": path,
+                            "hint": "change the referencing setting before deleting",
+                        },
+                    )
+            profiles.pop(name)
+            change_set = service.update(
+                {"agent.profiles": profiles}, expected_revision=expected,
+            )
+            return self._config_result(change_set, service)
+
+        try:
+            async with self._config_lock:
+                result = await asyncio.to_thread(_apply)
+        except ConfigError as exc:
+            raise self._config_gateway_error(exc, service) from exc
+        self._config_audit(
+            connection, result, True, action="profile.delete", target=name,
+            extra={"confirmed_in_use": confirm},
+        )
+        return result
+
+    async def _config_profile_duplicate(self, connection: ClientConnection,
+                                        command: Command) -> dict:
+        """Copy a profile (or ``agent.llm``) with its raw secret (§5.5)."""
+        service = self._require_config_write(connection)
+        source_name = str(command.args["from"])
+        name = str(command.args["name"])
+        expected = command.args.get("expected_revision")
+
+        def _apply() -> dict:
+            self._config_expected_revision(service, expected)
+            self._config_composite_readonly(service, "agent.profiles")
+            file_config = self._config_file_config(service)
+            profiles = app_to_dict(file_config)["agent"]["profiles"]
+            self._config_reserved_profile_name(name, creating=True)
+            if name in profiles:
+                raise GatewayError(
+                    E_CONFIG_PROFILE_EXISTS,
+                    "profile already exists",
+                    location=LOCATION_SERVER,
+                    context={"name": name},
+                )
+            if source_name == "default":
+                source = app_to_dict(file_config)["agent"]["llm"]
+            else:
+                source = profiles.get(source_name)
+                if source is None:
+                    raise GatewayError(
+                        E_CONFIG_PROFILE_NOT_FOUND,
+                        "profile does not exist",
+                        location=LOCATION_SERVER,
+                        context={"name": source_name},
+                    )
+            profiles[name] = copy.deepcopy(source)
+            change_set = service.update(
+                {"agent.profiles": profiles}, expected_revision=expected,
+            )
+            return self._config_result(change_set, service)
+
+        try:
+            async with self._config_lock:
+                result = await asyncio.to_thread(_apply)
+        except ConfigError as exc:
+            raise self._config_gateway_error(exc, service) from exc
+        self._config_audit(connection, result, True,
+                           action="profile.duplicate", target=name)
+        return result
+
+    async def _config_fallback_set(self, connection: ClientConnection,
+                                   command: Command) -> dict:
+        """Append (no ``index``) or edit one fallback, keeping raw secrets (§5.6)."""
+        service = self._require_config_write(connection)
+        values = dict(command.args["values"])
+        index = command.args.get("index")
+        expected = command.args.get("expected_revision")
+        target = "new" if index is None else str(index)
+
+        def _apply() -> dict:
+            self._config_expected_revision(service, expected)
+            self._config_composite_readonly(service, "agent.fallbacks")
+            file_config = self._config_file_config(service)
+            fallbacks = app_to_dict(file_config)["agent"]["fallbacks"]
+            if index is None:
+                fallbacks.append(
+                    self._merge_llm_values({}, values, creating=True)
+                )
+            else:
+                self._config_fallback_bounds(len(fallbacks), index)
+                fallbacks[index] = self._merge_llm_values(
+                    fallbacks[index], values, creating=False,
+                )
+            change_set = service.update(
+                {"agent.fallbacks": fallbacks}, expected_revision=expected,
+            )
+            return self._config_result(change_set, service)
+
+        try:
+            async with self._config_lock:
+                result = await asyncio.to_thread(_apply)
+        except ConfigError as exc:
+            raise self._config_gateway_error(exc, service) from exc
+        self._config_audit(connection, result, True,
+                           action="fallback.set", target=target)
+        return result
+
+    async def _config_fallback_delete(self, connection: ClientConnection,
+                                      command: Command) -> dict:
+        """Delete one fallback by index (§5.6)."""
+        service = self._require_config_write(connection)
+        index = int(command.args["index"])
+        expected = command.args.get("expected_revision")
+
+        def _apply() -> dict:
+            self._config_expected_revision(service, expected)
+            self._config_composite_readonly(service, "agent.fallbacks")
+            file_config = self._config_file_config(service)
+            fallbacks = app_to_dict(file_config)["agent"]["fallbacks"]
+            self._config_fallback_bounds(len(fallbacks), index)
+            fallbacks.pop(index)
+            change_set = service.update(
+                {"agent.fallbacks": fallbacks}, expected_revision=expected,
+            )
+            return self._config_result(change_set, service)
+
+        try:
+            async with self._config_lock:
+                result = await asyncio.to_thread(_apply)
+        except ConfigError as exc:
+            raise self._config_gateway_error(exc, service) from exc
+        self._config_audit(connection, result, True,
+                           action="fallback.delete", target=str(index))
+        return result
+
+    async def _config_fallback_move(self, connection: ClientConnection,
+                                    command: Command) -> dict:
+        """Reorder one fallback; its raw secret travels with the entry (§5.6)."""
+        service = self._require_config_write(connection)
+        source_index = int(command.args["from"])
+        target_index = int(command.args["to"])
+        expected = command.args.get("expected_revision")
+
+        def _apply() -> dict:
+            self._config_expected_revision(service, expected)
+            self._config_composite_readonly(service, "agent.fallbacks")
+            file_config = self._config_file_config(service)
+            fallbacks = app_to_dict(file_config)["agent"]["fallbacks"]
+            self._config_fallback_bounds(len(fallbacks), source_index)
+            self._config_fallback_bounds(len(fallbacks), target_index)
+            item = fallbacks.pop(source_index)
+            fallbacks.insert(target_index, item)
+            change_set = service.update(
+                {"agent.fallbacks": fallbacks}, expected_revision=expected,
+            )
+            return self._config_result(change_set, service)
+
+        try:
+            async with self._config_lock:
+                result = await asyncio.to_thread(_apply)
+        except ConfigError as exc:
+            raise self._config_gateway_error(exc, service) from exc
+        self._config_audit(
+            connection, result, True, action="fallback.move",
+            target=f"{source_index}->{target_index}",
+        )
+        return result
 
     # -- plugin runtime commands (§5.6) -------------------------------------
     def _require_plugin_runtime(self, connection: ClientConnection) -> None:

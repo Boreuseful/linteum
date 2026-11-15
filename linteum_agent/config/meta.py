@@ -20,8 +20,8 @@ secret markers and the apply scope.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields, is_dataclass
-from typing import Any
+from dataclasses import dataclass, field, fields, is_dataclass
+from typing import Any, Mapping
 
 from ..runtime.llm.config import LLMConfig, PROVIDER_DEFAULTS
 from .schema import (
@@ -40,6 +40,8 @@ SECTION_TITLES: dict[str, str] = {
     "agent.tools": "工具与审批",
     "agent.background": "后台任务 (Async ReAct)",
     "agent.skills": "Skills",
+    "agent.subagents": "子代理",
+    "agent.steering": "轮次引导",
     "agent.budget": "预算",
     "agent.session": "会话默认值",
     "agent.modes": "模式",
@@ -51,6 +53,7 @@ SECTION_TITLES: dict[str, str] = {
     "gateway.history": "历史分页",
     "gateway.backpressure": "背压",
     "gateway.plugins": "插件管理",
+    "gateway.config": "配置管理",
     "storage": "存储",
     "storage.checkpoints": "Checkpoint",
     "logging": "日志",
@@ -65,6 +68,8 @@ SECTION_ORDER: tuple[str, ...] = (
     "agent.tools",
     "agent.background",
     "agent.skills",
+    "agent.subagents",
+    "agent.steering",
     "agent.budget",
     "agent.session",
     "agent.modes",
@@ -76,11 +81,52 @@ SECTION_ORDER: tuple[str, ...] = (
     "gateway.history",
     "gateway.backpressure",
     "gateway.plugins",
+    "gateway.config",
     "storage",
     "storage.checkpoints",
     "logging",
     "ui",
 )
+
+#: Localized section titles.  ``title`` above stays the canonical Chinese
+#: value; clients fall back to it when a locale is absent.
+SECTION_TITLES_I18N: dict[str, dict[str, str]] = {
+    "agent.llm": {"en": "Model"},
+    "agent.profiles": {"en": "Model Profiles"},
+    "agent.context": {"en": "Context"},
+    "agent.tools": {"en": "Tools & Approval"},
+    "agent.background": {"en": "Background Tasks"},
+    "agent.skills": {"en": "Skills"},
+    "agent.subagents": {"en": "Subagents"},
+    "agent.steering": {"en": "Turn Steering"},
+    "agent.budget": {"en": "Budget"},
+    "agent.session": {"en": "Session Defaults"},
+    "agent.modes": {"en": "Modes"},
+    "agent.plugins": {"en": "Plugins"},
+    "gateway": {"en": "Gateway"},
+    "gateway.websocket": {"en": "WebSocket"},
+    "gateway.limits": {"en": "Gateway Limits"},
+    "gateway.delta": {"en": "Streaming Deltas"},
+    "gateway.history": {"en": "History Paging"},
+    "gateway.backpressure": {"en": "Backpressure"},
+    "gateway.plugins": {"en": "Plugin Management"},
+    "gateway.config": {"en": "Config Management"},
+    "storage": {"en": "Storage"},
+    "storage.checkpoints": {"en": "Checkpoints"},
+    "logging": {"en": "Logging"},
+    "ui": {"en": "Interface"},
+}
+
+#: Localized field text.  Shape: ``{key: {locale: {title?, description?}}}``.
+#: Phase 3 fills this incrementally; missing entries fall back to FIELD_META.
+FIELD_I18N: dict[str, dict[str, dict[str, str]]] = {
+    "agent.context.max_tokens": {
+        "en": {
+            "title": "Context budget (tokens)",
+            "description": "Maximum context tokens kept for a request.",
+        },
+    },
+}
 
 #: Per-field overrides.  Anything omitted is inferred from the dataclass.
 FIELD_META: dict[str, dict[str, Any]] = {
@@ -302,6 +348,128 @@ FIELD_META: dict[str, dict[str, Any]] = {
         ),
     },
     # -- agent.subagents ------------------------------------------------
+    "agent.subagents.enabled": {
+        "title": "启用子代理",
+        "type": "bool",
+        "description": "开启后根会话注入 spawn_subagent 工具；默认关闭。",
+    },
+    "agent.subagents.tool_name": {
+        "title": "子代理工具名",
+        "type": "str",
+        "description": "保留的工具名；子会话不会注册同名工具（max_depth=1）。",
+    },
+    "agent.subagents.max_depth": {
+        "title": "最大委托深度",
+        "type": "int",
+        "minimum": 1,
+        "description": "当前实现只支持 1：子会话不再委托。",
+    },
+    "agent.subagents.max_concurrent_per_session": {
+        "title": "单会话子代理并发上限",
+        "type": "int",
+        "minimum": 1,
+    },
+    "agent.subagents.max_queued_per_session": {
+        "title": "单会话子代理排队上限",
+        "type": "int",
+        "minimum": 0,
+    },
+    "agent.subagents.default_timeout_ms": {
+        "title": "子代理默认超时 ms",
+        "type": "int",
+        "minimum": 0,
+    },
+    "agent.subagents.max_timeout_ms": {
+        "title": "子代理超时上限 ms",
+        "type": "int",
+        "minimum": 0,
+    },
+    "agent.subagents.cancel_grace_ms": {
+        "title": "子代理取消宽限 ms",
+        "type": "int",
+        "minimum": 0,
+        "advanced": True,
+    },
+    "agent.subagents.max_prompt_bytes": {
+        "title": "子代理 prompt 上限字节",
+        "type": "int",
+        "minimum": 0,
+        "advanced": True,
+    },
+    "agent.subagents.max_summary_bytes": {
+        "title": "子代理摘要上限字节",
+        "type": "int",
+        "minimum": 0,
+        "advanced": True,
+    },
+    "agent.subagents.progress_interval_ms": {
+        "title": "子代理进度间隔 ms",
+        "type": "int",
+        "minimum": 0,
+        "advanced": True,
+    },
+    "agent.subagents.default_tools": {
+        "title": "子代理默认工具",
+        "type": "list",
+        "item_type": "str",
+        "description": "父会话未显式指定 tools 时子会话使用的工具名列表。",
+    },
+    "agent.subagents.allowed_tools": {
+        "title": "子代理允许工具",
+        "type": "list",
+        "item_type": "str",
+        "description": "模型只能收窄到这些工具；不在列表中的请求会失败。",
+    },
+    "agent.subagents.default_model_profile": {
+        "title": "子代理默认模型 Profile",
+        "type": "str",
+        "description": "父会话未显式指定 model_profile 时使用。",
+    },
+    "agent.subagents.allowed_model_profiles": {
+        "title": "子代理允许模型 Profile",
+        "type": "list",
+        "item_type": "str",
+        "description": "模型只能选择这些 profile；不在列表中的请求会失败。",
+    },
+    "agent.subagents.approval_policy": {
+        "title": "子代理审批策略",
+        "type": "enum",
+        "enum": ("allow", "deny", "inherit"),
+        "description": "allow=直接执行；deny=拒绝；inherit=跟随父会话。",
+    },
+    "agent.subagents.inherit_skills": {
+        "title": "子代理继承 Skills",
+        "type": "bool",
+        "description": "子会话是否继承父会话的 skills 索引。",
+    },
+    "agent.subagents.max_tokens": {
+        "title": "子代理 token 上限",
+        "type": "int",
+        "minimum": 0,
+        "description": "0 表示不限制。",
+        "advanced": True,
+    },
+    "agent.subagents.max_usd": {
+        "title": "子代理费用上限 USD",
+        "type": "float",
+        "minimum": 0,
+        "description": "0 表示不限制。",
+        "advanced": True,
+    },
+    "agent.subagents.max_rounds": {
+        "title": "子代理轮次上限",
+        "type": "int",
+        "minimum": 0,
+        "description": "0 表示不限制。",
+        "advanced": True,
+    },
+    "agent.subagents.max_wall_ms": {
+        "title": "子代理墙钟上限 ms",
+        "type": "int",
+        "minimum": 0,
+        "description": "0 表示不限制。",
+        "advanced": True,
+    },
     "agent.subagents.force_background": {
         "title": "子代理强制后台",
         "type": "bool",
@@ -482,6 +650,14 @@ FIELD_META: dict[str, dict[str, Any]] = {
             "agent.plugins.allow；重启网关后生效。默认关闭。"
         ),
     },
+    "gateway.config.manage": {
+        "title": "允许客户端修改配置",
+        "type": "bool",
+        "description": (
+            "允许本地客户端通过 config.set/config.unset 修改配置；"
+            "重启网关后生效。默认关闭。"
+        ),
+    },
     # -- storage --------------------------------------------------------
     "storage.state_db": {"title": "SQLite 路径", "type": "path"},
     "storage.artifacts": {"title": "Artifact 目录", "type": "path"},
@@ -530,7 +706,8 @@ FILE_ONLY_KEYS: frozenset[str] = frozenset({
 })
 
 _RESTART_PREFIXES: tuple[str, ...] = (
-    "storage.", "gateway.websocket.", "gateway.plugins.", "agent.plugins.",
+    "storage.", "gateway.websocket.", "gateway.plugins.", "gateway.config.",
+    "agent.plugins.",
 )
 _RESTART_KEYS = frozenset({
     "gateway.transport",
@@ -587,6 +764,8 @@ class FieldSpec:
     section: str = ""
     item_type: str = ""
     item_section: str = ""
+    title_i18n: Mapping[str, str] = field(default_factory=dict)
+    description_i18n: Mapping[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -595,6 +774,8 @@ class FieldSpec:
             "default": self.default,
             "title": self.title,
             "description": self.description,
+            "title_i18n": dict(self.title_i18n),
+            "description_i18n": dict(self.description_i18n),
             "enum": list(self.enum),
             "minimum": self.minimum,
             "maximum": self.maximum,
@@ -622,6 +803,23 @@ def _infer_type(default: Any) -> str:
         return "float"
     if isinstance(default, str):
         return "str"
+    if isinstance(default, (list, tuple)):
+        return "list"
+    return "str"
+
+
+def _infer_item_type(default: Any) -> str:
+    """Infer a scalar ``item_type`` for a list/tuple default."""
+    if isinstance(default, (list, tuple)):
+        for item in default:
+            if isinstance(item, bool):
+                return "bool"
+            if isinstance(item, int):
+                return "int"
+            if isinstance(item, float):
+                return "float"
+            if isinstance(item, str):
+                return "str"
     return "str"
 
 
@@ -644,6 +842,24 @@ def _make_spec(key: str, default: Any) -> FieldSpec:
     section = meta.get("section") or (key.rsplit(".", 1)[0] if "." in key else "")
     nullable = bool(meta.get("nullable", default is None))
     field_type = meta.get("type") or _infer_type(default)
+    item_type = meta.get("item_type", "")
+    if field_type == "list" and not item_type:
+        item_type = _infer_item_type(default)
+    i18n = FIELD_I18N.get(key, {})
+    title_i18n = {
+        locale: values["title"]
+        for locale, values in i18n.items()
+        if values.get("title")
+    }
+    description_i18n = {
+        locale: values["description"]
+        for locale, values in i18n.items()
+        if values.get("description")
+    }
+    if not title_i18n.get("en"):
+        # Humanized keys are a reasonable English fallback for fields that do
+        # not have an explicit translation yet; ``title`` stays canonical.
+        title_i18n["en"] = _humanize(key.rsplit(".", 1)[-1])
     return FieldSpec(
         key=key,
         type=field_type,
@@ -659,8 +875,10 @@ def _make_spec(key: str, default: Any) -> FieldSpec:
         nullable=nullable,
         allow_custom=bool(meta.get("allow_custom", False)),
         section=section,
-        item_type=meta.get("item_type", ""),
+        item_type=item_type,
         item_section=meta.get("item_section", ""),
+        title_i18n=title_i18n,
+        description_i18n=description_i18n,
     )
 
 
@@ -690,6 +908,7 @@ def build_schema(config: AppConfig | None = None) -> dict:
         sections.append({
             "key": key,
             "title": SECTION_TITLES.get(key, _humanize(key.replace(".", " "))),
+            "title_i18n": dict(SECTION_TITLES_I18N.get(key, {})),
             "fields": [item.to_dict() for item in items],
         })
     return {"version": CONFIG_VERSION, "sections": sections}
@@ -755,6 +974,56 @@ def get_spec(key: str, config: AppConfig | None = None) -> FieldSpec:
     raise ConfigError(f"unknown config key: {key}", key=key, code="E_CONFIG_UNKNOWN")
 
 
+#: Upper bound for one list value (gateway and CLI share it).
+MAX_LIST_ITEMS = 256
+
+#: List item types the generic editor/protocol may replace wholesale.
+WRITABLE_LIST_ITEM_TYPES = frozenset({"str", "path", "int", "float", "bool"})
+
+
+def is_writable_spec(spec: FieldSpec) -> bool:
+    """True when ``config.set/unset`` may write this field generically."""
+    if spec.key == "agent.plugins.allow":
+        return False
+    if spec.type in ("map", "object"):
+        return False
+    if spec.type == "list":
+        return spec.item_type in WRITABLE_LIST_ITEM_TYPES
+    return True
+
+
+def coerce_item(spec: FieldSpec, value: Any, index: int) -> Any:
+    """Validate one item of a scalar list against ``spec.item_type``."""
+    key = f"{spec.key}[{index}]"
+    item_type = spec.item_type or "str"
+    if item_type == "bool":
+        if not isinstance(value, bool):
+            raise ConfigError(f"{key} must be a boolean", key=key,
+                              code="E_CONFIG_TYPE")
+        return value
+    if item_type == "int":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"{key} must be an integer", key=key,
+                              code="E_CONFIG_TYPE")
+        return value
+    if item_type == "float":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(f"{key} must be a number", key=key,
+                              code="E_CONFIG_TYPE")
+        return float(value)
+    if item_type in ("str", "path"):
+        if not isinstance(value, str):
+            raise ConfigError(f"{key} must be a string", key=key,
+                              code="E_CONFIG_TYPE")
+        return value
+    if item_type == "object":
+        if not isinstance(value, dict):
+            raise ConfigError(f"{key} must be a JSON object", key=key,
+                              code="E_CONFIG_TYPE")
+        return value
+    return value
+
+
 def coerce_value(spec: FieldSpec, value: Any) -> Any:
     """Coerce a CLI/env string into the field's declared type."""
     if value is None:
@@ -793,7 +1062,13 @@ def coerce_value(spec: FieldSpec, value: Any) -> Any:
         if not isinstance(value, (list, tuple)):
             raise ConfigError(f"{spec.key} must be a JSON array",
                               key=spec.key, code="E_CONFIG_TYPE")
-        return list(value)
+        if len(value) > MAX_LIST_ITEMS:
+            raise ConfigError(
+                f"{spec.key} accepts at most {MAX_LIST_ITEMS} items",
+                key=spec.key, code="E_CONFIG_RANGE",
+            )
+        return [coerce_item(spec, item, index)
+                for index, item in enumerate(value)]
     if base == "path":
         base = "str"
     if base == "secret":
@@ -814,14 +1089,20 @@ def coerce_value(spec: FieldSpec, value: Any) -> Any:
 
 
 __all__ = [
+    "FIELD_I18N",
     "FIELD_META",
     "FILE_ONLY_KEYS",
     "SECTION_ORDER",
     "SECTION_TITLES",
+    "MAX_LIST_ITEMS",
+    "SECTION_TITLES_I18N",
     "FieldSpec",
+    "WRITABLE_LIST_ITEM_TYPES",
     "apply_scope",
     "build_schema",
+    "coerce_item",
     "coerce_value",
     "field_specs",
     "get_spec",
+    "is_writable_spec",
 ]
