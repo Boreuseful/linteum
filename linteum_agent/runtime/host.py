@@ -1031,7 +1031,6 @@ class AgentHost:
                 skill_index=resolution.filtered_skills.index_text,
             )
             subagent_tools = resolution.subagent_tools
-            subagent_settings = cfg.agent.subagents
             schemas, background_tools, targets = self._compose_schemas(
                 cfg, registry, subagent_tools, workspace=workspace,
             )

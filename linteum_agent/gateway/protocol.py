@@ -253,8 +253,8 @@ def _config_values(args: Mapping) -> dict:
         raise _bad("values must be a non-empty object")
     if len(values) > CONFIG_MAX_VALUES:
         raise _bad(f"values accepts at most {CONFIG_MAX_VALUES} keys")
-    for field, value in values.items():
-        if not isinstance(field, str):
+    for name, value in values.items():
+        if not isinstance(name, str):
             raise _bad("values keys must be strings")
         try:
             json.dumps(value, ensure_ascii=False)

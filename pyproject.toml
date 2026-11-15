@@ -24,4 +24,20 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["linteum_agent"]
 
+[dependency-groups]
+dev = [
+    "ruff>=0.17.5",
+]
+
+[tool.ruff]
+# Pin the rule set explicitly: ruff's defaults have widened across releases.
+target-version = "py312"
+line-length = 100
+src = ["linteum_agent"]
+exclude = ["linteum-web", "dist"]
+
+[tool.ruff.lint]
+# E4 imports, E7 statements, E9 runtime/syntax, F pyflakes (incl. F821).
+select = ["E4", "E7", "E9", "F"]
+
 

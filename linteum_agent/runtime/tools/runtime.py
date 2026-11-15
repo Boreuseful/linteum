@@ -38,7 +38,6 @@ from ..errors import ErrorSource, error_info
 from ...bus.scheduler.cancel import Cancelled, CancelToken
 from ...bus.scheduler.pool import WorkerPool
 from .errors import (
-    E_BAD_ARGS,
     E_BACKGROUND_SPEC_CHANGED,
     E_CANCELLED,
     E_DENIED,

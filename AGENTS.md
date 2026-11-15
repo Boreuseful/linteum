@@ -30,6 +30,7 @@ are leaves: they must not reach into dispatch or state internals.
 - `uv sync` — create `.venv` and install `anthropic`, `openai`, `pyyaml`.
 - `uv run python -m compileall -q linteum_agent` — syntax/bytecode smoke check.
 - `uv run python -c "import linteum_agent.bus, linteum_agent.runtime, linteum_agent.storage"` — import smoke check.
+- `uv run ruff check linteum_agent` — lint (`E4/E7/E9/F`, including `F821` undefined names).
 - SDK imports are deliberately lazy (`openai` / `anthropic` only inside adapter
   constructors). Keep it that way so bus/state/tool code can be imported without
   SDKs.
@@ -177,7 +178,7 @@ change requires breaking one, stop and redesign the change.
 
 ## PR / commit
 
-- Run the compile/import smoke checks above before committing.
+- Run the compile/import/ruff checks above before committing.
 - Commit style from history: `feat(bus): ...`, `fix(runtime): ...`,
   `refactor!: ...`, `docs: ...`.
 - Keep commits scoped. Never commit `.venv`, `__pycache__`, `.kilo/`,
