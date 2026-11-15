@@ -29,13 +29,15 @@ _RESTART_PREFIXES: tuple[str, ...] = (
     "gateway.plugins.",
     "gateway.config.",
     "agent.plugins.",
-    "logging.",
 )
 _RESTART_KEYS = frozenset({
     "gateway.transport",
     # The bus (and its coalescer) is constructed when AgentHost starts.
     "gateway.delta.coalesce_window_ms",
 })
+
+#: RunLogger.apply_config() swaps level/handlers in place (Phase 4).
+_LIVE_PREFIXES: tuple[str, ...] = ("logging.",)
 
 _NEXT_CONNECTION_PREFIXES: tuple[str, ...] = (
     "gateway.limits.",
@@ -56,6 +58,8 @@ def runtime_scope(key: str) -> str:
     """Return the real effect of changing ``key`` in a running gateway."""
     if key in _RESTART_KEYS or key.startswith(_RESTART_PREFIXES):
         return RESTART
+    if key.startswith(_LIVE_PREFIXES):
+        return LIVE
     if key in _NEXT_CONNECTION_KEYS or key.startswith(_NEXT_CONNECTION_PREFIXES):
         return NEXT_CONNECTION
     if key in _NOOP_KEYS or key.startswith(_NOOP_PREFIXES):

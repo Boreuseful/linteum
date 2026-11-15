@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
@@ -216,6 +217,7 @@ class RunLogger:
         self.bus = None
         self._closed = False
         self._degraded = False
+        self._apply_lock = threading.Lock()
         self._unsub: Optional[Callable[[], None]] = None
         self._sink: Optional[Callable[[dict], None]] = None
         self._deltas: "OrderedDict[str, list]" = OrderedDict()
@@ -236,31 +238,82 @@ class RunLogger:
         logger.setLevel(_level_of(self.config.level))
         logger.propagate = False           # never touch the host's root config
         logger.handlers = []               # start clean for this instance
-        path = self.config.resolved_path
         try:
-            directory = os.path.dirname(path)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            handler = RotatingFileHandler(
-                path,
-                maxBytes=max(0, self.config.max_bytes),
-                backupCount=max(0, self.config.backups),
-                encoding="utf-8",
-            )
-            handler.setFormatter(self._make_formatter())
-            logger.addHandler(handler)
+            handlers = self._build_handlers(self.config)
         except OSError as exc:  # unwritable path -> degrade, never raise
             self._degrade(exc)
-        if self.config.console:
-            console = logging.StreamHandler(sys.stderr)
-            console.setFormatter(self._make_formatter())
-            logger.addHandler(console)
+            handlers = []
+            if self.config.console:
+                handlers.append(self._console_handler(self.config))
+        for handler in handlers:
+            logger.addHandler(handler)
         return logger
 
-    def _make_formatter(self) -> logging.Formatter:
-        if str(self.config.format).lower() == "json":
+    def _build_handlers(self, config: LogConfig) -> list[logging.Handler]:
+        """Build a fresh handler set. Raises ``OSError`` on an unusable path."""
+        path = config.resolved_path
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        handler = RotatingFileHandler(
+            path,
+            maxBytes=max(0, config.max_bytes),
+            backupCount=max(0, config.backups),
+            encoding="utf-8",
+        )
+        handler.setFormatter(self._make_formatter(config))
+        handlers: list[logging.Handler] = [handler]
+        if config.console:
+            handlers.append(self._console_handler(config))
+        return handlers
+
+    def _console_handler(self, config: LogConfig) -> logging.Handler:
+        console = logging.StreamHandler(sys.stderr)
+        console.setFormatter(self._make_formatter(config))
+        return console
+
+    def _make_formatter(self, config: Optional[LogConfig] = None) -> logging.Formatter:
+        config = config or self.config
+        if str(config.format).lower() == "json":
             return _JsonFormatter()
         return _TextFormatter()
+
+    def apply_config(self, config: LogConfig) -> bool:
+        """Swap level/handlers for a running logger. Best-effort, never raises.
+
+        New handlers are built first; only after that succeeds are the old
+        handlers removed and closed.  A build failure leaves the old target in
+        place and writes one stderr warning (web-config-phase4 §6.6.2).
+        """
+        with self._apply_lock:
+            if self._closed:
+                return False
+            try:
+                handlers = self._build_handlers(config)
+            except Exception as exc:  # noqa: BLE001 - live apply must not break the write
+                try:
+                    sys.stderr.write(
+                        "[linteum_agent.runtime.observability] run log "
+                        f"reconfigure failed, keeping the old target: {exc!r}\n"
+                    )
+                except Exception:  # pragma: no cover - stderr itself is gone
+                    pass
+                return False
+
+            logger = self._logger
+            old_handlers = list(logger.handlers)
+            logger.setLevel(_level_of(config.level))
+            for handler in handlers:
+                logger.addHandler(handler)
+            for handler in old_handlers:
+                logger.removeHandler(handler)
+                try:
+                    handler.flush()
+                    handler.close()
+                except Exception:  # noqa: BLE001 - a stale handler must not raise
+                    pass
+            self.config = config
+            return True
 
     def _degrade(self, exc: BaseException) -> None:
         if self._degraded:

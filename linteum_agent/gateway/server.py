@@ -24,9 +24,10 @@ import json
 import time
 import uuid
 from dataclasses import fields
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from ..config.meta import (
+    FILE_ONLY_KEYS,
     MAX_LIST_ITEMS,
     FieldSpec,
     field_specs,
@@ -35,10 +36,10 @@ from ..config.meta import (
 )
 from ..config.options import SessionOptions
 from ..config.schema import AppConfig, ConfigError, GatewaySettings, LLMConfig, app_to_dict
-from ..config.service import ConfigService, EffectiveConfig, env_var_for
+from ..config.service import ChangeSet, ConfigService, EffectiveConfig, env_var_for
 from ..runtime.host import AgentHost, SessionLocked, SessionNotFound
 from ..runtime.plugins.errors import PluginError, PluginManifestError, PluginNotFound
-from .config_scope import runtime_scope
+from .config_scope import LIVE, runtime_scope
 from .errors import (
     E_CONFIG_COMPOSITE_UNSUPPORTED,
     E_CONFIG_LOCAL_ONLY,
@@ -498,6 +499,10 @@ class GatewayServer:
         # web-config §6.1: same startup-capture model for configuration writes.
         self._config_manage_enabled = self._initial_config_manage_enabled()
         self._config_lock = asyncio.Lock()
+        # Phase 4: one ConfigService listener per server; the listener runs on
+        # the config write thread and marshals the broadcast onto this loop.
+        self._config_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._config_unsub: Optional[Callable[[], None]] = None
 
         self._gateways: dict[str, SessionGateway] = {}
         self._gateway_locks: dict[str, asyncio.Lock] = {}
@@ -547,6 +552,7 @@ class GatewayServer:
         )
         connection.start()
         self._connections[connection.id] = connection
+        self._ensure_config_subscription()
         logger.info(
             "connection %d opened (%d live)", connection.id, len(self._connections)
         )
@@ -580,6 +586,10 @@ class GatewayServer:
         if self._closed:
             return
         self._closed = True
+        if self._config_unsub is not None:
+            self._config_unsub()
+            self._config_unsub = None
+        self._config_loop = None
         logger.info(
             "gateway server closing (%d session(s), %d connection(s), close_host=%s)",
             len(self._gateways), len(self._connections), close_host,
@@ -1085,6 +1095,71 @@ class GatewayServer:
         }
 
     # -- config management (web-config §6) ---------------------------------
+    def _ensure_config_subscription(self) -> None:
+        """Subscribe this server to config changes once (idempotent, §6.3)."""
+        if self.config_service is None:
+            return
+        loop = asyncio.get_running_loop()
+        if self._config_unsub is not None and self._config_loop is loop:
+            return
+        if self._config_unsub is not None:
+            # A previous loop is gone (tests/host restart): drop its listener
+            # before registering the new one so writes never fan out twice.
+            self._config_unsub()
+            self._config_unsub = None
+        self._config_loop = loop
+        self._config_unsub = self.config_service.subscribe(self._on_config_change)
+
+    @staticmethod
+    def _is_file_only(key: str) -> bool:
+        return any(
+            key == prefix or key.startswith(prefix + ".")
+            for prefix in FILE_ONLY_KEYS
+        )
+
+    def _on_config_change(self, change_set: ChangeSet) -> None:
+        """Config listener (write thread): live-apply, then marshal a push."""
+        if not change_set.changes:
+            return
+        loop = self._config_loop
+        if loop is None or loop.is_closed():
+            return
+        if any(runtime_scope(change.key) == LIVE for change in change_set.changes):
+            try:
+                self.host.apply_live_config()
+            except Exception:  # noqa: BLE001 - live apply must not break the write
+                logger.warning("live config apply failed", exc_info=True)
+        keys = [
+            {"key": change.key, "scope": runtime_scope(change.key)}
+            for change in change_set.changes
+            if not self._is_file_only(change.key)
+        ]
+        if not keys:
+            return
+        payload = {"revision": change_set.revision, "keys": keys}
+        try:
+            loop.call_soon_threadsafe(self._broadcast_config_changed, payload)
+        except RuntimeError:
+            pass  # the loop closed between the check and the call
+
+    def _broadcast_config_changed(self, payload: dict) -> None:
+        """Event-loop thread: enqueue one ephemeral frame per eligible client."""
+        frame = Frame.create("config.changed", payload, ephemeral=True)
+        for connection in list(self._connections.values()):
+            if not connection.hello_done:
+                continue
+            if not self._config_manage_enabled and not getattr(
+                connection.transport, "is_local", True
+            ):
+                continue
+            try:
+                connection.send_frame(frame)
+            except Exception:  # noqa: BLE001 - one broken connection must not stop the rest
+                logger.debug(
+                    "connection %d could not receive config.changed",
+                    connection.id, exc_info=True,
+                )
+
     def _require_config_read(self, connection: ClientConnection) -> ConfigService:
         """``config.get`` is local-or-managed; secrets stay masked either way."""
         if not self._config_manage_enabled and not getattr(
@@ -1169,6 +1244,8 @@ class GatewayServer:
 
     async def _config_get(self, connection: ClientConnection,
                           command: Command) -> dict:
+        # Defensive: tests and embedders may call the handler without serve().
+        self._ensure_config_subscription()
         self._require_config_read(connection)
         service = self._config_service_or_error()
         sections = command.args.get("sections")

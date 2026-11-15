@@ -711,12 +711,8 @@ _RESTART_PREFIXES: tuple[str, ...] = (
 )
 _RESTART_KEYS = frozenset({
     "gateway.transport",
-    "logging.dir",
-    "logging.file",
-    "logging.path",
-    "logging.format",
-    "logging.max_bytes",
-    "logging.backups",
+    # The bus (and its delta coalescer) is constructed when AgentHost starts.
+    "gateway.delta.coalesce_window_ms",
 })
 _LIVE_PREFIXES: tuple[str, ...] = (
     "gateway.limits.",
@@ -732,6 +728,13 @@ _LIVE_KEYS = frozenset({
     "logging.console",
     "logging.include_content",
     "logging.log_deltas",
+    "logging.max_field_bytes",
+    "logging.dir",
+    "logging.file",
+    "logging.path",
+    "logging.format",
+    "logging.max_bytes",
+    "logging.backups",
 })
 
 

@@ -65,6 +65,9 @@ FEATURES: tuple = (
     # Phase 3: full schema-driven settings page (include_fields, list writes,
     # raw_value, schema i18n).
     "config.settings",
+    # Phase 4: the gateway pushes an ephemeral ``config.changed`` control frame
+    # after an in-process configuration write (web-config-phase4 §6.1).
+    "config.push",
 )
 
 #: Commands a client may send (§5.2).  Anything else is ``E_UNKNOWN_COMMAND``.
@@ -115,7 +118,8 @@ RESERVED_ARGS: frozenset = frozenset({"origin", "seq", "cause_id"})
 #: Control frames bypass the subscription filter (they are protocol plumbing,
 #: not projected facts).
 CONTROL_FRAMES: frozenset = frozenset(
-    {"hello.ok", "snapshot", "gap", "flow", "error", "pong", "bye", "history.page", "artifact.chunk"}
+    {"hello.ok", "snapshot", "gap", "flow", "error", "pong", "bye", "history.page", "artifact.chunk",
+     "config.changed"}
 )
 
 _SESSION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
