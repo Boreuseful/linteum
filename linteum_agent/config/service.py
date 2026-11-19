@@ -16,14 +16,16 @@ Per-conversation values (``workspace``) are deliberately absent; they live in
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import threading
-from dataclasses import dataclass, replace
-from typing import Any, Callable, Mapping, Optional
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from .meta import (
     FILE_ONLY_KEYS,
+    FieldSpec,
     apply_scope,
     build_schema,
     coerce_value,
@@ -65,6 +67,7 @@ class ConfigValue:
     secret: bool = False
     set: bool = True
     masked: Optional[str] = None
+    raw_value: Any = None
 
     def to_dict(self) -> dict:
         return {
@@ -74,6 +77,7 @@ class ConfigValue:
             "secret": self.secret,
             "set": self.set,
             "masked": self.masked,
+            "raw_value": self.raw_value,
         }
 
 
@@ -138,6 +142,8 @@ class EffectiveConfig:
     sources: Mapping[str, str]
     revision: str
     issues: tuple[Issue, ...] = ()
+    #: Flattened file leaves (pre-env/pre-override) for ``raw_value``.
+    raw: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def warnings(self) -> tuple[Issue, ...]:
@@ -153,10 +159,21 @@ class EffectiveConfig:
                 return self.sources.get(parent, "default")
         return "default"
 
-    def get(self, key: str, *, reveal: bool = False) -> ConfigValue:
-        spec = get_spec(key, self.config)
-        data = app_to_dict(self.config)
-        value = _get_path(data, key)
+    def _raw_for(self, spec: FieldSpec) -> Any:
+        """File-level value for non-secret scalar leaves (``${VAR}`` intact)."""
+        if spec.secret or spec.type in ("map", "list", "object"):
+            return None
+        if self.source(spec.key) != "file":
+            return None
+        raw = self.raw.get(spec.key)
+        # YAML can produce dates/binary objects; the gateway response must stay
+        # JSON-serialisable, so only pass through JSON scalar types.
+        if raw is None or isinstance(raw, (str, int, float, bool)):
+            return raw
+        return None
+
+    def _value_for(self, spec: FieldSpec, value: Any, *,
+                   reveal: bool = False) -> ConfigValue:
         if isinstance(value, (dict, list, tuple)):
             is_set = bool(value)
         else:
@@ -166,13 +183,29 @@ class EffectiveConfig:
         if not reveal and spec.type in ("map", "list", "object") and shown is not None:
             shown = _mask_secret_fields(shown)
         return ConfigValue(
-            key=key,
+            key=spec.key,
             value=shown,
-            source=self.source(key),
+            source=self.source(spec.key),
             secret=spec.secret,
             set=is_set,
             masked=masked,
+            raw_value=self._raw_for(spec),
         )
+
+    def get(self, key: str, *, reveal: bool = False) -> ConfigValue:
+        spec = get_spec(key, self.config)
+        data = app_to_dict(self.config)
+        return self._value_for(spec, _get_path(data, key), reveal=reveal)
+
+    def values(self, *, reveal: bool = False) -> dict[str, dict]:
+        """Return every schema leaf as ``ConfigValue.to_dict()``."""
+        data = app_to_dict(self.config)
+        return {
+            spec.key: self._value_for(
+                spec, _get_path(data, spec.key), reveal=reveal,
+            ).to_dict()
+            for spec in field_specs(self.config)
+        }
 
     def to_dict(self, *, reveal: bool = False) -> dict:
         data = app_to_dict(self.config)
@@ -428,7 +461,8 @@ class ConfigService:
         sources = {key: "default" for key in _flatten(defaults)}
         sources.pop("version", None)
 
-        raw_file = self.store.load_raw() if self.store.exists() else {}
+        raw_file, file_revision = self.store.load_raw_with_revision()
+        raw_flat: dict[str, Any] = {}
         if raw_file:
             merged = _deep_merge(merged, raw_file)
             raw_flat = _flatten(raw_file)
@@ -481,8 +515,9 @@ class ConfigService:
         return EffectiveConfig(
             config=config,
             sources={key: sources.get(key, "default") for key in specs},
-            revision=self.store.revision(),
+            revision=file_revision,
             issues=tuple(issues),
+            raw=raw_flat,
         )
 
     def get(self, key: str, *, reveal: bool = False) -> ConfigValue:
@@ -504,28 +539,11 @@ class ConfigService:
         persist: bool = True,
     ) -> ChangeSet:
         """Validate and persist one dotted key; return the resulting diff."""
-        spec = get_spec(key)
-        coerced = coerce_value(spec, value)
-
-        with self._lock:
-            old = self.store.load(create=False)
-            data = app_to_dict(old)
-            _set_path(data, key, coerced)
-            new = app_from_dict(data)
-            raise_for_issues(validate_config(new))
-
-            if persist:
-                revision = self.store.save(new, expected_revision=expected_revision)
-            else:
-                revision = self.store.revision()
-
-            changes = _diff(old, new)
-            self._last_config = new
-            change_set = ChangeSet(revision=revision, changes=changes)
-
-        if persist:
-            self._notify(change_set)
-        return change_set
+        return self.update(
+            {key: value},
+            expected_revision=expected_revision,
+            persist=persist,
+        )
 
     def unset(
         self,
@@ -535,10 +553,80 @@ class ConfigService:
         persist: bool = True,
     ) -> ChangeSet:
         """Reset a key to its schema default."""
-        spec = get_spec(key)
-        return self.set(
-            key,
-            spec.default,
+        return self.unset_many(
+            [key],
+            expected_revision=expected_revision,
+            persist=persist,
+        )
+
+    def update(
+        self,
+        changes: Mapping[str, Any],
+        *,
+        expected_revision: Optional[str] = None,
+        persist: bool = True,
+    ) -> ChangeSet:
+        """Validate and persist a batch of dotted keys atomically."""
+        if not changes:
+            return ChangeSet(revision=self.store.revision(), changes=())
+
+        resolved: list[tuple[str, Any]] = []
+        for key, value in changes.items():
+            spec = get_spec(key)
+            resolved.append((key, coerce_value(spec, value)))
+        _reject_overlapping_keys(key for key, _ in resolved)
+
+        with self._lock:
+            # Load the raw file instead of ``store.load`` so a batch that
+            # repairs a semantic error (bad enum/range/cross-field) is not
+            # rejected by validating the *old* config first.  The new config
+            # is still validated before ``save`` touches the file.
+            raw = self.store.load_raw()
+            old = app_from_dict(raw) if raw else default_config()
+            data = app_to_dict(old)
+            for key, coerced in resolved:
+                _set_path(data, key, coerced)
+            new = app_from_dict(data)
+            raise_for_issues(validate_config(new))
+
+            diff = _diff(old, new)
+            if not diff:
+                current = self.store.revision()
+                if (persist and expected_revision is not None
+                        and expected_revision != current):
+                    raise ConfigError(
+                        "configuration changed since it was read",
+                        code="E_CONFIG_CONFLICT",
+                        hint="reload the configuration and re-apply",
+                    )
+                return ChangeSet(revision=current, changes=())
+
+            if persist:
+                revision = self.store.save(
+                    new, expected_revision=expected_revision,
+                )
+                self._last_config = new
+            else:
+                revision = self.store.revision()
+            result = ChangeSet(revision=revision, changes=diff)
+
+        if persist:
+            self._notify(result)
+        return result
+
+    def unset_many(
+        self,
+        keys: Sequence[str],
+        *,
+        expected_revision: Optional[str] = None,
+        persist: bool = True,
+    ) -> ChangeSet:
+        """Reset keys to their schema defaults in one transaction."""
+        defaults = {
+            key: copy.deepcopy(get_spec(key).default) for key in keys
+        }
+        return self.update(
+            defaults,
             expected_revision=expected_revision,
             persist=persist,
         )
@@ -627,6 +715,19 @@ class ConfigService:
                 continue
 
 
+def _reject_overlapping_keys(keys: Iterable[str]) -> None:
+    """Reject a batch that sets both a parent object and one of its children."""
+    ordered = sorted(set(keys))
+    for parent, child in zip(ordered, ordered[1:]):
+        if child.startswith(parent + "."):
+            raise ConfigError(
+                f"configuration keys overlap: {parent!r} and {child!r}",
+                key=parent,
+                code="E_CONFIG_KEY_OVERLAP",
+                hint="set either the parent object or its child fields, not both",
+            )
+
+
 def _diff(old: AppConfig, new: AppConfig) -> tuple[ConfigChange, ...]:
     old_data = app_to_dict(old)
     new_data = app_to_dict(new)
@@ -638,15 +739,28 @@ def _diff(old: AppConfig, new: AppConfig) -> tuple[ConfigChange, ...]:
             continue
         before, after = old_flat.get(key), new_flat.get(key)
         if before != after:
-            if _is_secret_key(key):
-                before = _mask(before) if before not in (None, "") else None
-                after = _mask(after) if after not in (None, "") else None
-            changes.append(ConfigChange(
+            change = ConfigChange(
                 key=key,
                 old=before,
                 new=after,
                 scope=apply_scope(key),
-            ))
+            )
+            if key in ("agent.profiles", "agent.fallbacks"):
+                # Composite maps/lists arrive as a single flat leaf (lists are
+                # never recursed into), so their secret children must be masked
+                # here.  Never serialize a raw api_key in a diff.
+                change = replace(
+                    change,
+                    old=_mask_secret_fields(before),
+                    new=_mask_secret_fields(after),
+                )
+            elif _is_secret_key(key):
+                change = replace(
+                    change,
+                    old=_mask(before) if before not in (None, "") else None,
+                    new=_mask(after) if after not in (None, "") else None,
+                )
+            changes.append(change)
 
     # Collapse dynamic profile leaves into one stable composite change so
     # listeners never have to understand arbitrary profile names.

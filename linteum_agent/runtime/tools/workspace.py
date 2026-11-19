@@ -187,18 +187,59 @@ def make_file_tools(ws: Workspace) -> list[ToolSpec]:
     path_schema = {"type": "string", "pattern": _PATH_PATTERN}
 
     @tool(
-        "Read a UTF-8 text file (path is relative to the workspace root).",
-        {"path": path_schema}, required=["path"], side_effect="read",
+        "Read a UTF-8 text file (path is relative to the workspace root). "
+        "Optionally limit the result to a 1-based inclusive line range.",
+        {
+            "path": path_schema,
+            "start_line": {
+                "type": "integer", "minimum": 1,
+                "description": "First line to return (1-based, inclusive). Defaults to 1.",
+            },
+            "end_line": {
+                "type": "integer", "minimum": 1,
+                "description": (
+                    "Last line to return (1-based, inclusive); past EOF is "
+                    "clamped. Defaults to the end of the file."
+                ),
+            },
+        },
+        required=["path"], side_effect="read",
         timeout=10, name="read_file",
     )
-    def read_file(path: str) -> str:
+    def read_file(
+        path: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+    ) -> str:
         target = ws.resolve(path, mode="read")
         try:
             with open(target, "rb") as handle:          # bounded: read at most N bytes
                 data = handle.read(ws.max_read_bytes)
         except OSError:
             raise WorkspaceViolation("failed to read file", path=path, kind="io_error") from None
-        return data.decode("utf-8", "replace")
+        text = data.decode("utf-8", "replace")
+        if start_line is None and end_line is None:
+            return text
+
+        start = 1 if start_line is None else start_line
+        if start < 1:
+            raise WorkspaceViolation(
+                "start_line must be >= 1", path=path, kind="invalid_range",
+            )
+        if end_line is not None and end_line < start:
+            raise WorkspaceViolation(
+                "end_line must be >= start_line", path=path,
+                kind="invalid_range",
+            )
+        lines = text.splitlines(keepends=True)
+        if start > len(lines):
+            raise WorkspaceViolation(
+                f"start_line {start} is beyond the end of the file "
+                f"({len(lines)} lines)",
+                path=path, kind="invalid_range",
+            )
+        stop = len(lines) if end_line is None else min(end_line, len(lines))
+        return "".join(lines[start - 1:stop])
 
     @tool(
         "Overwrite a UTF-8 text file (path is relative to the workspace root).",

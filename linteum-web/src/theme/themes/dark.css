@@ -1,0 +1,39 @@
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --surface-canvas: #0e1014;
+  --surface-sunken: #0a0c0f;
+  --surface-raised: #15181e;
+  --surface-overlay: #1a1e26;
+  --surface-hover: #1e232c;
+  --surface-active: #242a35;
+
+  --text-primary: #e7e9ee;
+  --text-secondary: #a9b0bd;
+  --text-muted: #6d7583;
+  --text-inverse: #0e1014;
+
+  --border-subtle: #242933;
+  --border-strong: #39404d;
+
+  --accent: #7aa2ff;
+  --accent-strong: #4d82ff;
+  --accent-soft: rgba(122, 162, 255, 0.14);
+
+  --success: #4cc38a;
+  --success-soft: rgba(76, 195, 138, 0.14);
+  --warning: #e5b567;
+  --warning-soft: rgba(229, 181, 103, 0.14);
+  --danger: #e06c75;
+  --danger-soft: rgba(224, 108, 117, 0.14);
+
+  --selection-bg: #22344f;
+  --selection-text: #dbe6ff;
+  --code-bg: #11141a;
+  --code-text: #d6dbe5;
+  --reasoning-text: #98a1b0;
+  --focus-ring: #7aa2ff;
+  --backdrop: rgba(5, 6, 8, 0.62);
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.03), 0 8px 24px rgba(0, 0, 0, 0.18);
+  --shadow-pop: 0 18px 48px rgba(0, 0, 0, 0.45);
+}

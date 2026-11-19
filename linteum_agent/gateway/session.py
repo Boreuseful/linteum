@@ -49,9 +49,11 @@ from .log import get_logger
 from .projector import ProjectorState, project, snapshot_payload
 from .protocol import (
     CONTROL_FRAMES,
+    MAX_CONTEXT_PAGE,
     Command,
     Frame,
     command_session_id,
+    encode,
     frame_matches,
 )
 
@@ -69,6 +71,10 @@ DEFAULT_IDEMPOTENCY_SIZE = 1_024
 #: One subscription stores at most this many catch-up frames before the replay
 #: cutoff is applied; beyond it, the subscriber is told to resubscribe.
 CATCHUP_LIMIT = 10_000
+#: Room reserved inside ``max_frame_bytes`` for the command envelope.
+CONTEXT_ENVELOPE_RESERVE = 8_192
+#: Marker appended to message content that had to be shortened to fit a frame.
+CONTEXT_TRUNCATION_MARKER = "\n…[truncated]"
 
 logger = get_logger("session")
 
@@ -221,10 +227,7 @@ class SessionGateway:
                 self._unsub = None
             raise
 
-        if state.mode is None:
-            seeded = await self._seed_initial_mode()
-            if seeded is not None:
-                state = replace(state, mode=seeded)
+        state = await self._seed_state_mode(state)
         self._state = state
         self._expected = (events[-1].seq + 1) if events else 1
         self._started = True
@@ -242,6 +245,9 @@ class SessionGateway:
         handle = lookup(self.session_id) if callable(lookup) else None
         if handle is not None and getattr(handle, "mode", None) is not None:
             return {
+                # Same shape as the `mode` frame and `snapshot_payload`: the
+                # web/TUI clients key their binding on the canonical id.
+                "id": f"{handle.mode.source_id}/{handle.mode.name}",
                 "name": handle.mode.name,
                 "source": handle.mode.source_id,
                 "digest": handle.mode.digest,
@@ -258,13 +264,28 @@ class SessionGateway:
         name = metadata.get("mode")
         if not name:
             return None
+        source = metadata.get("mode_source")
         return {
+            "id": f"{source}/{name}" if source else name,
             "name": name,
-            "source": metadata.get("mode_source"),
+            "source": source,
             "digest": metadata.get("mode_digest"),
             "from": None,
             "refresh": False,
         }
+
+    async def _seed_state_mode(self, state: ProjectorState) -> ProjectorState:
+        """Fill the initial mode when the WAL has no ``system.mode.changed``.
+
+        Replay rebuilds history from scratch, so a session that never switched
+        modes would otherwise report ``mode: null`` in its snapshot even though
+        the host bound one at activation. Live state and every replay-derived
+        snapshot (subscribe, history) share this seed.
+        """
+        if state.mode is not None:
+            return state
+        seeded = await self._seed_initial_mode()
+        return replace(state, mode=seeded) if seeded is not None else state
 
     async def close(self) -> None:
         if self._closed:
@@ -559,7 +580,7 @@ class SessionGateway:
             if cmd.name == "artifact.read":
                 return await self._artifact(cmd, connection)
             if cmd.name == "session.context":
-                return await self._context()
+                return await self._context(cmd)
             if cmd.name == "session.tasks":
                 return self._tasks_result()
             if cmd.name == "session.task.stop":
@@ -824,13 +845,18 @@ class SessionGateway:
         }
 
     # -- derived context -------------------------------------------------
-    async def _context(self) -> dict:
-        """Return the derived context plan without creating an Agent.
+    async def _context(self, cmd: Command) -> dict:
+        """Return a bounded page of the derived context plan.
 
         A live session uses the reducer's own builder, so host system blocks
         (subagent role/environment/output contract, skill index) are included.
         A closed session falls back to the persisted state, where those
         host-only blocks are no longer available.
+
+        ``digest`` / ``estimated_tokens`` / ``messages_total`` always describe
+        the *full* plan; only ``messages`` is paginated.  Packing the whole
+        plan into one command result used to exceed ``max_frame_bytes`` and the
+        server replaced it with ``E_PAYLOAD_TOO_LARGE``.
         """
         handle = self.host.session(self.session_id)
         if handle is not None:
@@ -841,7 +867,7 @@ class SessionGateway:
             plan = await agent.ctx_builder.build(agent.state, tools=tools)
             blocks = getattr(agent.ctx_builder, "system_blocks", ()) or ()
             prompt = getattr(agent.ctx_builder, "system_prompt", None)
-            return {"context": {
+            base = {
                 "session_id": self.session_id,
                 "kind": handle.kind,
                 "phase": agent.state.phase,
@@ -850,34 +876,143 @@ class SessionGateway:
                 "system_blocks_included": bool(blocks or prompt),
                 "digest": plan.digest,
                 "estimated_tokens": plan.estimated_tokens(),
-                "messages": plan.to_provider_messages(),
                 "tools": [
                     name for name in (
                         self._schema_name(schema) for schema in tools
                     ) if name
                 ],
-            }}
+            }
+        else:
+            info = await self.host.get_session_info(self.session_id)
+            if info is None:
+                raise GatewayError(
+                    E_SESSION_NOT_FOUND,
+                    f"session not found: {self.session_id!r}",
+                    location=LOCATION_SESSION,
+                )
+            plan = await self.host.service.context(self.session_id, tools=())
+            base = {
+                "session_id": self.session_id,
+                "kind": info.kind,
+                "phase": info.phase,
+                "round": info.round,
+                "source": "replay",
+                "system_blocks_included": False,
+                "digest": plan.digest,
+                "estimated_tokens": plan.estimated_tokens(),
+                "tools": [],
+            }
 
-        info = await self.host.get_session_info(self.session_id)
-        if info is None:
-            raise GatewayError(
-                E_SESSION_NOT_FOUND,
-                f"session not found: {self.session_id!r}",
-                location=LOCATION_SESSION,
+        # Copy only the requested page; a long session's plan can be large.
+        messages = plan.messages
+        total = len(messages)
+        offset = min(max(0, int(cmd.args.get("offset") or 0)), total)
+        # An explicit ``limit`` opts into count-based paging; otherwise return as
+        # many messages as the byte budget allows (older clients do not page and
+        # must not silently lose messages 101+).
+        requested_limit = cmd.args.get("limit")
+        if requested_limit is None:
+            limit = max(1, total)
+        else:
+            limit = min(max(1, int(requested_limit)), MAX_CONTEXT_PAGE)
+        include_messages = bool(cmd.args.get("include_messages", True))
+        if include_messages:
+            page, next_offset, has_more, truncated = self._context_page(
+                base, messages, offset, limit
             )
-        plan = await self.host.service.context(self.session_id, tools=())
+        else:
+            page, next_offset, has_more, truncated = [], offset, False, False
+
         return {"context": {
-            "session_id": self.session_id,
-            "kind": info.kind,
-            "phase": info.phase,
-            "round": info.round,
-            "source": "replay",
-            "system_blocks_included": False,
-            "digest": plan.digest,
-            "estimated_tokens": plan.estimated_tokens(),
-            "messages": plan.to_provider_messages(),
-            "tools": [],
+            **base,
+            "messages_total": total,
+            "offset": offset,
+            "next_offset": next_offset,
+            "has_more": has_more,
+            "truncated": truncated,
+            "messages": page,
         }}
+
+    def _context_page(
+        self, base: dict, messages: tuple, offset: int, limit: int
+    ) -> tuple[list, int, bool, bool]:
+        """Fit as many provider messages as the frame budget allows.
+
+        The page is filled from ``offset`` until the encoded result would cross
+        the budget.  When even the first message is too large, its content is
+        truncated so the page always makes progress (``next_offset`` advances).
+        """
+        budget = self._context_budget()
+        empty = {"context": {
+            **base,
+            "messages_total": len(messages),
+            "offset": offset,
+            "next_offset": offset,
+            "has_more": False,
+            "truncated": False,
+            "messages": [],
+        }}
+        size = len(encode(empty).encode("utf-8"))
+        page: list = []
+        truncated = False
+        for index in range(offset, min(offset + limit, len(messages))):
+            message = dict(messages[index])
+            message_size = len(encode(message).encode("utf-8")) + 1
+            if size + message_size <= budget:
+                page.append(message)
+                size += message_size
+                continue
+            if page:
+                break
+            fitted, was_truncated = self._fit_context_message(
+                message, max(1, budget - size - 2)
+            )
+            page.append(fitted)
+            truncated = truncated or was_truncated
+            size += len(encode(fitted).encode("utf-8")) + 1
+            break
+        next_offset = offset + len(page)
+        return page, next_offset, next_offset < len(messages), truncated
+
+    def _context_budget(self) -> int:
+        max_frame_bytes = 1_048_576
+        if self.limits is not None:
+            max_frame_bytes = int(self.limits.max_frame_bytes)
+        return max(1024, max_frame_bytes - CONTEXT_ENVELOPE_RESERVE)
+
+    @staticmethod
+    def _fit_context_message(message: dict, budget: int) -> tuple[dict, bool]:
+        """Shorten one provider message until its encoded form fits ``budget``."""
+        if len(encode(message).encode("utf-8")) <= budget:
+            return message, False
+        fitted = dict(message)
+        # Optional decorations are dropped before content: a giant tool-call
+        # argument can dominate the message even when ``content`` is short.
+        for key in ("reasoning", "tool_calls"):
+            if key in fitted:
+                del fitted[key]
+                if len(encode(fitted).encode("utf-8")) <= budget:
+                    fitted["truncated"] = True
+                    return fitted, True
+        content = fitted.get("content", "")
+        if isinstance(content, str):
+            lo, hi = 0, len(content)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                fitted["content"] = content[:mid] + CONTEXT_TRUNCATION_MARKER
+                if len(encode(fitted).encode("utf-8")) <= budget:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            fitted["content"] = content[:lo] + CONTEXT_TRUNCATION_MARKER
+        if len(encode(fitted).encode("utf-8")) > budget:
+            fitted = {
+                "role": str(message.get("role") or "user"),
+                "content": "",
+                "truncated": True,
+            }
+        fitted["truncated"] = True
+        return fitted, True
 
     @staticmethod
     def _schema_name(schema) -> Optional[str]:
@@ -952,6 +1087,7 @@ class SessionGateway:
         connection.resume_session(self.session_id)  # an explicit subscribe lifts a gap pause
         try:
             entries, state = await self._replay_entries(after_seq)
+            state = await self._seed_state_mode(state)
             await connection.send_replay_frame(Frame.create(
                 "snapshot",
                 snapshot_payload(state),
@@ -1090,6 +1226,7 @@ class SessionGateway:
             next_seq = event.seq
             included += 1
 
+        state = await self._seed_state_mode(state)
         payload = {
             "after_seq": after_seq,
             "next_seq": next_seq,

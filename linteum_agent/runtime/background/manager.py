@@ -35,6 +35,7 @@ from ...bus.event import Event, uuid7
 from ...config.schema import BackgroundSettings, SubagentSettings
 from ..tools.errors import E_DENIED, UnknownTool, ToolUnavailable, ValidationError
 from .errors import (
+    E_BACKGROUND_APPROVAL,
     E_BACKGROUND_ARGS,
     E_BACKGROUND_CANCELLED,
     E_BACKGROUND_DISABLED,
@@ -42,7 +43,6 @@ from .errors import (
     E_BACKGROUND_LOST,
     E_BACKGROUND_NOT_ALLOWED,
     E_BACKGROUND_NOT_FOUND,
-    E_BACKGROUND_NOT_RUNNING,
     E_BACKGROUND_SPAWN,
     E_BACKGROUND_STOPPED,
     E_BACKGROUND_UNKNOWN_TOOL,

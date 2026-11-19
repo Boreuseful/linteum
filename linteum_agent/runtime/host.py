@@ -397,6 +397,20 @@ class AgentHost:
         """The effective configuration as of this call (used by the gateway)."""
         return self._current_config()
 
+    def apply_live_config(self) -> bool:
+        """Re-apply config keys that have a live consumer. Never raises.
+
+        Only the run logger consumes ``logging.*`` live today
+        (web-config-phase4 §6.6.1).  Called from the config write thread.
+        """
+        if self.config_service is None:
+            return False
+        try:
+            cfg = self._current_config()
+            return self.run_logger.apply_config(cfg.logging)
+        except Exception:  # noqa: BLE001 - live apply must not break the write
+            return False
+
     @staticmethod
     def _default_storage(cfg: AppConfig) -> StorageBundle:
         path = str(Path(cfg.storage.state_db).expanduser())
@@ -1017,7 +1031,6 @@ class AgentHost:
                 skill_index=resolution.filtered_skills.index_text,
             )
             subagent_tools = resolution.subagent_tools
-            subagent_settings = cfg.agent.subagents
             schemas, background_tools, targets = self._compose_schemas(
                 cfg, registry, subagent_tools, workspace=workspace,
             )

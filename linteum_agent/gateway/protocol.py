@@ -38,6 +38,9 @@ from .errors import (
 #: Major protocol version.  ``hello`` negotiates it; there is no minor version.
 PROTOCOL_VERSION = 1
 
+#: Upper bound for one ``session.context`` message page.
+MAX_CONTEXT_PAGE = 500
+
 #: Feature flags advertised by ``hello``.
 FEATURES: tuple = (
     "view",
@@ -55,6 +58,16 @@ FEATURES: tuple = (
     "plugins.manage",
     # v0.4: runtime lifecycle commands (set_allowed/load/unload/reload, §5.6).
     "plugins.runtime",
+    # v0.5: configuration read/write through the gateway (web-config §6).
+    "config",
+    # v0.6: named LLM profiles and the fallback chain (web-llm-profiles §5.7).
+    "config.profiles",
+    # Phase 3: full schema-driven settings page (include_fields, list writes,
+    # raw_value, schema i18n).
+    "config.settings",
+    # Phase 4: the gateway pushes an ephemeral ``config.changed`` control frame
+    # after an in-process configuration write (web-config-phase4 §6.1).
+    "config.push",
 )
 
 #: Commands a client may send (§5.2).  Anything else is ``E_UNKNOWN_COMMAND``.
@@ -86,6 +99,15 @@ KNOWN_COMMANDS: frozenset = frozenset(
         "plugin.load",
         "plugin.unload",
         "plugin.reload",
+        "config.get",
+        "config.set",
+        "config.unset",
+        "config.profile.set",
+        "config.profile.delete",
+        "config.profile.duplicate",
+        "config.fallback.set",
+        "config.fallback.delete",
+        "config.fallback.move",
         "ping",
     }
 )
@@ -96,7 +118,8 @@ RESERVED_ARGS: frozenset = frozenset({"origin", "seq", "cause_id"})
 #: Control frames bypass the subscription filter (they are protocol plumbing,
 #: not projected facts).
 CONTROL_FRAMES: frozenset = frozenset(
-    {"hello.ok", "snapshot", "gap", "flow", "error", "pong", "bye", "history.page", "artifact.chunk"}
+    {"hello.ok", "snapshot", "gap", "flow", "error", "pong", "bye", "history.page", "artifact.chunk",
+     "config.changed"}
 )
 
 _SESSION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -106,6 +129,13 @@ _MODE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 #: Mirrors ``runtime.plugins.model.PLUGIN_ID_PATTERN``; protocol must stay
 #: runtime-free, so the pattern is duplicated here rather than imported.
 _PLUGIN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_CONFIG_KEY = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
+
+#: Upper bounds for one config command (web-config §6.6).
+CONFIG_MAX_CHANGES = 128
+CONFIG_MAX_SECTIONS = 32
+#: Upper bound for one profile/fallback ``values`` object (web-llm-profiles §5.7).
+CONFIG_MAX_VALUES = 32
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +212,55 @@ def _string_list(args: Mapping, key: str) -> tuple:
     if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
         raise _bad(f"argument {key!r} must be a list of strings")
     return tuple(value)
+
+
+def _required_integer(args: Mapping, key: str, *,
+                      minimum: Optional[int] = None) -> int:
+    value = _integer(args, key, minimum=minimum)
+    if value is None:
+        raise _bad(f"missing argument: {key}")
+    return value
+
+
+def _expected_revision(args: Mapping) -> str:
+    """A write revision; ``""`` is the create sentinel (§5.7)."""
+    value = args.get("expected_revision")
+    if not isinstance(value, str):
+        raise _bad("expected_revision must be a string")
+    return value
+
+
+def _profile_name(args: Mapping, key: str = "name") -> str:
+    """Shape-check one profile name (§5.7).
+
+    ``_PROFILE`` is shared with ``session.create.profile``.  Names are map keys
+    made of dotted segments, so an empty segment (e.g. ``"default."``) is
+    malformed even though the character class alone would accept it.
+    """
+    value = args.get(key)
+    if value is None:
+        raise _bad(f"missing argument: {key}")
+    if (not isinstance(value, str) or not _PROFILE.match(value)
+            or "" in value.split(".")):
+        raise _bad("invalid profile name", **{key: value})
+    return value
+
+
+def _config_values(args: Mapping) -> dict:
+    """A non-empty object of at most ``CONFIG_MAX_VALUES`` JSON values (§5.7)."""
+    values = args.get("values")
+    if not isinstance(values, Mapping) or not values:
+        raise _bad("values must be a non-empty object")
+    if len(values) > CONFIG_MAX_VALUES:
+        raise _bad(f"values accepts at most {CONFIG_MAX_VALUES} keys")
+    for name, value in values.items():
+        if not isinstance(name, str):
+            raise _bad("values keys must be strings")
+        try:
+            json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise _bad("values must be JSON-serialisable") from exc
+    return dict(values)
 
 
 def command_session_id(cmd: "Command") -> Optional[str]:
@@ -303,6 +382,11 @@ def validate_command(cmd: "Command") -> None:
     if cmd.name == "session.context":
         if command_session_id(cmd) is None:
             raise _bad("session.context requires session_id")
+        include_messages = args.get("include_messages")
+        if include_messages is not None and not isinstance(include_messages, bool):
+            raise _bad("session.context.include_messages must be a boolean")
+        _integer(args, "offset", minimum=0)
+        _integer(args, "limit", minimum=1, maximum=MAX_CONTEXT_PAGE)
         return
 
     if cmd.name == "session.tasks":
@@ -381,6 +465,169 @@ def validate_command(cmd: "Command") -> None:
         if plugin_id is None or not _PLUGIN_ID.match(plugin_id):
             raise _bad("invalid plugin id", id=plugin_id)
         _integer(args, "grace_ms", minimum=0)
+        return
+
+    if cmd.name == "config.get":
+        # Gateway-wide: no session, and an exact argument set (§6.3).
+        if cmd.session_id is not None or "session_id" in args:
+            raise _bad("config.get takes no session_id")
+        extra = set(args) - {"sections", "include_schema", "include_fields"}
+        if extra:
+            raise _bad(
+                "config.get takes only 'sections', 'include_schema' and "
+                "'include_fields'"
+            )
+        sections = args.get("sections")
+        if sections is not None:
+            if (not isinstance(sections, (list, tuple))
+                    or len(sections) > CONFIG_MAX_SECTIONS):
+                raise _bad(
+                    "config.get.sections must be a list of at most "
+                    f"{CONFIG_MAX_SECTIONS} strings"
+                )
+            for section in sections:
+                if not isinstance(section, str) or not _CONFIG_KEY.match(section):
+                    raise _bad("invalid config section", section=section)
+        include = args.get("include_schema")
+        if include is not None and not isinstance(include, bool):
+            raise _bad("config.get.include_schema must be a boolean")
+        include_fields = args.get("include_fields")
+        if include_fields is not None and not isinstance(include_fields, bool):
+            raise _bad("config.get.include_fields must be a boolean")
+        return
+
+    if cmd.name == "config.set":
+        if cmd.session_id is not None or "session_id" in args:
+            raise _bad("config.set takes no session_id")
+        extra = set(args) - {"changes", "expected_revision", "persist"}
+        if extra:
+            raise _bad("config.set takes only 'changes', 'expected_revision', 'persist'")
+        changes = args.get("changes")
+        if not isinstance(changes, Mapping) or not changes:
+            raise _bad("config.set.changes must be a non-empty object")
+        if len(changes) > CONFIG_MAX_CHANGES:
+            raise _bad(
+                f"config.set.changes accepts at most {CONFIG_MAX_CHANGES} keys"
+            )
+        for key, value in changes.items():
+            if not isinstance(key, str) or not _CONFIG_KEY.match(key):
+                raise _bad("invalid config key", key=key)
+            try:
+                json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError) as exc:
+                raise _bad(
+                    "config value must be JSON-serialisable", key=key,
+                ) from exc
+        persist = args.get("persist", True)
+        if not isinstance(persist, bool):
+            raise _bad("config.set.persist must be a boolean")
+        revision = args.get("expected_revision")
+        if persist and revision is None:
+            raise _bad(
+                "config.set.expected_revision is required when persist is true"
+            )
+        if revision is not None and not isinstance(revision, str):
+            raise _bad("config.set.expected_revision must be a string")
+        return
+
+    if cmd.name == "config.unset":
+        if cmd.session_id is not None or "session_id" in args:
+            raise _bad("config.unset takes no session_id")
+        extra = set(args) - {"keys", "expected_revision"}
+        if extra:
+            raise _bad("config.unset takes only 'keys' and 'expected_revision'")
+        keys = args.get("keys")
+        if (not isinstance(keys, (list, tuple)) or not keys
+                or len(keys) > CONFIG_MAX_CHANGES):
+            raise _bad(
+                "config.unset.keys must be a non-empty list of at most "
+                f"{CONFIG_MAX_CHANGES} strings"
+            )
+        for key in keys:
+            if not isinstance(key, str) or not _CONFIG_KEY.match(key):
+                raise _bad("invalid config key", key=key)
+        revision = args.get("expected_revision")
+        if revision is None or not isinstance(revision, str):
+            raise _bad("config.unset.expected_revision must be a string")
+        return
+
+    if cmd.name.startswith("config.profile."):
+        # §5.7: gateway-wide writes; no session and an exact argument set.
+        if cmd.session_id is not None or "session_id" in args:
+            raise _bad(f"{cmd.name} takes no session_id")
+        if cmd.name == "config.profile.set":
+            extra = set(args) - {"name", "values", "expected_revision"}
+            if extra:
+                raise _bad(
+                    "config.profile.set takes only 'name', 'values', "
+                    "'expected_revision'"
+                )
+            _profile_name(args)
+            _config_values(args)
+            _expected_revision(args)
+            return
+        if cmd.name == "config.profile.delete":
+            extra = set(args) - {"name", "expected_revision", "confirm_in_use"}
+            if extra:
+                raise _bad(
+                    "config.profile.delete takes only 'name', "
+                    "'expected_revision', 'confirm_in_use'"
+                )
+            _profile_name(args)
+            _expected_revision(args)
+            confirm = args.get("confirm_in_use")
+            if confirm is not None and not isinstance(confirm, bool):
+                raise _bad(
+                    "config.profile.delete.confirm_in_use must be a boolean"
+                )
+            return
+        # config.profile.duplicate
+        extra = set(args) - {"from", "name", "expected_revision"}
+        if extra:
+            raise _bad(
+                "config.profile.duplicate takes only 'from', 'name', "
+                "'expected_revision'"
+            )
+        _profile_name(args, "from")
+        _profile_name(args, "name")
+        _expected_revision(args)
+        return
+
+    if cmd.name.startswith("config.fallback."):
+        # §5.7: gateway-wide writes; no session and an exact argument set.
+        if cmd.session_id is not None or "session_id" in args:
+            raise _bad(f"{cmd.name} takes no session_id")
+        if cmd.name == "config.fallback.set":
+            extra = set(args) - {"index", "values", "expected_revision"}
+            if extra:
+                raise _bad(
+                    "config.fallback.set takes only 'index', 'values', "
+                    "'expected_revision'"
+                )
+            _integer(args, "index", minimum=0)
+            _config_values(args)
+            _expected_revision(args)
+            return
+        if cmd.name == "config.fallback.delete":
+            extra = set(args) - {"index", "expected_revision"}
+            if extra:
+                raise _bad(
+                    "config.fallback.delete takes only 'index', "
+                    "'expected_revision'"
+                )
+            _required_integer(args, "index", minimum=0)
+            _expected_revision(args)
+            return
+        # config.fallback.move
+        extra = set(args) - {"from", "to", "expected_revision"}
+        if extra:
+            raise _bad(
+                "config.fallback.move takes only 'from', 'to', "
+                "'expected_revision'"
+            )
+        _required_integer(args, "from", minimum=0)
+        _required_integer(args, "to", minimum=0)
+        _expected_revision(args)
         return
 
     if cmd.name == "session.mode.set":

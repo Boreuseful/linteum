@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Linteum</title>
+    <script>
+      // Resolve the persisted theme before the first paint to avoid a flash.
+      (function () {
+        try {
+          var choice = localStorage.getItem("linteum.theme") || "dark";
+          if (choice === "system") {
+            choice = window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark";
+          }
+          if (choice !== "dark" && choice !== "light" && choice !== "mono") {
+            choice = "dark";
+          }
+          document.documentElement.dataset.theme = choice;
+        } catch (error) {
+          document.documentElement.dataset.theme = "dark";
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

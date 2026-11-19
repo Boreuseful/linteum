@@ -1,0 +1,39 @@
+[data-theme="light"] {
+  color-scheme: light;
+
+  --surface-canvas: #fbfbfd;
+  --surface-sunken: #f2f3f7;
+  --surface-raised: #ffffff;
+  --surface-overlay: #ffffff;
+  --surface-hover: #f0f1f5;
+  --surface-active: #e9ebf1;
+
+  --text-primary: #1b1f27;
+  --text-secondary: #4e5563;
+  --text-muted: #7b8290;
+  --text-inverse: #ffffff;
+
+  --border-subtle: #e3e5eb;
+  --border-strong: #c9ced8;
+
+  --accent: #2f6fed;
+  --accent-strong: #1f5edb;
+  --accent-soft: rgba(47, 111, 237, 0.1);
+
+  --success: #1f9d63;
+  --success-soft: rgba(31, 157, 99, 0.1);
+  --warning: #a9731c;
+  --warning-soft: rgba(169, 115, 28, 0.12);
+  --danger: #c64a55;
+  --danger-soft: rgba(198, 74, 85, 0.1);
+
+  --selection-bg: #d7e4ff;
+  --selection-text: #16335f;
+  --code-bg: #f2f3f7;
+  --code-text: #242a36;
+  --reasoning-text: #626a78;
+  --focus-ring: #2f6fed;
+  --backdrop: rgba(24, 28, 36, 0.32);
+  --shadow-card: 0 1px 0 rgba(16, 24, 40, 0.02), 0 8px 24px rgba(16, 24, 40, 0.08);
+  --shadow-pop: 0 18px 48px rgba(16, 24, 40, 0.2);
+}
