@@ -106,7 +106,10 @@ class AnthropicAdapter(BaseAdapter):
             )
         from anthropic import AsyncAnthropic
 
-        self.client = AsyncAnthropic(api_key=api_key, timeout=self.config.timeout)
+        kwargs: dict = {"api_key": api_key, "timeout": self.config.timeout}
+        if self.config.resolved_base_url():
+            kwargs["base_url"] = self.config.resolved_base_url()
+        self.client = AsyncAnthropic(**kwargs)
 
     # -- request ------------------------------------------------------------
     def build_body(self, req: LlmRequest) -> tuple:
@@ -121,7 +124,9 @@ class AnthropicAdapter(BaseAdapter):
             "model": self._model_id(req.model),
             "messages": messages,
             "max_tokens": self._max_tokens(req) or self.capabilities(req.model).max_output,  # ★ required
-            "stream": req.stream,
+            # No ``stream`` key: this adapter calls ``client.messages.stream()``,
+            # which is streaming by definition and rejects a ``stream`` kwarg
+            # (only ``messages.create`` accepts it).
         }
         if system_parts:
             body["system"] = "\n".join(system_parts)
